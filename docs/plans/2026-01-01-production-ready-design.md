@@ -835,10 +835,484 @@ share/
 - Debug logging
 
 ### Phase 8: Testing & Polish
-- Integration tests with real Redis
+- Full test suite (see Section 15)
 - Edge case handling
 - Documentation
 - CPAN release
+
+---
+
+## Section 15: Testing Strategy
+
+### Test Categories
+
+```
+t/
+├── 00-compile.t              # Module compilation
+├── 01-unit/                  # Unit tests (no Redis needed)
+│   ├── uri.t                 # URI parsing
+│   ├── protocol.t            # RESP encoding/decoding
+│   ├── error.t               # Exception classes
+│   └── commands-generated.t  # Generated command methods exist
+├── 10-connection/            # Connection tests
+│   ├── basic.t               # Connect, disconnect
+│   ├── timeout.t             # Connect/read/write timeouts
+│   ├── reconnect.t           # Auto-reconnection
+│   ├── backoff.t             # Exponential backoff timing
+│   ├── events.t              # on_connect, on_disconnect, on_error
+│   ├── unix-socket.t         # Unix socket connections
+│   ├── tls.t                 # TLS/SSL connections
+│   ├── auth.t                # AUTH, ACL authentication
+│   ├── select.t              # Database selection
+│   └── fork-safety.t         # PID tracking after fork
+├── 20-commands/              # Command tests
+│   ├── strings.t             # GET, SET, INCR, APPEND, etc.
+│   ├── lists.t               # LPUSH, RPOP, LRANGE, etc.
+│   ├── sets.t                # SADD, SMEMBERS, SINTER, etc.
+│   ├── sorted-sets.t         # ZADD, ZRANGE, ZRANK, etc.
+│   ├── hashes.t              # HSET, HGET, HGETALL, etc.
+│   ├── keys.t                # DEL, EXISTS, EXPIRE, TTL, etc.
+│   ├── server.t              # INFO, CONFIG, DBSIZE, etc.
+│   └── prefix.t              # Key prefixing for all types
+├── 30-pipeline/              # Pipeline tests
+│   ├── basic.t               # Pipeline execution
+│   ├── chained.t             # Chained API style
+│   ├── errors.t              # Per-command error handling
+│   ├── large.t               # 1000+ commands in pipeline
+│   ├── auto-pipeline.t       # Automatic batching
+│   └── depth-limit.t         # Pipeline depth limits
+├── 40-transactions/          # Transaction tests
+│   ├── multi-exec.t          # Basic MULTI/EXEC
+│   ├── watch.t               # WATCH/UNWATCH
+│   ├── watch-conflict.t      # WATCH abort on key change
+│   ├── discard.t             # DISCARD behavior
+│   └── nested.t              # Nested transaction error
+├── 50-pubsub/                # PubSub tests
+│   ├── subscribe.t           # SUBSCRIBE, UNSUBSCRIBE
+│   ├── psubscribe.t          # Pattern subscribe
+│   ├── publish.t             # PUBLISH
+│   ├── multi-channel.t       # Multiple channels
+│   ├── reconnect.t           # Subscription replay on reconnect
+│   ├── sharded.t             # SSUBSCRIBE/SPUBLISH (Redis 7+)
+│   └── isolation.t           # Commands on subscriber error
+├── 60-scripting/             # Lua scripting tests
+│   ├── eval.t                # EVAL
+│   ├── evalsha.t             # EVALSHA
+│   ├── script-load.t         # SCRIPT LOAD
+│   ├── auto-fallback.t       # EVALSHA->EVAL fallback
+│   └── script-object.t       # Script wrapper pattern
+├── 70-blocking/              # Blocking command tests
+│   ├── blpop.t               # BLPOP/BRPOP
+│   ├── blmove.t              # BLMOVE
+│   ├── timeout.t             # Blocking timeout handling
+│   └── concurrent.t          # Multiple blocking waiters
+├── 80-scan/                  # SCAN iterator tests
+│   ├── scan.t                # SCAN
+│   ├── hscan.t               # HSCAN
+│   ├── sscan.t               # SSCAN
+│   ├── zscan.t               # ZSCAN
+│   ├── match.t               # Pattern matching
+│   └── large.t               # 10000+ keys iteration
+├── 90-pool/                  # Connection pool tests
+│   ├── basic.t               # Acquire/release
+│   ├── scoped.t              # with() pattern
+│   ├── sizing.t              # min/max sizing
+│   ├── idle.t                # Idle timeout
+│   ├── health.t              # Health check on acquire
+│   ├── concurrent.t          # Concurrent access
+│   └── exhaustion.t          # Pool exhaustion, acquire_timeout
+├── 91-reliability/           # Reliability tests
+│   ├── redis-restart.t       # Survive Redis restart
+│   ├── network-partition.t   # Connection drops mid-command
+│   ├── slow-commands.t       # Timeout during slow command
+│   ├── memory-pressure.t     # Redis OOM behavior
+│   ├── queue-overflow.t      # Command queue limits
+│   └── retry.t               # Retry strategy behavior
+├── 92-concurrency/           # Concurrency tests
+│   ├── parallel-commands.t   # Many concurrent commands
+│   ├── parallel-pipelines.t  # Concurrent pipelines
+│   ├── parallel-pubsub.t     # Concurrent pub/sub
+│   ├── mixed-workload.t      # Commands + pipelines + pubsub
+│   └── event-loop.t          # Non-blocking verification
+├── 93-binary/                # Binary data tests
+│   ├── binary-keys.t         # Binary key names
+│   ├── binary-values.t       # Binary values (null bytes)
+│   ├── utf8.t                # UTF-8 encoding
+│   └── large-values.t        # 1MB+ values
+├── 94-observability/         # Observability tests
+│   ├── tracing.t             # OpenTelemetry spans
+│   ├── metrics.t             # Metrics collection
+│   └── debug.t               # Debug logging
+└── 99-integration/           # Full integration tests
+    ├── pagi-channels.t       # PAGI-Channels use case
+    ├── high-throughput.t     # 10000+ ops/sec sustained
+    ├── long-running.t        # 1 hour stability test
+    └── redis-versions.t      # Redis 6, 7, 8 compatibility
+```
+
+### Test Infrastructure
+
+#### Docker Compose for Redis
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+
+  redis-tls:
+    image: redis:7-alpine
+    ports:
+      - "6380:6380"
+    volumes:
+      - ./certs:/certs:ro
+    command: >
+      redis-server
+      --port 0
+      --tls-port 6380
+      --tls-cert-file /certs/server.crt
+      --tls-key-file /certs/server.key
+      --tls-ca-cert-file /certs/ca.crt
+
+  redis-auth:
+    image: redis:7-alpine
+    ports:
+      - "6381:6381"
+    command: redis-server --port 6381 --requirepass testpass
+
+  redis-acl:
+    image: redis:7-alpine
+    ports:
+      - "6382:6382"
+    command: >
+      redis-server --port 6382
+      --user testuser on >testpass ~* +@all
+
+  redis-sentinel:
+    image: redis:7-alpine
+    ports:
+      - "26379:26379"
+    depends_on:
+      - redis
+    # Sentinel config here
+
+  redis-cluster:
+    # 6-node cluster setup
+```
+
+#### Test Helpers
+
+```perl
+# t/lib/Test/Future/IO/Redis.pm
+package Test::Future::IO::Redis;
+
+use strict;
+use warnings;
+use Test2::V0;
+use Future::IO::Redis;
+
+# Skip if no Redis available
+sub skip_without_redis {
+    my $redis = eval {
+        Future::IO::Redis->new(
+            host => $ENV{REDIS_HOST} // 'localhost',
+            connect_timeout => 2,
+        )->connect->get;
+    };
+    return $redis if $redis;
+    skip_all("Redis not available: $@");
+}
+
+# Clean up test keys
+sub cleanup_keys {
+    my ($redis, $pattern) = @_;
+    my $keys = $redis->keys($pattern)->get;
+    $redis->del(@$keys)->get if @$keys;
+}
+
+# Test with timeout wrapper
+sub with_timeout {
+    my ($timeout, $code) = @_;
+    my $f = $code->();
+    return $f->timeout($timeout);
+}
+
+# Assert Future fails with specific error type
+sub fails_with {
+    my ($future, $error_class, $message) = @_;
+    my $error;
+    eval { $future->get };
+    $error = $@;
+    ok($error && $error->isa($error_class), $message);
+}
+
+1;
+```
+
+### Test Scenarios
+
+#### Reliability Tests
+
+```perl
+# t/91-reliability/redis-restart.t
+
+use Test2::V0;
+use Test::Future::IO::Redis;
+
+my $redis = skip_without_redis();
+
+subtest 'survives redis restart' => sub {
+    # Set up reconnection
+    my $disconnects = 0;
+    my $reconnects = 0;
+
+    $redis = Future::IO::Redis->new(
+        host => 'localhost',
+        reconnect => 1,
+        on_disconnect => sub { $disconnects++ },
+        on_connect => sub { $reconnects++ },
+    );
+    await $redis->connect;
+
+    # Store value
+    await $redis->set('test:key', 'before');
+
+    # Simulate Redis restart (need Docker control)
+    system('docker-compose restart redis');
+    sleep(2);  # Wait for restart
+
+    # Command should work after reconnect
+    my $value = await $redis->get('test:key');
+    is($value, 'before', 'value survives restart');
+    is($disconnects, 1, 'disconnect detected');
+    is($reconnects, 2, 'reconnected (initial + after restart)');
+};
+
+done_testing;
+```
+
+#### Concurrency Tests
+
+```perl
+# t/92-concurrency/parallel-commands.t
+
+use Test2::V0;
+use Test::Future::IO::Redis;
+use Future;
+use Time::HiRes qw(time);
+
+my $redis = skip_without_redis();
+
+subtest 'parallel commands are truly parallel' => sub {
+    my $count = 100;
+
+    # Sequential timing
+    my $seq_start = time();
+    for my $i (1..$count) {
+        await $redis->set("seq:$i", $i);
+    }
+    my $seq_time = time() - $seq_start;
+
+    # Parallel timing
+    my $par_start = time();
+    my @futures = map {
+        $redis->set("par:$_", $_)
+    } (1..$count);
+    await Future->all(@futures);
+    my $par_time = time() - $par_start;
+
+    # Parallel should be significantly faster
+    ok($par_time < $seq_time / 2,
+        "parallel ($par_time) < sequential/2 ($seq_time/2)");
+};
+
+subtest 'event loop not blocked during commands' => sub {
+    my @ticks;
+    my $timer = IO::Async::Timer::Periodic->new(
+        interval => 0.01,
+        on_tick => sub { push @ticks, time() },
+    );
+    $loop->add($timer);
+    $timer->start;
+
+    # Run slow command
+    await $redis->debug_sleep(0.1);  # 100ms sleep
+
+    $timer->stop;
+    $loop->remove($timer);
+
+    # Should have ~10 ticks during the sleep
+    ok(@ticks >= 5, "timer ticked " . scalar(@ticks) . " times during Redis sleep");
+};
+
+done_testing;
+```
+
+#### Edge Case Tests
+
+```perl
+# t/93-binary/binary-values.t
+
+use Test2::V0;
+use Test::Future::IO::Redis;
+
+my $redis = skip_without_redis();
+
+subtest 'null bytes in values' => sub {
+    my $binary = "foo\x00bar\x00baz";
+    await $redis->set('binary:null', $binary);
+    my $result = await $redis->get('binary:null');
+    is($result, $binary, 'null bytes preserved');
+};
+
+subtest 'all byte values' => sub {
+    my $all_bytes = pack("C*", 0..255);
+    await $redis->set('binary:all', $all_bytes);
+    my $result = await $redis->get('binary:all');
+    is($result, $all_bytes, 'all 256 byte values preserved');
+};
+
+subtest 'binary keys' => sub {
+    my $key = "key\x00with\xFFbinary";
+    await $redis->set($key, 'value');
+    my $result = await $redis->get($key);
+    is($result, 'value', 'binary key works');
+    await $redis->del($key);
+};
+
+subtest 'large binary value' => sub {
+    my $large = pack("C*", map { $_ % 256 } (1..1_000_000));
+    await $redis->set('binary:large', $large);
+    my $result = await $redis->get('binary:large');
+    is(length($result), 1_000_000, '1MB value preserved');
+    is($result, $large, 'content matches');
+};
+
+done_testing;
+```
+
+### Coverage Requirements
+
+| Category | Minimum Coverage |
+|----------|------------------|
+| Core modules | 95% |
+| Commands.pm | 80% (generated) |
+| Error paths | 90% |
+| Edge cases | 85% |
+| Overall | 90% |
+
+### CI Pipeline
+
+```yaml
+# .github/workflows/test.yml
+name: Test
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        perl: ['5.18', '5.26', '5.34', '5.38']
+        redis: ['6.2', '7.0', '7.2', '8.0']
+
+    services:
+      redis:
+        image: redis:${{ matrix.redis }}-alpine
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl }}
+
+      - name: Install dependencies
+        run: cpanm --installdeps --notest .
+
+      - name: Run tests
+        run: prove -l -j4 t/
+        env:
+          REDIS_HOST: localhost
+
+      - name: Run coverage
+        run: |
+          cpanm Devel::Cover
+          cover -test -report codecov
+
+  stress-test:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      # ... setup ...
+      - name: Run stress tests
+        run: prove -l t/99-integration/
+        timeout-minutes: 30
+
+  tls-test:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate certs
+        run: ./scripts/generate-test-certs.sh
+      - name: Start Redis with TLS
+        run: docker-compose up -d redis-tls
+      - name: Run TLS tests
+        run: prove -l t/10-connection/tls.t
+```
+
+### Performance Benchmarks
+
+```perl
+# benchmark/throughput.pl
+
+use Benchmark qw(:all);
+use Future::IO::Redis;
+use Net::Async::Redis;
+use Mojo::Redis;
+
+my $iterations = 10000;
+
+cmpthese($iterations, {
+    'Future::IO::Redis' => sub {
+        # our implementation
+    },
+    'Net::Async::Redis' => sub {
+        # comparison
+    },
+    'Mojo::Redis' => sub {
+        # comparison
+    },
+});
+
+# Target: within 20% of Net::Async::Redis performance
+```
+
+### Test Checklist
+
+Before release, ALL must pass:
+
+- [ ] All unit tests pass
+- [ ] All integration tests pass with Redis 6.2, 7.0, 7.2, 8.0
+- [ ] All tests pass on Perl 5.18, 5.26, 5.34, 5.38
+- [ ] TLS tests pass
+- [ ] Unix socket tests pass
+- [ ] Fork safety tests pass
+- [ ] 1-hour long-running test passes
+- [ ] 10000 ops/sec throughput achieved
+- [ ] Memory usage stable over long run
+- [ ] No test flakiness (run 10x)
+- [ ] Coverage >= 90%
+- [ ] Benchmark within 20% of Net::Async::Redis
 
 ---
 
