@@ -135,6 +135,90 @@ When `auto_pipeline` enabled:
 - Responses distributed to original Futures
 - Transparent to caller - same API as non-pipelined
 
+#### Flush Mechanism (Concrete Implementation)
+
+The "event loop yields" behavior requires a precise implementation:
+
+```perl
+# AutoPipeline state
+has _queue         => [];      # pending commands
+has _flush_pending => 0;       # guard against double-scheduling
+has _flushing      => 0;       # guard against reentrancy
+
+sub command {
+    my ($self, @args) = @_;
+
+    my $future = Future->new;
+    push @{$self->{_queue}}, { cmd => \@args, future => $future };
+
+    # Schedule flush exactly once per batch
+    unless ($self->{_flush_pending}) {
+        $self->{_flush_pending} = 1;
+        $self->_schedule_flush;
+    }
+
+    return $future;
+}
+
+sub _schedule_flush {
+    my ($self) = @_;
+
+    # Use event loop's "next tick" mechanism
+    # This runs after current code yields but before I/O
+    Future::IO->later->on_done(sub {
+        $self->_do_flush;
+    });
+}
+
+sub _do_flush {
+    my ($self) = @_;
+
+    # Reentrancy guard - flush must not run inside flush
+    return if $self->{_flushing};
+    $self->{_flushing} = 1;
+
+    # Reset pending flag before flush (allows new commands to queue)
+    $self->{_flush_pending} = 0;
+
+    # Take current queue (new commands go to fresh queue)
+    my @batch = splice @{$self->{_queue}};
+
+    if (@batch) {
+        # Respect pipeline depth limit
+        my $max = $self->{pipeline_depth} // 1000;
+        if (@batch > $max) {
+            # Put excess back, schedule another flush
+            unshift @{$self->{_queue}}, splice(@batch, $max);
+            $self->{_flush_pending} = 1;
+            $self->_schedule_flush;
+        }
+
+        $self->_send_pipeline(\@batch);
+    }
+
+    $self->{_flushing} = 0;
+}
+```
+
+**Key invariants:**
+
+| Rule | Why |
+|------|-----|
+| `_flush_pending` flag | Prevents scheduling multiple flush callbacks for same batch |
+| `_flushing` guard | Prevents reentrancy if callback somehow triggers command |
+| `splice @queue` | Atomically takes batch; new commands go to fresh queue |
+| `later` not `sleep(0)` | `later` is non-blocking next-tick; `sleep(0)` may block |
+| Depth limit with reschedule | Prevents unbounded memory if commands arrive faster than flush |
+
+**Event loop compatibility:**
+
+```perl
+# Future::IO->later uses the active implementation:
+# - IO::Async: $loop->later(sub { ... })
+# - AnyEvent: AE::postpone(sub { ... })
+# - UV: $loop->idle(sub { ... })
+```
+
 ### Retry Strategies
 
 ```perl
@@ -153,15 +237,122 @@ my $redis = Future::IO::Redis->new(
 );
 ```
 
-Retryable errors:
-- Connection lost (reconnect first, then retry)
-- Timeout (if idempotent command)
-- LOADING (Redis still loading dataset)
-- BUSY (script in progress)
+### Command State Tracking
 
-Non-retryable:
-- WRONGTYPE, OOM, NOSCRIPT, AUTH errors
-- Write commands (unless explicitly marked idempotent)
+Every command has a state that determines retry safety:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Command States                                                 │
+│                                                                 │
+│  QUEUED ──► WRITTEN ──► RESPONDED                               │
+│     │          │            │                                   │
+│     │          │            └─► Complete (no retry needed)      │
+│     │          │                                                │
+│     │          └─► Failure here = MAYBE EXECUTED                │
+│     │              (timeout, connection drop after write)       │
+│     │              NOT safe to retry by default                 │
+│     │                                                           │
+│     └─► Failure here = DEFINITELY NOT EXECUTED                  │
+│         (connection drop before write)                          │
+│         Safe to retry                                           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation:**
+
+```perl
+# Each @inflight entry tracks state
+push @inflight, {
+    future   => $future,
+    deadline => time() + $timeout,
+    command  => \@args,
+    state    => 'queued',  # queued | written | responded
+};
+
+# After successful write
+sub _on_write_complete {
+    my ($self, $entry) = @_;
+    $entry->{state} = 'written';
+}
+
+# On response received
+sub _on_response {
+    my ($self, $response) = @_;
+    my $entry = shift @{$self->{inflight}};
+    $entry->{state} = 'responded';
+    # ... resolve future
+}
+```
+
+### Retry Safety Rules
+
+**Safe to auto-retry** (command was never sent):
+- Connection lost while command still `queued`
+- LOADING (Redis still loading dataset)
+- BUSY (Lua script in progress, command wasn't executed)
+
+**NOT safe to auto-retry by default** (command may have executed):
+- Connection lost after command `written`
+- Timeout after command `written`
+- Any failure where `state != 'queued'`
+
+**Never retry:**
+- WRONGTYPE, OOM, NOSCRIPT, AUTH errors (deterministic failures)
+- Commands that succeeded (obviously)
+
+### Timeout + Retry Interaction
+
+**Critical rule:** Timeout after write = maybe executed = no auto-retry.
+
+```perl
+sub _handle_timeout {
+    my ($self, $entry) = @_;
+
+    if ($entry->{state} eq 'queued') {
+        # Never sent - safe to queue for retry after reconnect
+        push @{$self->{retry_queue}}, $entry;
+    } else {
+        # Written but no response - maybe executed
+        # Default: fail permanently (safe)
+        $entry->{future}->fail(
+            Error::Timeout->new(
+                message => "Request timed out (maybe executed)",
+                maybe_executed => 1,
+            )
+        );
+    }
+
+    # Always reset connection on timeout (RESP2 stream desync)
+    $self->_reset_connection;
+}
+```
+
+**Optional "maybe executed" retry policy:**
+
+```perl
+my $redis = Future::IO::Redis->new(
+    # For users who accept the risk of duplicate execution
+    retry_maybe_executed => 1,  # default: 0 (safe)
+);
+```
+
+When enabled, commands marked as idempotent retry even after write. This is **dangerous** for non-idempotent commands like `INCR` or `LPUSH`.
+
+### Idempotent Command Marking
+
+```perl
+# Mark specific commands as safe to retry even after write
+my $redis = Future::IO::Redis->new(
+    idempotent_commands => [qw(GET SET SETNX SETEX GETSET)],
+);
+
+# Or per-command
+await $redis->set('key', 'value', idempotent => 1);
+```
+
+**Default idempotent commands:** GET, MGET, EXISTS, TYPE, TTL, PTTL, KEYS, SCAN, INFO, PING, ECHO, DEBUG, TIME, DBSIZE
 
 ### Timeout Implementation
 
@@ -376,7 +567,7 @@ sub _handle_timeout {
     # 1. Fail the timed-out request
     $timed_out_entry->{future}->fail(
         Future::IO::Redis::Error::Timeout->new(
-            message => "Request timed out after $self->{read_timeout}s",
+            message => "Request timed out after $self->{request_timeout}s",
             command => $timed_out_entry->{command},
         )
     );
@@ -868,7 +1059,7 @@ The only safe action is to fail all slots and let the caller retry.
 ### Behavior
 
 - Commands queued locally until `execute` called
-- All commands sent in single write (atomic network operation)
+- All commands sent as contiguous byte stream (write_all semantics - full buffer written before reading)
 - Responses collected in order
 - **Command-level Redis errors**: Captured per-slot, pipeline continues
 - **Transport/protocol errors**: Entire pipeline fails, connection reset
@@ -1275,8 +1466,11 @@ sub release {
     if ($conn->is_dirty) {
         $self->{stats}{destroyed}++;
 
-        if ($self->{on_dirty} eq 'cleanup') {
-            # Attempt cleanup (risky but configurable)
+        # Determine if cleanup is even possible
+        my $cleanup_allowed = $self->_can_attempt_cleanup($conn);
+
+        if ($cleanup_allowed && $self->{on_dirty} eq 'cleanup') {
+            # Attempt cleanup (only for safe states)
             $self->_cleanup_connection($conn)
                 ->timeout($self->{cleanup_timeout})
                 ->on_done(sub { $self->_return_to_pool($conn) })
@@ -1292,22 +1486,57 @@ sub release {
     # Clean connection - return to pool
     $self->_return_to_pool($conn);
 }
+
+sub _can_attempt_cleanup {
+    my ($self, $conn) = @_;
+
+    # NEVER attempt cleanup for these states - always destroy:
+
+    # 1. PubSub mode - UNSUBSCRIBE returns confirmation frames that
+    #    must be correctly drained in modal pubsub mode. Any mismatch
+    #    is a protocol hazard. Too risky.
+    return 0 if $conn->{in_pubsub};
+
+    # 2. Inflight requests - after timeout/reset model we've already
+    #    declared the stream desynced. Draining responses that may
+    #    never arrive is impossible to do safely.
+    return 0 if @{$conn->{inflight} // []} > 0;
+
+    # 3. Connection marked as desynced/broken
+    return 0 if $conn->{protocol_error};
+
+    # Cleanup MAY be attempted for these (still risky, but bounded):
+    # - in_multi: DISCARD is safe if we're actually in MULTI
+    # - watching: UNWATCH is always safe
+    return 1 if $conn->{in_multi} || $conn->{watching};
+
+    # Unknown dirty state - don't risk it
+    return 0;
+}
 ```
 
-#### Cleanup Sequence (Optional, Non-Default)
+**Cleanup eligibility summary:**
 
-If `on_dirty => 'cleanup'` is configured:
+| Dirty State | Cleanup Allowed? | Reason |
+|-------------|-----------------|--------|
+| `in_multi` | Yes | DISCARD is safe, bounded |
+| `watching` | Yes | UNWATCH is always safe |
+| `in_pubsub` | **NO** | Modal protocol, confirmation drain hazard |
+| `inflight > 0` | **NO** | Responses may never arrive (timeout/reset) |
+| `protocol_error` | **NO** | Stream already known-desynced |
+
+#### Cleanup Sequence (Optional, Non-Default, Limited States Only)
+
+If `on_dirty => 'cleanup'` is configured AND `_can_attempt_cleanup` returned true:
 
 ```perl
 async sub _cleanup_connection {
     my ($self, $conn) = @_;
 
-    # 1. Wait for inflight to drain (with timeout)
-    if (@{$conn->{inflight}} > 0) {
-        await $self->_drain_inflight($conn, timeout => 2);
-    }
+    # Note: This is only called for in_multi or watching states.
+    # PubSub and inflight connections are always destroyed (see _can_attempt_cleanup).
 
-    # 2. Reset transaction state
+    # Reset transaction state
     if ($conn->{in_multi}) {
         await $conn->command('DISCARD');
         $conn->{in_multi} = 0;
@@ -1318,17 +1547,16 @@ async sub _cleanup_connection {
         $conn->{watching} = 0;
     }
 
-    # 3. Exit pubsub mode (must unsubscribe from all)
-    if ($conn->{in_pubsub}) {
-        await $conn->command('UNSUBSCRIBE');
-        await $conn->command('PUNSUBSCRIBE');
-        # May need to drain subscription confirmations
-        $conn->{in_pubsub} = 0;
-    }
+    # Verify connection is now clean
+    die "Connection still dirty after cleanup" if $conn->is_dirty;
 
     return $conn;
 }
 ```
+
+**Note:** The previous version attempted to drain inflight responses and exit pubsub mode. This was removed because:
+- **Inflight drain** - After a timeout, we've already reset the connection per our timeout model. Waiting for responses that may never arrive is unsafe.
+- **PubSub exit** - UNSUBSCRIBE/PUNSUBSCRIBE return confirmation frames that must be consumed correctly. In modal RESP2 pubsub, any mismatch corrupts the stream. The risk exceeds the benefit.
 
 #### Why Destroy Is The Safe Default
 
