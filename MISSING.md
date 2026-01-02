@@ -190,6 +190,63 @@ Future::IO->on_fork(sub {
 
 ---
 
+## Implementation Observations (Phase 8 - Testing & Polish)
+
+### Async-Friendly External Process Execution
+
+**Problem:** Running external commands (like `docker restart redis`) during tests blocks the event loop. Need to verify async behavior while controlling external services.
+
+**Current Workaround:**
+```perl
+# Must use IO::Async::Process manually
+my $process = IO::Async::Process->new(
+    command => ['docker', 'restart', 'redis'],
+    on_finish => sub { $future->done(@_) },
+);
+$loop->add($process);
+await $future;
+```
+
+**Desired API:**
+```perl
+my $output = await Future::IO->run_command('docker', 'restart', 'redis');
+```
+
+### Tick Counting / Event Loop Verification
+
+**Problem:** No standard way to verify the event loop is actually ticking during async operations. Tests need to prove non-blocking behavior.
+
+**Current Workaround:**
+```perl
+my @ticks;
+my $timer = IO::Async::Timer::Periodic->new(
+    interval => 0.01,
+    on_tick => sub { push @ticks, time() },
+);
+$loop->add($timer);
+$timer->start;
+# ... run operation ...
+$timer->stop;
+ok(@ticks >= 5, 'event loop ticked');
+```
+
+**Desired API:**
+```perl
+my ($result, $tick_count) = await Future::IO->with_tick_counter(
+    $redis->long_operation(),
+    interval => 0.01,
+);
+ok($tick_count >= 5, 'event loop not blocked');
+```
+
+### Test Skip with Async Check
+
+**Problem:** Checking if a service is available (Redis, etc.) often requires blocking code during test bootstrap. Want to keep test setup async-friendly.
+
+**Observation:** The split between "bootstrap may block" and "test body must be async" creates cognitive overhead. Would be nice if everything could be consistently async.
+
+---
+
 ## Notes
 
 These observations come from building Future::IO::Redis, specifically:
