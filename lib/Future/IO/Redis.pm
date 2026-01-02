@@ -32,6 +32,9 @@ use Future::IO::Redis::Transaction;
 # Script support
 use Future::IO::Redis::Script;
 
+# Iterator support
+use Future::IO::Redis::Iterator;
+
 # Try XS version first, fall back to pure Perl
 BEGIN {
     eval { require Protocol::Redis::XS; 1 }
@@ -770,6 +773,54 @@ sub script {
     return Future::IO::Redis::Script->new(
         redis  => $self,
         script => $code,
+    );
+}
+
+# ============================================================================
+# SCAN Iterators
+# ============================================================================
+
+sub scan_iter {
+    my ($self, %opts) = @_;
+    return Future::IO::Redis::Iterator->new(
+        redis   => $self,
+        command => 'SCAN',
+        match   => $opts{match},
+        count   => $opts{count},
+        type    => $opts{type},
+    );
+}
+
+sub hscan_iter {
+    my ($self, $key, %opts) = @_;
+    return Future::IO::Redis::Iterator->new(
+        redis   => $self,
+        command => 'HSCAN',
+        key     => $key,
+        match   => $opts{match},
+        count   => $opts{count},
+    );
+}
+
+sub sscan_iter {
+    my ($self, $key, %opts) = @_;
+    return Future::IO::Redis::Iterator->new(
+        redis   => $self,
+        command => 'SSCAN',
+        key     => $key,
+        match   => $opts{match},
+        count   => $opts{count},
+    );
+}
+
+sub zscan_iter {
+    my ($self, $key, %opts) = @_;
+    return Future::IO::Redis::Iterator->new(
+        redis   => $self,
+        command => 'ZSCAN',
+        key     => $key,
+        match   => $opts{match},
+        count   => $opts{count},
     );
 }
 
