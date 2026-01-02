@@ -29,6 +29,9 @@ use Future::IO::Redis::KeyExtractor;
 # Transaction support
 use Future::IO::Redis::Transaction;
 
+# Script support
+use Future::IO::Redis::Script;
+
 # Try XS version first, fall back to pure Perl
 BEGIN {
     eval { require Protocol::Redis::XS; 1 }
@@ -708,6 +711,66 @@ async sub keys {
 async sub flushdb {
     my ($self) = @_;
     return await $self->command('FLUSHDB');
+}
+
+# ============================================================================
+# Lua Scripting
+# ============================================================================
+
+async sub script_load {
+    my ($self, $script) = @_;
+    return await $self->command('SCRIPT', 'LOAD', $script);
+}
+
+async sub script_exists {
+    my ($self, @shas) = @_;
+    return await $self->command('SCRIPT', 'EXISTS', @shas);
+}
+
+async sub script_flush {
+    my ($self, $mode) = @_;
+    my @args = ('SCRIPT', 'FLUSH');
+    push @args, $mode if $mode;  # ASYNC or SYNC
+    return await $self->command(@args);
+}
+
+async sub script_kill {
+    my ($self) = @_;
+    return await $self->command('SCRIPT', 'KILL');
+}
+
+async sub evalsha_or_eval {
+    my ($self, $sha, $script, $numkeys, @keys_and_args) = @_;
+
+    # Try EVALSHA first
+    my $result;
+    eval {
+        $result = await $self->evalsha($sha, $numkeys, @keys_and_args);
+    };
+
+    if ($@) {
+        my $error = $@;
+
+        # Check if it's a NOSCRIPT error
+        if ("$error" =~ /NOSCRIPT/i) {
+            # Fall back to EVAL (which also loads the script)
+            $result = await $self->eval($script, $numkeys, @keys_and_args);
+        }
+        else {
+            # Re-throw other errors
+            die $error;
+        }
+    }
+
+    return $result;
+}
+
+sub script {
+    my ($self, $code) = @_;
+    return Future::IO::Redis::Script->new(
+        redis  => $self,
+        script => $code,
+    );
 }
 
 # ============================================================================
