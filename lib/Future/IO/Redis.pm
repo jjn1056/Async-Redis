@@ -17,6 +17,7 @@ use Time::HiRes qw(time);
 use Future::IO::Redis::Error::Connection;
 use Future::IO::Redis::Error::Timeout;
 use Future::IO::Redis::Error::Disconnected;
+use Future::IO::Redis::Error::Redis;
 
 # Try XS version first, fall back to pure Perl
 BEGIN {
@@ -50,6 +51,18 @@ sub _calculate_backoff {
 sub new {
     my ($class, %args) = @_;
 
+    # Parse URI if provided
+    if ($args{uri}) {
+        require Future::IO::Redis::URI;
+        my $uri = Future::IO::Redis::URI->parse($args{uri});
+        if ($uri) {
+            my %uri_args = $uri->to_hash;
+            # URI values are defaults, explicit args override
+            %args = (%uri_args, %args);
+            delete $args{uri};  # don't store the string
+        }
+    }
+
     my $self = bless {
         host     => $args{host} // 'localhost',
         port     => $args{port} // 6379,
@@ -82,6 +95,15 @@ sub new {
         on_connect    => $args{on_connect},
         on_disconnect => $args{on_disconnect},
         on_error      => $args{on_error},
+
+        # Authentication
+        password    => $args{password},
+        username    => $args{username},
+        database    => $args{database} // 0,
+        client_name => $args{client_name},
+
+        # TLS (will implement fully in Task 6)
+        tls => $args{tls},
     }, $class;
 
     return $self;
@@ -151,6 +173,9 @@ async sub connect {
     $self->{connected} = 1;
     $self->{inflight} = [];
 
+    # Run Redis protocol handshake (AUTH, SELECT, CLIENT SETNAME)
+    await $self->_redis_handshake;
+
     # Fire on_connect callback and reset reconnect counter
     if ($self->{on_connect}) {
         $self->{on_connect}->($self);
@@ -158,6 +183,57 @@ async sub connect {
     $self->{_reconnect_attempt} = 0;
 
     return $self;
+}
+
+# Redis protocol handshake after TCP connect
+async sub _redis_handshake {
+    my ($self) = @_;
+
+    # AUTH (password or username+password for ACL)
+    if ($self->{password}) {
+        my @auth_args = ('AUTH');
+        push @auth_args, $self->{username} if $self->{username};
+        push @auth_args, $self->{password};
+
+        my $cmd = $self->_build_command(@auth_args);
+        await $self->_send($cmd);
+
+        my $response = await $self->_read_response();
+        my $result = $self->_decode_response($response);
+
+        # AUTH returns OK on success, throws on failure
+        unless ($result && $result eq 'OK') {
+            die Future::IO::Redis::Error::Redis->new(
+                message => "Authentication failed: $result",
+                type    => 'NOAUTH',
+            );
+        }
+    }
+
+    # SELECT database
+    if ($self->{database} && $self->{database} != 0) {
+        my $cmd = $self->_build_command('SELECT', $self->{database});
+        await $self->_send($cmd);
+
+        my $response = await $self->_read_response();
+        my $result = $self->_decode_response($response);
+
+        unless ($result && $result eq 'OK') {
+            die Future::IO::Redis::Error::Redis->new(
+                message => "SELECT failed: $result",
+                type    => 'ERR',
+            );
+        }
+    }
+
+    # CLIENT SETNAME
+    if ($self->{client_name}) {
+        my $cmd = $self->_build_command('CLIENT', 'SETNAME', $self->{client_name});
+        await $self->_send($cmd);
+
+        my $response = await $self->_read_response();
+        # Ignore result - SETNAME failing shouldn't prevent connection
+    }
 }
 
 # Disconnect from Redis
