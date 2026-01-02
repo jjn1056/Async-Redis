@@ -113,7 +113,7 @@ my $redis = Future::IO::Redis->new(
 - Exponential backoff: 0.1s -> 0.2s -> 0.4s -> ... -> 60s max
 - Jitter prevents thundering herd when many clients reconnect
 - `on_disconnect` fires with reason: `connection_lost`, `timeout`, `server_closed`
-- Key prefixing uses key extraction strategy (see Section 6.1)
+- Key prefixing uses key extraction strategy (see Section 11.1)
 - Fork safety: detect PID change and create fresh connections (for prefork servers)
 
 ### Auto-Pipelining
@@ -1140,7 +1140,7 @@ my $num = await $redis->spublish('channel1', 'hello');
 
 ---
 
-## Section 5: Connection Pool
+## Section 10: Connection Pool
 
 ### Constructor
 
@@ -1488,7 +1488,7 @@ await $pool->with(async sub {
 
 ---
 
-## Section 6: Command Generation
+## Section 11: Command Generation
 
 ### Build Process
 
@@ -1571,11 +1571,11 @@ Some commands need return value transformation:
 4. Generate POD documentation per command
 5. Track Redis version requirement for each command
 6. Handle subcommands (CLIENT, CLUSTER, CONFIG, etc.)
-7. **Extract and encode key position metadata** (see Section 6.1)
+7. **Extract and encode key position metadata** (see Section 11.1)
 
 ---
 
-## Section 6.1: Key Extraction Strategy
+## Section 11.1: Key Extraction Strategy
 
 Key prefixing **cannot** be "transparent to all key arguments" without understanding command structure. Redis commands have keys in various positions:
 
@@ -2677,7 +2677,7 @@ The non-blocking proof test (`t/00-nonblocking-proof.t`) must be run:
 
 ---
 
-## Section 15: Testing Strategy
+## Section 12: Testing Strategy
 
 ### Test Categories
 
@@ -3337,6 +3337,87 @@ my $redis = Future::IO::Redis->new(
     },
 );
 ```
+
+### Credential & Sensitive Data Redaction
+
+**By default, command arguments are logged, but sensitive commands are redacted:**
+
+| Command | Logged As | Reason |
+|---------|-----------|--------|
+| `AUTH password` | `AUTH [REDACTED]` | Password exposure |
+| `AUTH user pass` | `AUTH user [REDACTED]` | ACL password exposure |
+| `CONFIG SET requirepass x` | `CONFIG SET requirepass [REDACTED]` | Password in config |
+| `MIGRATE ... AUTH pass` | `MIGRATE ... AUTH [REDACTED]` | Migration password |
+| `MIGRATE ... AUTH2 user pass` | `MIGRATE ... AUTH2 user [REDACTED]` | Migration ACL password |
+
+**Implementation:**
+
+```perl
+# Redacted commands list (auto-generated from commands.json where applicable)
+my %REDACT_COMMANDS = (
+    AUTH     => sub { my @a = @_; $a[0] = '[REDACTED]' if @a >= 1; $a[1] = '[REDACTED]' if @a >= 2; @a },
+    CONFIG   => sub { my @a = @_; $a[2] = '[REDACTED]' if $a[0] eq 'SET' && $a[1] =~ /pass/i; @a },
+    MIGRATE  => \&_redact_migrate_auth,
+);
+
+sub _format_command_for_log {
+    my ($self, @cmd) = @_;
+
+    my $name = uc($cmd[0] // '');
+    my @args = @cmd[1..$#cmd];
+
+    if (my $redactor = $REDACT_COMMANDS{$name}) {
+        @args = $redactor->(@args);
+    }
+
+    return join(' ', $name, @args);
+}
+```
+
+**Trace span `db.statement` attribute:**
+
+- **Default**: Redacted (same rules as debug logging)
+- **Option**: `otel_include_args => 0` disables command args entirely in traces
+- **Option**: `otel_redact => 0` disables redaction (NOT recommended for production)
+
+```perl
+my $redis = Future::IO::Redis->new(
+    otel_tracer => $tracer,
+
+    # Span db.statement options:
+    otel_include_args => 1,        # Include args (default: 1)
+    otel_redact       => 1,        # Redact sensitive args (default: 1)
+);
+
+# With defaults:
+# AUTH command → span.db.statement = "AUTH [REDACTED]"
+# GET key      → span.db.statement = "GET key"
+
+# With otel_include_args => 0:
+# All commands → span.db.statement = "GET" (command name only)
+```
+
+**Key values are NOT logged by default** (they may contain sensitive data):
+
+```perl
+# GET sensitive_key → logs "GET sensitive_key" (key name visible)
+# Response: "secret123" → logs response size only, not content
+
+# To log response values (dangerous!):
+debug => { include_values => 1 }  # NOT recommended
+```
+
+**What IS logged by default:**
+
+| Item | Logged | Notes |
+|------|--------|-------|
+| Command name | Yes | Always visible |
+| Key names | Yes | May reveal schema |
+| Non-sensitive args | Yes | Counts, ranges, options |
+| AUTH passwords | No | Always redacted |
+| CONFIG passwords | No | Always redacted |
+| Response values | No | Only size/type logged |
+| Connection password | No | Never logged anywhere |
 
 ---
 
