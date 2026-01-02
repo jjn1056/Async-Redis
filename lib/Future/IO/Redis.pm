@@ -11,6 +11,12 @@ use Future::AsyncAwait;
 use Future::IO 0.17;  # Need read/write methods
 use Socket qw(pack_sockaddr_in inet_aton AF_INET SOCK_STREAM);
 use IO::Socket::INET;
+use Time::HiRes qw(time);
+
+# Error classes
+use Future::IO::Redis::Error::Connection;
+use Future::IO::Redis::Error::Timeout;
+use Future::IO::Redis::Error::Disconnected;
 
 # Try XS version first, fall back to pure Perl
 BEGIN {
@@ -33,6 +39,16 @@ sub new {
         connected => 0,
         subscribing => 0,
         _read_buffer => '',
+
+        # Timeout settings
+        connect_timeout         => $args{connect_timeout} // 10,
+        read_timeout            => $args{read_timeout} // 30,
+        write_timeout           => $args{write_timeout} // 30,
+        request_timeout         => $args{request_timeout} // 5,
+        blocking_timeout_buffer => $args{blocking_timeout_buffer} // 2,
+
+        # Inflight tracking with deadlines
+        inflight => [],
     }, $class;
 
     return $self;
@@ -48,19 +64,59 @@ async sub connect {
     my $socket = IO::Socket::INET->new(
         Proto    => 'tcp',
         Blocking => 0,
-    ) or die "Cannot create socket: $!";
+    ) or die Future::IO::Redis::Error::Connection->new(
+        message => "Cannot create socket: $!",
+        host    => $self->{host},
+        port    => $self->{port},
+    );
 
     # Build sockaddr
     my $addr = inet_aton($self->{host})
-        or die "Cannot resolve host: $self->{host}";
+        or die Future::IO::Redis::Error::Connection->new(
+            message => "Cannot resolve host: $self->{host}",
+            host    => $self->{host},
+            port    => $self->{port},
+        );
     my $sockaddr = pack_sockaddr_in($self->{port}, $addr);
 
-    # Connect asynchronously
-    await Future::IO->connect($socket, $sockaddr);
+    # Connect with timeout using Future->wait_any
+    my $connect_f = Future::IO->connect($socket, $sockaddr);
+    my $timeout_f = Future::IO->sleep($self->{connect_timeout})->then(sub {
+        return Future->fail('connect_timeout');
+    });
+
+    my $wait_f = Future->wait_any($connect_f, $timeout_f);
+
+    # Use followed_by to handle both success and failure without await propagating failure
+    my $result_f = $wait_f->followed_by(sub {
+        my ($f) = @_;
+        return Future->done($f);  # wrap the future itself
+    });
+
+    my $completed_f = await $result_f;
+
+    # Now check the result
+    if ($completed_f->is_failed) {
+        my ($error) = $completed_f->failure;
+        close $socket;
+
+        if ($error eq 'connect_timeout') {
+            die Future::IO::Redis::Error::Timeout->new(
+                message => "Connect timed out after $self->{connect_timeout}s",
+                timeout => $self->{connect_timeout},
+            );
+        }
+        die Future::IO::Redis::Error::Connection->new(
+            message => "$error",
+            host    => $self->{host},
+            port    => $self->{port},
+        );
+    }
 
     $self->{socket} = $socket;
     $self->{parser} = _parser_class()->new(api => 1);
     $self->{connected} = 1;
+    $self->{inflight} = [];
 
     return $self;
 }
@@ -127,17 +183,134 @@ async sub _read_response {
     }
 }
 
+# Calculate deadline based on command type
+sub _calculate_deadline {
+    my ($self, $cmd, @args) = @_;
+
+    $cmd = uc($cmd // '');
+
+    # Blocking commands get extended deadline
+    if ($cmd =~ /^(BLPOP|BRPOP|BLMOVE|BRPOPLPUSH|BLMPOP|BZPOPMIN|BZPOPMAX|BZMPOP)$/) {
+        # Last arg is the timeout for these commands
+        my $server_timeout = $args[-1] // 0;
+        return time() + $server_timeout + $self->{blocking_timeout_buffer};
+    }
+
+    if ($cmd =~ /^(XREAD|XREADGROUP)$/) {
+        # XREAD/XREADGROUP have BLOCK option
+        for my $i (0 .. $#args - 1) {
+            if (uc($args[$i]) eq 'BLOCK') {
+                my $block_ms = $args[$i + 1] // 0;
+                return time() + ($block_ms / 1000) + $self->{blocking_timeout_buffer};
+            }
+        }
+    }
+
+    # Normal commands use request_timeout
+    return time() + $self->{request_timeout};
+}
+
 # Execute a Redis command
 async sub command {
     my ($self, @args) = @_;
 
-    die "Not connected" unless $self->{connected};
+    die Future::IO::Redis::Error::Disconnected->new(
+        message => "Not connected",
+    ) unless $self->{connected};
 
     my $cmd = $self->_build_command(@args);
+
+    # Calculate deadline based on command type
+    my $deadline = $self->_calculate_deadline($args[0], @args[1..$#args]);
+
+    # Send command
     await $self->_send($cmd);
 
-    my $response = await $self->_read_response();
+    # Read response with timeout
+    my $response = await $self->_read_response_with_deadline($deadline, \@args);
     return $self->_decode_response($response);
+}
+
+# Read response with deadline enforcement
+async sub _read_response_with_deadline {
+    my ($self, $deadline, $cmd_ref) = @_;
+
+    # First check if parser already has a complete message
+    if (my $msg = $self->{parser}->get_message) {
+        return $msg;
+    }
+
+    # Read until we get a complete message
+    while (1) {
+        my $remaining = $deadline - time();
+
+        if ($remaining <= 0) {
+            $self->_reset_connection;
+            die Future::IO::Redis::Error::Timeout->new(
+                message        => "Request timed out after $self->{request_timeout}s",
+                command        => $cmd_ref,
+                timeout        => $self->{request_timeout},
+                maybe_executed => 1,  # already sent the command
+            );
+        }
+
+        # Use wait_any for timeout
+        my $read_f = Future::IO->read($self->{socket}, 65536);
+        my $timeout_f = Future::IO->sleep($remaining)->then(sub {
+            return Future->fail('read_timeout');
+        });
+
+        my $wait_f = Future->wait_any($read_f, $timeout_f);
+        await $wait_f;
+
+        if ($wait_f->is_failed) {
+            my ($error) = $wait_f->failure;
+            if ($error eq 'read_timeout') {
+                $self->_reset_connection;
+                die Future::IO::Redis::Error::Timeout->new(
+                    message        => "Request timed out after $self->{request_timeout}s",
+                    command        => $cmd_ref,
+                    timeout        => $self->{request_timeout},
+                    maybe_executed => 1,
+                );
+            }
+            $self->_reset_connection;
+            die Future::IO::Redis::Error::Connection->new(
+                message => "$error",
+            );
+        }
+
+        # Get the read result
+        my $buf = $wait_f->get;
+
+        # EOF
+        if (!defined $buf || length($buf) == 0) {
+            $self->_reset_connection;
+            die Future::IO::Redis::Error::Connection->new(
+                message => "Connection closed by server",
+            );
+        }
+
+        $self->{parser}->parse($buf);
+
+        if (my $msg = $self->{parser}->get_message) {
+            return $msg;
+        }
+    }
+}
+
+# Reset connection after timeout (stream is desynced)
+sub _reset_connection {
+    my ($self) = @_;
+
+    if ($self->{socket}) {
+        close $self->{socket};
+        $self->{socket} = undef;
+    }
+
+    $self->{connected} = 0;
+    $self->{parser} = undef;
+    $self->{inflight} = [];
 }
 
 # Decode Protocol::Redis response to Perl value

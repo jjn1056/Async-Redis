@@ -43,7 +43,7 @@ subtest 'publish and subscribe' => sub {
         my $subscription = await $sub->subscribe('test:channel');
 
         # Read 3 messages then stop
-        for (1..3) {
+        for my $i (1..3) {
             my $msg = await $subscription->next_message;
             push @received, $msg;
         }
@@ -92,7 +92,7 @@ subtest 'multiple channel subscription' => sub {
     my $sub_future = (async sub {
         my $subscription = await $sub->subscribe('chan:a', 'chan:b', 'chan:c');
 
-        for (1..3) {
+        for my $i (1..3) {
             my $msg = await $subscription->next_message;
             push @received, $msg;
         }
