@@ -20,11 +20,38 @@ Design for making Future::IO::Redis a production-ready, rock-solid Redis client.
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
+| **Protocol** | **RESP2 only (v1.x)** | Protocol::Redis exists, works with all Redis versions, XS-accelerated |
 | Command coverage | Auto-generate from redis-doc JSON | Matches Net::Async::Redis, stays current with Redis releases |
 | Method naming | snake_case (`cluster_addslots`) | Net::Async::Redis compatibility |
 | Error handling | Typed exception classes | Clear failure categories, catchable |
 | Reconnection | Automatic with exponential backoff | Production resilience |
 | TLS | IO::Socket::SSL (optional dep) | Standard Perl TLS solution |
+
+### Protocol Version: RESP2
+
+**This release (v1.x) implements RESP2 only.**
+
+RESP2 is the legacy Redis protocol supported by all Redis versions. We use Protocol::Redis (with optional XS acceleration) for parsing.
+
+**What this means:**
+- Works with Redis 2.x, 3.x, 4.x, 5.x, 6.x, 7.x, 8.x
+- PubSub requires dedicated connection (cannot share with commands)
+- HGETALL returns array (we convert to hash in transformer)
+- No client-side caching support
+- No sharded PubSub on same connection
+
+**RESP3 is planned for v2.x** - See `TODO.md` for details. RESP3 would enable:
+- Inline PubSub (same connection as commands)
+- Native map/set/boolean types
+- Client-side caching via invalidation messages
+- Sharded PubSub without connection overhead
+
+**Why RESP2 first:**
+1. Protocol::Redis already exists and is battle-tested
+2. No RESP3 parser exists on CPAN (would need to write one)
+3. RESP2 covers all core functionality
+4. Faster path to production-ready release
+5. RESP3 can be added without breaking API
 
 ---
 
@@ -1954,15 +1981,9 @@ await $cluster->set('foo', 'bar');  # routes to correct node
 
 ### RESP3 Protocol
 
-```perl
-my $redis = Future::IO::Redis->new(
-    protocol => 3,  # RESP3
-);
-```
+See `TODO.md` for comprehensive RESP3 implementation plan.
 
-- Better type information (maps, sets, booleans, nulls)
-- Inline PubSub (no separate connection needed)
-- Client-side caching invalidation via push notifications
+Summary: RESP3 (Redis 6+) enables inline PubSub, native types, and client-side caching. Requires writing a new parser since none exists on CPAN.
 
 ---
 
