@@ -35,7 +35,7 @@ SKIP: {
     };
 
     subtest 'SET with options' => sub {
-        my $result = await_f($redis->set('test:str2', 'world', 'EX', 60));
+        my $result = await_f($redis->set('test:str2', 'world', ex => 60));
         is($result, 'OK', 'SET with EX returns OK');
 
         my $ttl = await_f($redis->ttl('test:str2'));

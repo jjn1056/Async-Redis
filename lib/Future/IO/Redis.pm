@@ -26,6 +26,9 @@ our @ISA = qw(Future::IO::Redis::Commands);
 # Key extraction for prefixing
 use Future::IO::Redis::KeyExtractor;
 
+# Transaction support
+use Future::IO::Redis::Transaction;
+
 # Try XS version first, fall back to pure Perl
 BEGIN {
     eval { require Protocol::Redis::XS; 1 }
@@ -114,6 +117,10 @@ sub new {
 
         # Key prefixing
         prefix => $args{prefix},
+
+        # Transaction state
+        in_multi => 0,
+        watching => 0,
     }, $class;
 
     return $self;
@@ -701,6 +708,171 @@ async sub keys {
 async sub flushdb {
     my ($self) = @_;
     return await $self->command('FLUSHDB');
+}
+
+# ============================================================================
+# Transactions
+# ============================================================================
+
+async sub multi {
+    my ($self, $callback) = @_;
+
+    # Prevent nested multi() calls
+    die "Cannot nest multi() calls - already in a transaction"
+        if $self->{in_multi};
+
+    # Mark that we're collecting transaction commands
+    $self->{in_multi} = 1;
+
+    my @commands;
+    eval {
+        # Create transaction collector
+        my $tx = Future::IO::Redis::Transaction->new(redis => $self);
+
+        # Run callback to collect commands
+        await $callback->($tx);
+
+        @commands = $tx->commands;
+    };
+    my $collect_error = $@;
+
+    if ($collect_error) {
+        $self->{in_multi} = 0;
+        die $collect_error;
+    }
+
+    # If no commands queued, return empty result
+    unless (@commands) {
+        $self->{in_multi} = 0;
+        return [];
+    }
+
+    # Execute transaction (in_multi already set)
+    return await $self->_execute_transaction(\@commands);
+}
+
+async sub _execute_transaction {
+    my ($self, $commands) = @_;
+
+    # in_multi should already be set by caller
+
+    my $results;
+    eval {
+        # Send MULTI
+        await $self->command('MULTI');
+
+        # Queue all commands (they return +QUEUED)
+        for my $cmd (@$commands) {
+            await $self->command(@$cmd);
+        }
+
+        # Execute and get results
+        $results = await $self->command('EXEC');
+    };
+    my $error = $@;
+
+    # Always clear transaction state
+    $self->{in_multi} = 0;
+
+    if ($error) {
+        # Try to clean up
+        eval { await $self->command('DISCARD') };
+        die $error;
+    }
+
+    return $results;
+}
+
+# Accessor for pool cleanliness tracking
+sub in_multi { shift->{in_multi} }
+sub watching { shift->{watching} }
+
+async sub watch {
+    my ($self, @keys) = @_;
+    $self->{watching} = 1;
+    return await $self->command('WATCH', @keys);
+}
+
+async sub unwatch {
+    my ($self) = @_;
+    my $result = await $self->command('UNWATCH');
+    $self->{watching} = 0;
+    return $result;
+}
+
+async sub multi_start {
+    my ($self) = @_;
+    $self->{in_multi} = 1;
+    return await $self->command('MULTI');
+}
+
+async sub exec {
+    my ($self) = @_;
+    my $result = await $self->command('EXEC');
+    $self->{in_multi} = 0;
+    $self->{watching} = 0;  # EXEC clears watches
+    return $result;
+}
+
+async sub discard {
+    my ($self) = @_;
+    my $result = await $self->command('DISCARD');
+    $self->{in_multi} = 0;
+    # Note: DISCARD does NOT clear watches
+    return $result;
+}
+
+async sub watch_multi {
+    my ($self, $keys, $callback) = @_;
+
+    # WATCH the keys
+    await $self->watch(@$keys);
+
+    # Get current values of watched keys
+    my %watched;
+    for my $key (@$keys) {
+        $watched{$key} = await $self->get($key);
+    }
+
+    # Create transaction collector
+    my $tx = Future::IO::Redis::Transaction->new(redis => $self);
+
+    # Run callback with watched values
+    await $callback->($tx, \%watched);
+
+    my @commands = $tx->commands;
+
+    # If no commands queued, just unwatch and return empty
+    unless (@commands) {
+        await $self->unwatch;
+        return [];
+    }
+
+    # Execute transaction
+    $self->{in_multi} = 1;
+
+    my $results;
+    eval {
+        await $self->command('MULTI');
+
+        for my $cmd (@commands) {
+            await $self->command(@$cmd);
+        }
+
+        $results = await $self->command('EXEC');
+    };
+    my $error = $@;
+
+    $self->{in_multi} = 0;
+    $self->{watching} = 0;
+
+    if ($error) {
+        eval { await $self->command('DISCARD') };
+        die $error;
+    }
+
+    # EXEC returns undef/nil if WATCH failed
+    return $results;
 }
 
 # ============================================================================
