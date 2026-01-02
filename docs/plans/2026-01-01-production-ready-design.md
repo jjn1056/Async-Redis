@@ -199,15 +199,104 @@ Future::IO::Redis::Error (base)
 
 ### Data Integrity Guarantees
 
-1. **Command-response pairing** - Each command gets a unique ID internally. Responses matched strictly. Mismatch = protocol error, connection reset.
+1. **FIFO command-response ordering** - Redis guarantees strict FIFO on each connection. We maintain an `@inflight` queue of pending Futures. Each response pops the next Future from the queue. No IDs needed - order is the invariant.
 
-2. **Pipeline safety** - Pipeline commands sent atomically (single write). Responses read in order. Partial failure = entire pipeline fails.
+2. **Pipeline safety** - Pipeline commands sent atomically (single write). Responses read in order, each popping from `@inflight`. Individual command errors captured in results, don't abort pipeline.
 
 3. **No silent failures** - Every command returns a Future that either resolves with data or fails with typed exception. Never hangs indefinitely (timeouts).
 
-4. **Reconnect safety** - Commands in-flight when connection drops fail with `Connection` error. Only queued (not-yet-sent) commands retry on reconnect.
+4. **Reconnect safety** - Commands in-flight when connection drops: all pending Futures in `@inflight` fail with `Connection` error. Only queued (not-yet-sent) commands retry on reconnect.
 
-5. **PubSub isolation** - Subscribe mode uses dedicated connection state. Regular commands on subscriber connection produce error.
+5. **PubSub isolation** - Subscribe mode is modal (RESP2). Regular commands on subscriber connection produce error.
+
+### Connection State Machine
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  RESP2 Normal Mode                                              │
+│                                                                  │
+│  send(cmd):                                                      │
+│    future = Future->new                                          │
+│    push @inflight, future                                        │
+│    write cmd to socket                                           │
+│    return future                                                 │
+│                                                                  │
+│  recv(response):                                                 │
+│    future = shift @inflight    # FIFO pop                        │
+│    future->done(response)      # or ->fail if Redis error        │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  RESP2 PubSub Mode (modal - entered via SUBSCRIBE)              │
+│                                                                  │
+│  Allowed commands: SUBSCRIBE, PSUBSCRIBE, UNSUBSCRIBE,          │
+│                    PUNSUBSCRIBE, PING, QUIT                      │
+│                                                                  │
+│  send(SUBSCRIBE channel):                                        │
+│    push @inflight, confirmation_future                           │
+│    write cmd to socket                                           │
+│                                                                  │
+│  recv(message):                                                  │
+│    if message[0] == 'subscribe':                                 │
+│      future = shift @inflight  # confirmation                    │
+│      future->done(message)                                       │
+│    elsif message[0] == 'message':                                │
+│      dispatch to subscription handler  # NOT from @inflight      │
+│                                                                  │
+│  Other commands → Error::Protocol                                │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│  RESP3 Mode (future - v2.x)                                     │
+│                                                                  │
+│  recv(frame):                                                    │
+│    if frame.type == '>' (push):                                  │
+│      route to push handler     # DON'T consume @inflight         │
+│      (pubsub message, invalidation, etc.)                        │
+│    else:                                                         │
+│      future = shift @inflight  # FIFO pop                        │
+│      future->done(frame)                                         │
+│                                                                  │
+│  Push messages and regular responses can interleave.             │
+│  @inflight only tracks request-response pairs.                   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Why FIFO, Not IDs
+
+Redis protocol has no request IDs. Unlike HTTP/2 or WebSockets, you cannot match responses to requests by ID. Redis guarantees:
+
+- Single connection = single stream
+- Responses arrive in exact order commands were sent
+- This is true even for pipelines
+
+Therefore, a simple queue is correct and sufficient:
+
+```perl
+# Correct: FIFO queue
+my @inflight;
+
+sub command {
+    my ($self, @args) = @_;
+    my $future = Future->new;
+    push @inflight, $future;
+    $self->_send(\@args);
+    return $future;
+}
+
+sub _on_response {
+    my ($self, $response) = @_;
+    my $future = shift @inflight;
+    if ($response->{type} eq '-') {
+        $future->fail(Error::Redis->new($response->{data}));
+    } else {
+        $future->done($self->_decode($response));
+    }
+}
+```
 
 ### Usage Pattern
 
