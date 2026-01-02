@@ -2853,6 +2853,14 @@ services:
 
 #### Test Helpers
 
+**Important: Test Bootstrap vs Test Body**
+
+| Phase | May Block? | Rationale |
+|-------|------------|-----------|
+| **Bootstrap** (skip checks, setup) | Yes, briefly | Runs before event loop, practical necessity |
+| **Test body** | **NO** | Must prove non-blocking behavior |
+| **Cleanup** | Prefer async | Part of test, should maintain discipline |
+
 ```perl
 # t/lib/Test/Future/IO/Redis.pm
 package Test::Future::IO::Redis;
@@ -2860,11 +2868,25 @@ package Test::Future::IO::Redis;
 use strict;
 use warnings;
 use Test2::V0;
+use IO::Async::Loop;
+use Future::IO::Impl::IOAsync;
 use Future::IO::Redis;
 
+our $loop;
+
+# Initialize event loop (call once at test start)
+sub init_loop {
+    $loop = IO::Async::Loop->new;
+    return $loop;
+}
+
 # Skip if no Redis available
+# NOTE: This uses ->get which BLOCKS briefly.
+# This is acceptable in bootstrap phase only.
+# Test bodies must use await, not ->get.
 sub skip_without_redis {
     my $redis = eval {
+        # BLOCKING - acceptable only in bootstrap
         Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
             connect_timeout => 2,
@@ -2874,11 +2896,30 @@ sub skip_without_redis {
     skip_all("Redis not available: $@");
 }
 
-# Clean up test keys
-sub cleanup_keys {
+# Async-friendly skip check (preferred)
+# Use when you've already initialized the loop
+sub skip_without_redis_async {
+    my $redis = Future::IO::Redis->new(
+        host => $ENV{REDIS_HOST} // 'localhost',
+        connect_timeout => 2,
+    );
+
+    my $connected = eval {
+        $loop->await($redis->connect);
+        1;
+    };
+
+    return $redis if $connected;
+    skip_all("Redis not available: $@");
+}
+
+# Clean up test keys - ASYNC version (preferred)
+sub cleanup_keys_async {
     my ($redis, $pattern) = @_;
-    my $keys = $redis->keys($pattern)->get;
-    $redis->del(@$keys)->get if @$keys;
+    return async sub {
+        my $keys = await $redis->keys($pattern);
+        await $redis->del(@$keys) if @$keys;
+    }->();
 }
 
 # Test with timeout wrapper
@@ -2888,16 +2929,71 @@ sub with_timeout {
     return $f->timeout($timeout);
 }
 
-# Assert Future fails with specific error type
-sub fails_with {
+# Assert Future fails with specific error type - ASYNC
+sub fails_with_async {
     my ($future, $error_class, $message) = @_;
     my $error;
-    eval { $future->get };
+    eval { $loop->await($future) };
     $error = $@;
     ok($error && $error->isa($error_class), $message);
 }
 
+# Async delay - use instead of sleep()!
+sub delay {
+    my ($seconds) = @_;
+    return Future::IO->sleep($seconds);
+}
+
+# Async process execution - use instead of system()!
+sub run_command_async {
+    my (@cmd) = @_;
+    require IO::Async::Process;
+
+    my $future = $loop->new_future;
+    my $stdout = '';
+    my $stderr = '';
+
+    my $process = IO::Async::Process->new(
+        command => \@cmd,
+        stdout => { into => \$stdout },
+        stderr => { into => \$stderr },
+        on_finish => sub {
+            my ($self, $exitcode) = @_;
+            if ($exitcode == 0) {
+                $future->done($stdout);
+            } else {
+                $future->fail("Command failed: $stderr", exitcode => $exitcode);
+            }
+        },
+    );
+
+    $loop->add($process);
+    return $future;
+}
+
 1;
+```
+
+**Usage in tests:**
+
+```perl
+# Test file setup
+use Test::Future::IO::Redis qw(init_loop skip_without_redis delay run_command_async);
+
+my $loop = init_loop();
+my $redis = skip_without_redis();  # Bootstrap - blocking OK here
+
+# Test body - MUST be async
+subtest 'my async test' => sub {
+    $loop->await(async sub {
+        await $redis->set('key', 'value');
+        my $result = await $redis->get('key');
+        is($result, 'value', 'got expected value');
+    }->());
+};
+
+# Cleanup - prefer async
+$loop->await(cleanup_keys_async($redis, 'test:*'));
 ```
 
 ### Test Scenarios
@@ -2908,38 +3004,61 @@ sub fails_with {
 # t/91-reliability/redis-restart.t
 
 use Test2::V0;
-use Test::Future::IO::Redis;
+use Test::Future::IO::Redis qw(
+    init_loop skip_without_redis delay run_command_async
+);
+use Future::AsyncAwait;
 
-my $redis = skip_without_redis();
+my $loop = init_loop();
+my $redis = skip_without_redis();  # Bootstrap - blocking OK
 
-subtest 'survives redis restart' => sub {
-    # Set up reconnection
-    my $disconnects = 0;
-    my $reconnects = 0;
+$loop->await(async sub {
+    subtest 'survives redis restart' => sub {
+        # Set up reconnection
+        my $disconnects = 0;
+        my $reconnects = 0;
 
-    $redis = Future::IO::Redis->new(
-        host => 'localhost',
-        reconnect => 1,
-        on_disconnect => sub { $disconnects++ },
-        on_connect => sub { $reconnects++ },
-    );
-    await $redis->connect;
+        my $redis = Future::IO::Redis->new(
+            host => 'localhost',
+            reconnect => 1,
+            on_disconnect => sub { $disconnects++ },
+            on_connect => sub { $reconnects++ },
+        );
+        await $redis->connect;
 
-    # Store value
-    await $redis->set('test:key', 'before');
+        # Store value
+        await $redis->set('test:key', 'before');
 
-    # Simulate Redis restart (need Docker control)
-    system('docker-compose restart redis');
-    sleep(2);  # Wait for restart
+        # Simulate Redis restart - ASYNC process execution
+        # WRONG: system('docker-compose restart redis');  # BLOCKS!
+        # WRONG: sleep(2);  # BLOCKS!
+        await run_command_async('docker-compose', 'restart', 'redis');
+        await delay(2);  # Async delay - does not block event loop
 
-    # Command should work after reconnect
-    my $value = await $redis->get('test:key');
-    is($value, 'before', 'value survives restart');
-    is($disconnects, 1, 'disconnect detected');
-    is($reconnects, 2, 'reconnected (initial + after restart)');
-};
+        # Command should work after reconnect
+        my $value = await $redis->get('test:key');
+        is($value, 'before', 'value survives restart');
+        is($disconnects, 1, 'disconnect detected');
+        is($reconnects, 2, 'reconnected (initial + after restart)');
+    };
+}->());
 
 done_testing;
+```
+
+**Common blocking mistakes to avoid:**
+
+```perl
+# WRONG - These block the event loop!
+sleep(2);                              # Use: await delay(2)
+system('docker-compose restart');      # Use: await run_command_async(...)
+my $result = $future->get;             # Use: my $result = await $future
+                                       #  or: $loop->await($future)
+
+# CORRECT - These are async
+await Future::IO->sleep(2);            # Async delay
+await run_command_async('docker', 'restart', 'redis');
+my $result = await $redis->get('key');
 ```
 
 #### Concurrency Tests
