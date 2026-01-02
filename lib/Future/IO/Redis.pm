@@ -1,0 +1,427 @@
+package Future::IO::Redis;
+
+use strict;
+use warnings;
+use 5.018;
+
+our $VERSION = '0.001';
+
+use Future;
+use Future::AsyncAwait;
+use Future::IO 0.17;  # Need read/write methods
+use Socket qw(pack_sockaddr_in inet_aton AF_INET SOCK_STREAM);
+use IO::Socket::INET;
+
+# Try XS version first, fall back to pure Perl
+BEGIN {
+    eval { require Protocol::Redis::XS; 1 }
+        or require Protocol::Redis;
+}
+
+sub _parser_class {
+    return $INC{'Protocol/Redis/XS.pm'} ? 'Protocol::Redis::XS' : 'Protocol::Redis';
+}
+
+sub new {
+    my ($class, %args) = @_;
+
+    my $self = bless {
+        host     => $args{host} // 'localhost',
+        port     => $args{port} // 6379,
+        socket   => undef,
+        parser   => undef,
+        connected => 0,
+        subscribing => 0,
+        _read_buffer => '',
+    }, $class;
+
+    return $self;
+}
+
+# Connect to Redis server
+async sub connect {
+    my ($self) = @_;
+
+    return $self if $self->{connected};
+
+    # Create socket
+    my $socket = IO::Socket::INET->new(
+        Proto    => 'tcp',
+        Blocking => 0,
+    ) or die "Cannot create socket: $!";
+
+    # Build sockaddr
+    my $addr = inet_aton($self->{host})
+        or die "Cannot resolve host: $self->{host}";
+    my $sockaddr = pack_sockaddr_in($self->{port}, $addr);
+
+    # Connect asynchronously
+    await Future::IO->connect($socket, $sockaddr);
+
+    $self->{socket} = $socket;
+    $self->{parser} = _parser_class()->new(api => 1);
+    $self->{connected} = 1;
+
+    return $self;
+}
+
+# Disconnect from Redis
+sub disconnect {
+    my ($self) = @_;
+
+    if ($self->{socket}) {
+        close $self->{socket};
+        $self->{socket} = undef;
+    }
+    $self->{connected} = 0;
+    $self->{parser} = undef;
+
+    return $self;
+}
+
+# Build Redis command in RESP format
+sub _build_command {
+    my ($self, @args) = @_;
+
+    my $cmd = "*" . scalar(@args) . "\r\n";
+    for my $arg (@args) {
+        $arg //= '';
+        my $bytes = "$arg";  # stringify
+        utf8::encode($bytes) if utf8::is_utf8($bytes);
+        $cmd .= "\$" . length($bytes) . "\r\n" . $bytes . "\r\n";
+    }
+    return $cmd;
+}
+
+# Send raw data
+async sub _send {
+    my ($self, $data) = @_;
+    await Future::IO->write_exactly($self->{socket}, $data);
+    return length($data);
+}
+
+# Read and parse one response
+async sub _read_response {
+    my ($self) = @_;
+
+    # First check if parser already has a complete message
+    # (from previous read that contained multiple responses)
+    if (my $msg = $self->{parser}->get_message) {
+        return $msg;
+    }
+
+    # Read until we get a complete message
+    while (1) {
+        my $buf = await Future::IO->read($self->{socket}, 65536);
+
+        # EOF
+        if (!defined $buf || length($buf) == 0) {
+            die "Connection closed by server";
+        }
+
+        $self->{parser}->parse($buf);
+
+        if (my $msg = $self->{parser}->get_message) {
+            return $msg;
+        }
+    }
+}
+
+# Execute a Redis command
+async sub command {
+    my ($self, @args) = @_;
+
+    die "Not connected" unless $self->{connected};
+
+    my $cmd = $self->_build_command(@args);
+    await $self->_send($cmd);
+
+    my $response = await $self->_read_response();
+    return $self->_decode_response($response);
+}
+
+# Decode Protocol::Redis response to Perl value
+sub _decode_response {
+    my ($self, $msg) = @_;
+
+    return undef unless $msg;
+
+    my $type = $msg->{type};
+    my $data = $msg->{data};
+
+    # Simple string (+)
+    if ($type eq '+') {
+        return $data;
+    }
+    # Error (-)
+    elsif ($type eq '-') {
+        die "Redis error: $data";
+    }
+    # Integer (:)
+    elsif ($type eq ':') {
+        return 0 + $data;
+    }
+    # Bulk string ($)
+    elsif ($type eq '$') {
+        return $data;  # undef for null bulk
+    }
+    # Array (*)
+    elsif ($type eq '*') {
+        return undef unless defined $data;  # null array
+        return [ map { $self->_decode_response($_) } @$data ];
+    }
+
+    return $data;
+}
+
+# ============================================================================
+# Convenience Commands
+# ============================================================================
+
+async sub ping {
+    my ($self) = @_;
+    return await $self->command('PING');
+}
+
+async sub set {
+    my ($self, $key, $value, %opts) = @_;
+    my @cmd = ('SET', $key, $value);
+    push @cmd, 'EX', $opts{ex} if exists $opts{ex};
+    push @cmd, 'PX', $opts{px} if exists $opts{px};
+    push @cmd, 'NX' if $opts{nx};
+    push @cmd, 'XX' if $opts{xx};
+    return await $self->command(@cmd);
+}
+
+async sub get {
+    my ($self, $key) = @_;
+    return await $self->command('GET', $key);
+}
+
+async sub del {
+    my ($self, @keys) = @_;
+    return await $self->command('DEL', @keys);
+}
+
+async sub incr {
+    my ($self, $key) = @_;
+    return await $self->command('INCR', $key);
+}
+
+async sub lpush {
+    my ($self, $key, @values) = @_;
+    return await $self->command('LPUSH', $key, @values);
+}
+
+async sub rpush {
+    my ($self, $key, @values) = @_;
+    return await $self->command('RPUSH', $key, @values);
+}
+
+async sub lpop {
+    my ($self, $key) = @_;
+    return await $self->command('LPOP', $key);
+}
+
+async sub lrange {
+    my ($self, $key, $start, $stop) = @_;
+    return await $self->command('LRANGE', $key, $start, $stop);
+}
+
+async sub keys {
+    my ($self, $pattern) = @_;
+    return await $self->command('KEYS', $pattern // '*');
+}
+
+async sub flushdb {
+    my ($self) = @_;
+    return await $self->command('FLUSHDB');
+}
+
+# ============================================================================
+# PUB/SUB
+# ============================================================================
+
+async sub publish {
+    my ($self, $channel, $message) = @_;
+    return await $self->command('PUBLISH', $channel, $message);
+}
+
+# Subscribe to channels - returns a message iterator
+async sub subscribe {
+    my ($self, @channels) = @_;
+
+    die "Not connected" unless $self->{connected};
+    die "Already in subscribe mode" if $self->{subscribing};
+
+    my $cmd = $self->_build_command('SUBSCRIBE', @channels);
+    await $self->_send($cmd);
+
+    # Read subscription confirmations
+    for my $ch (@channels) {
+        my $msg = await $self->_read_response();
+        # Response: ['subscribe', $channel, $count]
+    }
+
+    $self->{subscribing} = 1;
+
+    return Future::IO::Redis::Subscription->new(redis => $self);
+}
+
+# Read next pubsub message (blocking)
+async sub _read_pubsub_message {
+    my ($self) = @_;
+
+    my $msg = await $self->_read_response();
+
+    # Message format: ['message', $channel, $payload]
+    # or: ['pmessage', $pattern, $channel, $payload]
+    return $msg;
+}
+
+# ============================================================================
+# Pipelining
+# ============================================================================
+
+sub pipeline {
+    my ($self) = @_;
+    return Future::IO::Redis::Pipeline->new(redis => $self);
+}
+
+# Execute multiple commands, return all responses
+async sub _execute_pipeline {
+    my ($self, $commands) = @_;
+
+    die "Not connected" unless $self->{connected};
+
+    # Send all commands
+    my $data = '';
+    for my $cmd (@$commands) {
+        $data .= $self->_build_command(@$cmd);
+    }
+    await $self->_send($data);
+
+    # Read all responses
+    my @responses;
+    my $count = scalar @$commands;
+    for my $i (1 .. $count) {
+        my $msg = await $self->_read_response();
+        push @responses, $self->_decode_response($msg);
+    }
+
+    return \@responses;
+}
+
+# ============================================================================
+# Helper Classes
+# ============================================================================
+
+package Future::IO::Redis::Subscription;
+
+use Future::AsyncAwait;
+
+sub new {
+    my ($class, %args) = @_;
+    return bless { redis => $args{redis} }, $class;
+}
+
+async sub next_message {
+    my ($self) = @_;
+    my $msg = await $self->{redis}->_read_pubsub_message();
+
+    if (ref $msg eq 'ARRAY' && $msg->[0] eq 'message') {
+        return {
+            channel => $msg->[1],
+            message => $msg->[2],
+        };
+    }
+
+    return $msg;
+}
+
+sub unsubscribe {
+    my ($self) = @_;
+    $self->{redis}{subscribing} = 0;
+    # Would need to send UNSUBSCRIBE and read confirmation
+}
+
+package Future::IO::Redis::Pipeline;
+
+use Future::AsyncAwait;
+
+sub new {
+    my ($class, %args) = @_;
+    return bless {
+        redis => $args{redis},
+        commands => [],
+    }, $class;
+}
+
+sub add {
+    my ($self, @cmd) = @_;
+    push @{$self->{commands}}, \@cmd;
+    return $self;
+}
+
+# Convenience methods for pipeline
+sub set { shift->add('SET', @_) }
+sub get { shift->add('GET', @_) }
+sub incr { shift->add('INCR', @_) }
+sub del { shift->add('DEL', @_) }
+
+async sub execute {
+    my ($self) = @_;
+    return await $self->{redis}->_execute_pipeline($self->{commands});
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+Future::IO::Redis - Non-blocking Redis client using Future::IO
+
+=head1 SYNOPSIS
+
+    use Future::IO::Redis;
+    use Future::AsyncAwait;
+    use IO::Async::Loop;
+    use Future::IO::Impl::IOAsync;
+
+    my $loop = IO::Async::Loop->new;
+
+    my $redis = Future::IO::Redis->new(host => 'localhost', port => 6379);
+
+    # Use await keyword for async operations
+    (async sub {
+        await $redis->connect;
+
+        # Basic commands
+        await $redis->set('foo', 'bar');
+        my $value = await $redis->get('foo');
+
+        # Pipelining
+        my $results = await $redis->pipeline
+            ->set('a', 1)
+            ->set('b', 2)
+            ->get('a')
+            ->get('b')
+            ->execute;
+
+        # Pub/Sub
+        my $sub = await $redis->subscribe('news');
+        while (my $msg = await $sub->next_message) {
+            say "Got: $msg->{message} on $msg->{channel}";
+        }
+    })->();
+
+    $loop->run;
+
+=head1 DESCRIPTION
+
+Future::IO::Redis provides a non-blocking Redis client built on Future::IO,
+making it event-loop agnostic. It works with IO::Async, AnyEvent, UV, or
+any other Future::IO implementation.
+
+=cut
