@@ -623,6 +623,166 @@ Examples:
 - TLS requires IO::Socket::SSL (optional dependency)
 - Without IO::Socket::SSL, `tls => 1` throws error at connect time
 
+### Non-Blocking TLS Handshake (Critical Implementation Detail)
+
+**WARNING:** IO::Socket::SSL's default behavior is blocking. A naive implementation will pass tests on localhost but hang on real networks with latency.
+
+#### The Problem
+
+```perl
+# WRONG - These block during handshake!
+my $ssl = IO::Socket::SSL->new($socket);
+IO::Socket::SSL->start_SSL($socket);  # Also blocks
+```
+
+Even with a non-blocking socket, `start_SSL` performs a blocking handshake by default. On localhost this completes instantly, but over a network it can take 50-200ms, blocking the event loop.
+
+#### The Solution: Drive Handshake with Readiness Waiting
+
+```perl
+async sub _tls_upgrade {
+    my ($self, $socket) = @_;
+
+    # 1. Ensure socket is non-blocking
+    $socket->blocking(0);
+
+    # 2. Start SSL without immediate handshake
+    IO::Socket::SSL->start_SSL($socket,
+        SSL_startHandshake => 0,      # Don't handshake yet!
+        SSL_verify_mode    => $self->{tls}{verify} // SSL_VERIFY_PEER,
+        SSL_ca_file        => $self->{tls}{ca_file},
+        SSL_cert_file      => $self->{tls}{cert_file},
+        SSL_key_file       => $self->{tls}{key_file},
+    ) or die "SSL setup failed: $SSL_ERROR";
+
+    # 3. Drive handshake with non-blocking loop
+    my $deadline = time() + $self->{connect_timeout};
+
+    while (1) {
+        # Check timeout
+        if (time() >= $deadline) {
+            die Future::IO::Redis::Error::Timeout->new(
+                message => "TLS handshake timed out",
+            );
+        }
+
+        # Attempt handshake step
+        my $rv = $socket->connect_SSL;
+
+        if ($rv) {
+            # Handshake complete!
+            return $socket;
+        }
+
+        # Handshake needs more I/O
+        if ($SSL_ERROR == SSL_WANT_READ) {
+            # Wait for socket to become readable
+            await Future::IO->waitfor_readable($socket)
+                ->timeout($deadline - time());
+        }
+        elsif ($SSL_ERROR == SSL_WANT_WRITE) {
+            # Wait for socket to become writable
+            await Future::IO->waitfor_writable($socket)
+                ->timeout($deadline - time());
+        }
+        else {
+            # Actual error
+            die Future::IO::Redis::Error::Connection->new(
+                message => "TLS handshake failed: $SSL_ERROR",
+            );
+        }
+    }
+}
+```
+
+#### Why This Matters
+
+| Scenario | Blocking Handshake | Non-Blocking Handshake |
+|----------|-------------------|------------------------|
+| Localhost | ~1ms (seems fine) | ~1ms |
+| Same datacenter | 50-100ms **blocks** | 50-100ms async |
+| Cross-region | 100-300ms **blocks** | 100-300ms async |
+| Slow network | 500ms+ **blocks** | 500ms+ async |
+| Packet loss | Retransmits **block** | Retransmits async |
+
+On localhost, everything works. In production, your event loop freezes during every TLS connection.
+
+#### Connection Sequence with TLS
+
+```perl
+async sub connect {
+    my ($self) = @_;
+
+    # 1. TCP connect (already non-blocking via Future::IO)
+    my $socket = await $self->_tcp_connect;
+
+    # 2. TLS upgrade (non-blocking handshake)
+    if ($self->{tls}) {
+        $socket = await $self->_tls_upgrade($socket);
+    }
+
+    # 3. Redis protocol initialization
+    await $self->_redis_handshake($socket);  # AUTH, SELECT, etc.
+
+    return $socket;
+}
+```
+
+#### Testing TLS Non-Blocking Behavior
+
+```perl
+# t/10-connection/tls.t
+
+subtest 'TLS handshake does not block event loop' => sub {
+    my @ticks;
+    my $timer = IO::Async::Timer::Periodic->new(
+        interval => 0.01,  # 10ms
+        on_tick => sub { push @ticks, time() },
+    );
+    $loop->add($timer);
+    $timer->start;
+
+    # Connect to TLS Redis (use remote host, not localhost!)
+    my $redis = Future::IO::Redis->new(
+        host => $ENV{TLS_REDIS_HOST} // 'redis-tls.example.com',
+        port => 6380,
+        tls => 1,
+        connect_timeout => 5,
+    );
+
+    my $start = time();
+    await $redis->connect;
+    my $elapsed = time() - $start;
+
+    $timer->stop;
+    $loop->remove($timer);
+
+    # Timer should have ticked during handshake
+    # If handshake took 100ms, we should have ~10 ticks
+    my $expected_ticks = int($elapsed / 0.01);
+    my $actual_ticks = scalar @ticks;
+
+    ok($actual_ticks >= $expected_ticks * 0.5,
+        "Timer ticked $actual_ticks times during ${elapsed}s TLS handshake " .
+        "(expected ~$expected_ticks)");
+};
+```
+
+#### CI/CD Consideration
+
+Localhost TLS tests will pass even with blocking code. For proper verification:
+
+```yaml
+# In CI, test against a remote TLS Redis with artificial latency
+services:
+  redis-tls:
+    image: redis:7-alpine
+    # Add network latency simulation
+    command: >
+      sh -c "tc qdisc add dev eth0 root netem delay 50ms &&
+             redis-server --tls-port 6380 ..."
+```
+
 ---
 
 ## Section 4: Pipelining
@@ -2116,14 +2276,19 @@ ok($ticks > 5, 'Event loop not blocked during reconnection');
 - Auth replayed on reconnect
 
 #### Step 6: TLS
-**Goal:** TLS/SSL connections
+**Goal:** Non-blocking TLS/SSL connections
 
 1. Run all tests
 2. Create `t/10-connection/tls.t`
-3. Implement TLS upgrade using IO::Socket::SSL
+3. Implement non-blocking TLS upgrade:
+   - Socket set non-blocking BEFORE start_SSL
+   - `SSL_startHandshake => 0` to defer handshake
+   - Drive handshake with `connect_SSL` + readiness waiting
+   - Loop on SSL_WANT_READ/SSL_WANT_WRITE
+   - Respect connect_timeout for entire handshake
 4. Run TLS tests (requires redis-tls Docker container)
 5. Run all tests
-6. Run non-blocking proof (TLS handshake must not block)
+6. Run non-blocking proof (CRITICAL - TLS handshake must not block)
 7. Commit
 
 **Tests to write:**
@@ -2131,6 +2296,45 @@ ok($ticks > 5, 'Event loop not blocked during reconnection');
 - Custom CA/cert/key works
 - Certificate verification works
 - Invalid cert throws `Error::Connection`
+- **TLS handshake does not block event loop** (timer tick test)
+- Handshake timeout fires correctly
+- Reconnect re-establishes TLS
+
+**Non-blocking verification (CRITICAL):**
+```perl
+# WARNING: Localhost tests will pass even with blocking code!
+# Must test with network latency to catch blocking handshakes.
+
+subtest 'TLS handshake non-blocking' => sub {
+    my @ticks;
+    my $timer = IO::Async::Timer::Periodic->new(
+        interval => 0.01,
+        on_tick => sub { push @ticks, time() },
+    );
+    $loop->add($timer);
+    $timer->start;
+
+    # Use remote host or add artificial latency
+    my $redis = Future::IO::Redis->new(
+        host => $ENV{TLS_REDIS_HOST},
+        tls => 1,
+        connect_timeout => 5,
+    );
+
+    my $start = time();
+    await $redis->connect;
+    my $elapsed = time() - $start;
+
+    $timer->stop;
+
+    # If handshake took 100ms, timer should have ticked ~10 times
+    my $expected = int($elapsed / 0.01);
+    ok(@ticks >= $expected * 0.5,
+        "Event loop ticked during TLS handshake");
+};
+```
+
+**CI consideration:** Add network latency simulation to catch blocking code that passes on localhost.
 
 #### Step 7: Command Generation
 **Goal:** Auto-generate all Redis commands
