@@ -113,7 +113,7 @@ my $redis = Future::IO::Redis->new(
 - Exponential backoff: 0.1s -> 0.2s -> 0.4s -> ... -> 60s max
 - Jitter prevents thundering herd when many clients reconnect
 - `on_disconnect` fires with reason: `connection_lost`, `timeout`, `server_closed`
-- Key prefixing applied transparently to all key arguments
+- Key prefixing uses key extraction strategy (see Section 6.1)
 - Fork safety: detect PID change and create fresh connections (for prefork servers)
 
 ### Auto-Pipelining
@@ -1369,6 +1369,367 @@ Some commands need return value transformation:
 4. Generate POD documentation per command
 5. Track Redis version requirement for each command
 6. Handle subcommands (CLIENT, CLUSTER, CONFIG, etc.)
+7. **Extract and encode key position metadata** (see Section 6.1)
+
+---
+
+## Section 6.1: Key Extraction Strategy
+
+Key prefixing **cannot** be "transparent to all key arguments" without understanding command structure. Redis commands have keys in various positions:
+
+| Command | Key Position(s) | Complexity |
+|---------|-----------------|------------|
+| `GET key` | arg 0 | Simple |
+| `SET key value` | arg 0 | Simple |
+| `MGET key1 key2 key3` | all args | All args are keys |
+| `BITOP AND dest src1 src2` | args 1+ | First arg is operation |
+| `EVAL script numkeys k1 k2 a1` | Dynamic | Parse `numkeys` |
+| `OBJECT ENCODING key` | arg 1 | After subcommand |
+| `MIGRATE host port key db timeout` | arg 2 | Middle position |
+| `XREAD STREAMS s1 s2 id1 id2` | Complex | Before IDs, count varies |
+
+### Strategy Hierarchy
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  1. key_specs from commands.json (preferred, Redis 7+)         │
+│     ↓ if not available                                          │
+│  2. Manual overrides (share/key_overrides.json)                 │
+│     ↓ if not in overrides                                       │
+│  3. Pattern-based fallbacks (classic command patterns)          │
+│     ↓ if unknown command                                        │
+│  4. No prefixing (warn in debug mode)                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 1. key_specs (Preferred)
+
+Redis 7+ commands.json includes `key_specs` with precise key locations:
+
+```json
+{
+  "SET": {
+    "key_specs": [
+      {
+        "begin_search": { "type": "index", "spec": { "index": 1 } },
+        "find_keys": { "type": "range", "spec": { "lastkey": 0, "keystep": 1, "limit": 0 } }
+      }
+    ]
+  },
+  "EVAL": {
+    "key_specs": [
+      {
+        "begin_search": { "type": "index", "spec": { "index": 3 } },
+        "find_keys": { "type": "keynum", "spec": { "keynumidx": 2, "firstkey": 0, "keystep": 1 } }
+      }
+    ]
+  }
+}
+```
+
+The generator parses these specs and generates extraction code:
+
+```perl
+# Generated for SET (index-based)
+sub _keys_for_set {
+    my (@args) = @_;
+    return (0);  # arg 0 is key
+}
+
+# Generated for MGET (range-based, all args)
+sub _keys_for_mget {
+    my (@args) = @_;
+    return (0 .. $#args);  # all args are keys
+}
+
+# Generated for EVAL (keynum-based, dynamic)
+sub _keys_for_eval {
+    my (@args) = @_;
+    my $numkeys = $args[1];  # keynumidx=2, but 0-indexed after command
+    return (2 .. 2 + $numkeys - 1);  # keys start at index 2
+}
+```
+
+### 2. Manual Overrides
+
+For commands without `key_specs` or with incorrect specs:
+
+```json
+// share/key_overrides.json
+{
+  "BITOP": {
+    "note": "First arg is operation, rest are keys",
+    "keys": { "type": "range", "start": 1, "end": -1 }
+  },
+  "OBJECT": {
+    "subcommands": {
+      "ENCODING": { "keys": [1] },
+      "FREQ": { "keys": [1] },
+      "IDLETIME": { "keys": [1] },
+      "REFCOUNT": { "keys": [1] }
+    }
+  },
+  "DEBUG": {
+    "note": "DEBUG commands are dangerous, no prefixing",
+    "keys": "none"
+  },
+  "MIGRATE": {
+    "note": "key at position 2, or after KEYS keyword",
+    "keys": { "type": "custom", "handler": "_keys_for_migrate" }
+  }
+}
+```
+
+### 3. Pattern-Based Fallbacks
+
+For unrecognized commands (modules, future Redis versions):
+
+```perl
+# lib/Future/IO/Redis/KeyExtractor.pm
+
+our %FALLBACK_PATTERNS = (
+    # Commands where first arg is always key
+    qr/^(GET|SET|DEL|EXISTS|EXPIRE|TTL|TYPE|RENAME.*)$/i => sub {
+        my (@args) = @_;
+        return (0);
+    },
+
+    # Commands where all args are keys
+    qr/^(MGET|MSET|DEL|EXISTS|TOUCH|UNLINK)$/i => sub {
+        my (@args) = @_;
+        return (0 .. $#args);
+    },
+
+    # Hash commands: first arg is key
+    qr/^H(SET|GET|DEL|EXISTS|INCR|KEYS|LEN|MGET|MSET|VALS|GETALL|SCAN)$/i => sub {
+        my (@args) = @_;
+        return (0);
+    },
+
+    # List commands: first arg is key
+    qr/^[LR](PUSH|POP|LEN|INDEX|RANGE|SET|TRIM|REM|INSERT|POS)$/i => sub {
+        my (@args) = @_;
+        return (0);
+    },
+
+    # Unknown: no prefixing, warn
+    DEFAULT => sub {
+        my ($cmd, @args) = @_;
+        warn "Unknown command '$cmd': key prefixing skipped" if $ENV{REDIS_DEBUG};
+        return ();
+    },
+);
+```
+
+### 4. Commands That Cannot Be Prefixed
+
+Some commands take patterns, not literal keys:
+
+| Command | Why No Prefix |
+|---------|---------------|
+| `KEYS pattern` | Pattern matching, not literal key |
+| `SCAN ... MATCH pattern` | Pattern matching |
+| `PSUBSCRIBE pattern` | Channel pattern |
+| `SORT ... BY pattern` | Pattern in BY clause |
+
+For these, prefix the pattern itself:
+
+```perl
+# User calls:
+$redis->keys('user:*');
+
+# With prefix 'myapp:', becomes:
+$redis->keys('myapp:user:*');
+
+# Implementation:
+sub _prefix_pattern {
+    my ($self, $pattern) = @_;
+    return $self->{prefix} . $pattern;
+}
+```
+
+### 5. Dynamic Extraction (EVAL/EVALSHA)
+
+EVAL requires runtime parsing:
+
+```perl
+async sub eval {
+    my ($self, $script, $numkeys, @keys_and_args) = @_;
+
+    # Apply prefix to exactly $numkeys args
+    if ($self->{prefix} && $numkeys > 0) {
+        for my $i (0 .. $numkeys - 1) {
+            $keys_and_args[$i] = $self->{prefix} . $keys_and_args[$i];
+        }
+    }
+
+    return await $self->command('EVAL', $script, $numkeys, @keys_and_args);
+}
+
+# Usage:
+$redis->eval($script, 2, 'key1', 'key2', 'arg1', 'arg2');
+# With prefix 'myapp:' → EVAL $script 2 myapp:key1 myapp:key2 arg1 arg2
+```
+
+### 6. Complex Commands (XREAD, MIGRATE)
+
+Some commands need custom handlers:
+
+```perl
+# XREAD [COUNT n] [BLOCK ms] STREAMS stream1 stream2 id1 id2
+sub _keys_for_xread {
+    my (@args) = @_;
+
+    # Find STREAMS keyword
+    my $streams_idx;
+    for my $i (0 .. $#args) {
+        if (uc($args[$i]) eq 'STREAMS') {
+            $streams_idx = $i;
+            last;
+        }
+    }
+    return () unless defined $streams_idx;
+
+    # Keys are between STREAMS and the IDs
+    # Number of streams = number of IDs = (remaining args) / 2
+    my $remaining = $#args - $streams_idx;
+    my $num_streams = $remaining / 2;
+
+    return ($streams_idx + 1 .. $streams_idx + $num_streams);
+}
+
+# MIGRATE host port key|"" db timeout [COPY] [REPLACE] [AUTH pw] [KEYS k1 k2]
+sub _keys_for_migrate {
+    my (@args) = @_;
+    my @key_indices;
+
+    # Single key at position 2 (unless empty string for multi-key)
+    push @key_indices, 2 if $args[2] ne '';
+
+    # Multi-key after KEYS keyword
+    for my $i (0 .. $#args) {
+        if (uc($args[$i]) eq 'KEYS') {
+            push @key_indices, ($i + 1 .. $#args);
+            last;
+        }
+    }
+
+    return @key_indices;
+}
+```
+
+### Generated KeyExtractor Module
+
+The build script generates:
+
+```perl
+# lib/Future/IO/Redis/KeyExtractor.pm (auto-generated)
+package Future::IO::Redis::KeyExtractor;
+
+use strict;
+use warnings;
+
+# Generated from commands.json key_specs + overrides
+our %KEY_POSITIONS = (
+    'GET'     => sub { (0) },
+    'SET'     => sub { (0) },
+    'MGET'    => sub { (0 .. $#_) },
+    'MSET'    => sub { grep { $_ % 2 == 0 } (0 .. $#_) },  # even indices
+    'EVAL'    => \&_keys_for_eval,
+    'EVALSHA' => \&_keys_for_eval,
+    'XREAD'   => \&_keys_for_xread,
+    'MIGRATE' => \&_keys_for_migrate,
+    # ... 200+ more
+);
+
+sub extract_key_indices {
+    my ($command, @args) = @_;
+    $command = uc($command);
+
+    if (my $extractor = $KEY_POSITIONS{$command}) {
+        return $extractor->(@args);
+    }
+
+    # Fallback to pattern matching
+    return _fallback_extract($command, @args);
+}
+
+sub apply_prefix {
+    my ($prefix, $command, @args) = @_;
+    return @args unless $prefix;
+
+    my @key_indices = extract_key_indices($command, @args);
+    for my $i (@key_indices) {
+        $args[$i] = $prefix . $args[$i];
+    }
+
+    return @args;
+}
+
+1;
+```
+
+### Usage in Command Method
+
+```perl
+# In Future::IO::Redis
+sub command {
+    my ($self, $cmd, @args) = @_;
+
+    # Apply key prefixing if configured
+    if ($self->{prefix}) {
+        @args = Future::IO::Redis::KeyExtractor::apply_prefix(
+            $self->{prefix}, $cmd, @args
+        );
+    }
+
+    # ... send command
+}
+```
+
+### File Structure Update
+
+```
+share/
+├── commands.json           # Redis command specs (from redis-doc)
+└── key_overrides.json      # Manual key position overrides
+
+lib/Future/IO/Redis/
+├── Commands.pm             # Auto-generated command methods
+└── KeyExtractor.pm         # Auto-generated key extraction logic
+```
+
+### Testing Key Extraction
+
+```perl
+# t/20-commands/prefix.t
+
+subtest 'simple commands' => sub {
+    my $redis = Future::IO::Redis->new(prefix => 'test:');
+    # Verify GET key becomes GET test:key
+};
+
+subtest 'MSET prefixes even args only' => sub {
+    # MSET key1 val1 key2 val2 → MSET test:key1 val1 test:key2 val2
+};
+
+subtest 'EVAL prefixes only numkeys keys' => sub {
+    # EVAL script 2 k1 k2 arg1 → EVAL script 2 test:k1 test:k2 arg1
+};
+
+subtest 'XREAD prefixes streams not IDs' => sub {
+    # XREAD STREAMS s1 s2 0 0 → XREAD STREAMS test:s1 test:s2 0 0
+};
+
+subtest 'KEYS prefixes pattern' => sub {
+    # KEYS user:* → KEYS test:user:*
+};
+
+subtest 'unknown command warns and skips prefix' => sub {
+    local $ENV{REDIS_DEBUG} = 1;
+    # Verify warning emitted, no prefix applied
+};
+```
 
 ---
 
@@ -1381,6 +1742,7 @@ lib/
 │       ├── Redis.pm                    # Main client, uses Commands role
 │       └── Redis/
 │           ├── Commands.pm             # Auto-generated command methods
+│           ├── KeyExtractor.pm         # Auto-generated key position logic
 │           ├── Connection.pm           # Connection state machine
 │           ├── Pool.pm                 # Connection pooling
 │           ├── Pipeline.pm             # Command pipelining
@@ -1399,9 +1761,10 @@ lib/
 │               ├── Redis.pm
 │               └── Disconnected.pm
 bin/
-└── generate-commands                   # Build script for Commands.pm
+└── generate-commands                   # Build script for Commands.pm + KeyExtractor.pm
 share/
-└── commands.json                       # Cached Redis command specs
+├── commands.json                       # Cached Redis command specs (from redis-doc)
+└── key_overrides.json                  # Manual key position overrides
 ```
 
 ---
@@ -1760,22 +2123,45 @@ For each category, follow the full process:
 
 Each file must include non-blocking verification.
 
-#### Step 9: Key Prefixing
-**Goal:** Automatic namespace prefixing
+#### Step 9: Key Extraction & Prefixing
+**Goal:** Key position detection and automatic namespace prefixing
 
 1. Run all tests
-2. Create `t/20-commands/prefix.t`
-3. Implement prefix logic in `command()` method
-4. Run prefix tests
-5. Run all tests
-6. Run non-blocking proof
-7. Commit
+2. Create `t/01-unit/key-extractor.t` (unit tests, no Redis needed)
+3. Create `t/20-commands/prefix.t` (integration tests)
+4. Implement `KeyExtractor.pm` with:
+   - `key_specs` parsing from commands.json
+   - Manual overrides from `key_overrides.json`
+   - Pattern-based fallbacks
+   - Dynamic extraction for EVAL/EVALSHA
+   - Custom handlers for XREAD, MIGRATE, etc.
+5. Implement prefix logic in `command()` method
+6. Run all tests
+7. Run non-blocking proof
+8. Commit
 
-**Tests to write:**
+**Unit tests (t/01-unit/key-extractor.t):**
+- Simple commands: GET, SET return index 0
+- Multi-key: MGET returns all indices
+- MSET returns even indices only (keys, not values)
+- EVAL/EVALSHA parses numkeys dynamically
+- BITOP returns indices 1+ (skip operation arg)
+- OBJECT subcommands return correct key index
+- XREAD finds keys between STREAMS and IDs
+- MIGRATE handles single key and KEYS keyword
+- Unknown command returns empty (with debug warning)
+- Pattern commands (KEYS, SCAN MATCH) prefix pattern
+
+**Integration tests (t/20-commands/prefix.t):**
 - Prefix applied to single-key commands
-- Prefix applied to multi-key commands
-- Prefix applied in SCAN results
-- Prefix NOT applied to non-key args
+- Prefix applied to multi-key commands (MGET, DEL)
+- Prefix NOT applied to values (SET key VALUE)
+- Prefix applied to EVAL keys only, not args
+- Prefix applied to XREAD streams, not IDs
+- Prefix applied to KEYS pattern
+- Prefix applied in pipeline commands
+- No prefix when prefix option not set
+- Empty prefix treated as no prefix
 
 #### Step 10: Transactions
 **Goal:** MULTI/EXEC/WATCH support
@@ -2056,7 +2442,8 @@ t/
 │   ├── uri.t                 # URI parsing
 │   ├── protocol.t            # RESP encoding/decoding
 │   ├── error.t               # Exception classes
-│   └── commands-generated.t  # Generated command methods exist
+│   ├── commands-generated.t  # Generated command methods exist
+│   └── key-extractor.t       # Key position extraction logic
 ├── 10-connection/            # Connection tests
 │   ├── basic.t               # Connect, disconnect
 │   ├── socket-timeout.t      # Socket-level timeouts (connect/read/write)
