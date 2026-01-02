@@ -215,7 +215,9 @@ Future::IO::Redis::Error (base)
 
 1. **FIFO command-response ordering** - Redis guarantees strict FIFO on each connection. We maintain an `@inflight` queue of pending Futures. Each response pops the next Future from the queue. No IDs needed - order is the invariant.
 
-2. **Pipeline safety** - Pipeline commands sent atomically (single write). Responses read in order, each popping from `@inflight`. Individual command errors captured in results, don't abort pipeline.
+2. **Pipeline failure semantics** - Two distinct failure modes:
+   - **Command-level Redis errors** (WRONGTYPE, OOM, NOSCRIPT): Captured inline in result array. Pipeline continues. Each slot contains either data or `Error::Redis` object.
+   - **Transport/protocol failures** (connection lost, timeout, malformed RESP): Abort entire pipeline. All remaining slots fail with `Error::Connection` or `Error::Protocol`. Connection reset.
 
 3. **No silent failures** - Every command returns a Future that either resolves with data or fails with typed exception. Never hangs indefinitely (timeouts).
 
@@ -652,24 +654,64 @@ my $results = await $redis->pipeline
 
 ### Error Handling
 
+**Two distinct failure modes:**
+
+#### 1. Command-Level Redis Errors (Per-Slot)
+
+Redis error replies (WRONGTYPE, OOM, etc.) are captured inline:
+
 ```perl
-# Individual command errors don't fail the pipeline
 my $results = await $redis->pipeline
     ->set('key', 'value')
-    ->incr('key')           # WRONGTYPE error
+    ->incr('key')           # WRONGTYPE error (key is string)
     ->get('key')
     ->execute;
 
 # $results = ['OK', Error::Redis->new(...), 'value']
-# Check each result for errors
+# Pipeline completed; check each slot for errors
+for my $i (0 .. $#$results) {
+    if (ref $results->[$i] && $results->[$i]->isa('Future::IO::Redis::Error')) {
+        warn "Command $i failed: $results->[$i]";
+    }
+}
 ```
+
+#### 2. Transport/Protocol Failures (Abort Pipeline)
+
+Connection loss, timeout, or protocol errors abort the entire pipeline:
+
+```perl
+my $results = eval {
+    await $redis->pipeline
+        ->set('a', 1)
+        ->set('b', 2)    # Connection drops here
+        ->set('c', 3)
+        ->execute;
+};
+
+if ($@) {
+    # $@ is Error::Connection or Error::Timeout
+    # All slots failed, connection reset
+    # Cannot determine which commands succeeded
+}
+```
+
+**Why abort on transport failure?**
+
+After connection loss mid-pipeline, we cannot know:
+- Which commands were received by Redis
+- Which responses we missed
+- Whether our writes were applied
+
+The only safe action is to fail all slots and let the caller retry.
 
 ### Behavior
 
 - Commands queued locally until `execute` called
 - All commands sent in single write (atomic network operation)
 - Responses collected in order
-- Individual command errors captured, don't abort pipeline
+- **Command-level Redis errors**: Captured per-slot, pipeline continues
+- **Transport/protocol errors**: Entire pipeline fails, connection reset
 - Pipeline object is single-use (cannot re-execute)
 
 ---
