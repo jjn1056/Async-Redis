@@ -5,7 +5,8 @@ use warnings;
 use Getopt::Long;
 use Time::HiRes qw(time);
 use IO::Async::Loop;
-use Future::IO::Impl::IOAsync;
+use Future::IO;
+Future::IO->load_impl('IOAsync');
 use lib 'lib';
 use Future::IO::Redis;
 

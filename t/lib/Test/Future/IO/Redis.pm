@@ -7,8 +7,12 @@ use Test2::V0;
 use IO::Async::Loop;
 use IO::Async::Timer::Periodic;
 use IO::Async::Process;
-use Future::IO::Impl::IOAsync;
+use Future::IO;
 use Future::IO::Redis;
+
+# For testing, we use IO::Async as our concrete event loop.
+# Production code can use any Future::IO-compatible loop (UV, Glib, etc.)
+Future::IO->load_impl('IOAsync');
 
 our @EXPORT_OK = qw(
     init_loop

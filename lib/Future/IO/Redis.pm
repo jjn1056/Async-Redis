@@ -1315,10 +1315,16 @@ Future::IO::Redis - Async Redis client using Future::IO
 
     use Future::IO::Redis;
     use Future::AsyncAwait;
-    use IO::Async::Loop;
-    use Future::IO::Impl::IOAsync;
 
+    # Use any Future::IO-compatible event loop
+    # IO::Async:
+    use IO::Async::Loop;
+    use Future::IO;
+    Future::IO->load_impl('IOAsync');
     my $loop = IO::Async::Loop->new;
+
+    # Or UV:   Future::IO->load_impl('UV');
+    # Or Glib: Future::IO->load_impl('Glib');
 
     my $redis = Future::IO::Redis->new(
         host => 'localhost',

@@ -8,7 +8,8 @@ use Time::HiRes qw(time);
 
 # Load Future::IO implementation
 use IO::Async::Loop;
-use Future::IO::Impl::IOAsync;
+use Future::IO;
+Future::IO->load_impl("IOAsync");
 use IO::Async::Timer::Periodic;
 
 use lib 'lib';

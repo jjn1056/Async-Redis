@@ -31,17 +31,21 @@ cpanm Protocol::Redis::XS
 ```perl
 use Future::IO::Redis;
 use Future::AsyncAwait;
-use IO::Async::Loop;
-use Future::IO::Impl::IOAsync;
 
+# Use any Future::IO-compatible event loop
+# IO::Async example:
+use IO::Async::Loop;
 my $loop = IO::Async::Loop->new;
+
+# Or UV:        use Future::IO; Future::IO->load_impl('UV');
+# Or Glib:      use Future::IO; Future::IO->load_impl('Glib');
 
 my $redis = Future::IO::Redis->new(
     host => 'localhost',
     port => 6379,
 );
 
-(async sub {
+async sub main {
     await $redis->connect;
 
     # Basic commands
@@ -57,9 +61,9 @@ my $redis = Future::IO::Redis->new(
     my $results = await $pipe->execute;
 
     $redis->disconnect;
-})->();
+}
 
-$loop->run;
+$loop->await(main());
 ```
 
 ## Usage Examples

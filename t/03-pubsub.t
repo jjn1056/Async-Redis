@@ -19,6 +19,8 @@ plan skip_all => 'Set REDIS_HOST to run tests'
 # Load Future::IO implementation
 eval { require Future::IO::Impl::IOAsync };
 use IO::Async::Loop;
+use Future::IO;
+Future::IO->load_impl("IOAsync");
 
 my $loop = IO::Async::Loop->new;
 

@@ -7,7 +7,8 @@ use Future::AsyncAwait;
 
 # Load Future::IO implementation - MUST load IO::Async::Loop first
 use IO::Async::Loop;
-use Future::IO::Impl::IOAsync;
+use Future::IO;
+Future::IO->load_impl("IOAsync");
 
 use lib 'lib';
 use Future::IO::Redis;

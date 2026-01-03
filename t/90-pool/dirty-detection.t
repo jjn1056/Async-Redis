@@ -3,8 +3,9 @@ use strict;
 use warnings;
 use Test2::V0;
 use IO::Async::Loop;
+use Future::IO;
+Future::IO->load_impl("IOAsync");
 use Future::AsyncAwait;
-use Future::IO::Impl::IOAsync;
 use Future::IO::Redis::Pool;
 use Future;
 

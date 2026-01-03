@@ -5,8 +5,9 @@ use Test2::V0;
 use Future::AsyncAwait;
 use Future;
 use IO::Async::Loop;
+use Future::IO;
+Future::IO->load_impl("IOAsync");
 use IO::Async::Timer::Periodic;
-use Future::IO::Impl::IOAsync;
 use Future::IO::Redis;
 use Time::HiRes qw(time);
 

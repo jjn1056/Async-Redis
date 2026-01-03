@@ -4,7 +4,8 @@ use warnings;
 use Test2::V0;
 use Future::AsyncAwait;
 use IO::Async::Loop;
-use Future::IO::Impl::IOAsync;
+use Future::IO;
+Future::IO->load_impl("IOAsync");
 use Future::IO::Redis;
 use Time::HiRes qw(time);
 
