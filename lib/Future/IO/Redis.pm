@@ -43,6 +43,9 @@ use Future::IO::Redis::AutoPipeline;
 # PubSub support
 use Future::IO::Redis::Subscription;
 
+# Telemetry support
+use Future::IO::Redis::Telemetry;
+
 # Try XS version first, fall back to pure Perl
 BEGIN {
     eval { require Protocol::Redis::XS; 1 }
@@ -144,7 +147,28 @@ sub new {
         in_pubsub     => 0,
         _subscription => undef,
         _pump_running => 0,
+
+        # Telemetry options
+        debug              => $args{debug},
+        otel_tracer        => $args{otel_tracer},
+        otel_meter         => $args{otel_meter},
+        otel_include_args  => $args{otel_include_args} // 1,
+        otel_redact        => $args{otel_redact} // 1,
     }, $class;
+
+    # Initialize telemetry if any observability enabled
+    if ($self->{debug} || $self->{otel_tracer} || $self->{otel_meter}) {
+        $self->{_telemetry} = Future::IO::Redis::Telemetry->new(
+            tracer       => $self->{otel_tracer},
+            meter        => $self->{otel_meter},
+            debug        => $self->{debug},
+            include_args => $self->{otel_include_args},
+            redact       => $self->{otel_redact},
+            host         => $self->{host},
+            port         => $self->{port},
+            database     => $self->{database} // 0,
+        );
+    }
 
     return $self;
 }
@@ -241,6 +265,12 @@ async sub connect {
     }
     $self->{_reconnect_attempt} = 0;
 
+    # Telemetry: record connection
+    if ($self->{_telemetry}) {
+        $self->{_telemetry}->record_connection(1);
+        $self->{_telemetry}->log_event('connected', "$self->{host}:$self->{port}");
+    }
+
     return $self;
 }
 
@@ -311,6 +341,12 @@ sub disconnect {
 
     if ($was_connected && $self->{on_disconnect}) {
         $self->{on_disconnect}->($self, $reason);
+    }
+
+    # Telemetry: record disconnection
+    if ($was_connected && $self->{_telemetry}) {
+        $self->{_telemetry}->record_connection(-1);
+        $self->{_telemetry}->log_event('disconnected', $reason);
     }
 
     return $self;
@@ -556,17 +592,46 @@ async sub command {
         message => "Not connected",
     ) unless $self->{connected};
 
+    # Telemetry: start span and log send
+    my $span_context;
+    my $start_time = time();
+    if ($self->{_telemetry}) {
+        $span_context = $self->{_telemetry}->start_command_span($cmd, @args);
+        $self->{_telemetry}->log_send($cmd, @args);
+    }
+
     my $raw_cmd = $self->_build_command($cmd, @args);
 
     # Calculate deadline based on command type
     my $deadline = $self->_calculate_deadline($cmd, @args);
 
-    # Send command
-    await $self->_send($raw_cmd);
+    my $result;
+    my $error;
 
-    # Read response with timeout
-    my $response = await $self->_read_response_with_deadline($deadline, \@args);
-    return $self->_decode_response($response);
+    eval {
+        # Send command
+        await $self->_send($raw_cmd);
+
+        # Read response with timeout
+        my $response = await $self->_read_response_with_deadline($deadline, \@args);
+        $result = $self->_decode_response($response);
+    };
+    $error = $@;
+
+    # Telemetry: log result and end span
+    if ($self->{_telemetry}) {
+        my $elapsed_ms = (time() - $start_time) * 1000;
+        if ($error) {
+            $self->{_telemetry}->log_error($error);
+        }
+        else {
+            $self->{_telemetry}->log_recv($result, $elapsed_ms);
+        }
+        $self->{_telemetry}->end_command_span($span_context, $error);
+    }
+
+    die $error if $error;
+    return $result;
 }
 
 # Read response with deadline enforcement
@@ -1174,6 +1239,8 @@ async sub _execute_pipeline {
 
     return [] unless @$commands;
 
+    my $start_time = time();
+
     # Send all commands
     my $data = '';
     for my $cmd (@$commands) {
@@ -1198,6 +1265,12 @@ async sub _execute_pipeline {
             chomp $result if defined $result;
         }
         push @responses, $result;
+    }
+
+    # Telemetry: record pipeline metrics
+    if ($self->{_telemetry}) {
+        my $elapsed_ms = (time() - $start_time) * 1000;
+        $self->{_telemetry}->record_pipeline($count, $elapsed_ms);
     }
 
     return \@responses;
