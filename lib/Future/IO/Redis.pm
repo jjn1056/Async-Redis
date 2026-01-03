@@ -148,6 +148,9 @@ sub new {
         _subscription => undef,
         _pump_running => 0,
 
+        # Fork safety
+        _pid => $$,
+
         # Telemetry options
         debug              => $args{debug},
         otel_tracer        => $args{otel_tracer},
@@ -247,6 +250,7 @@ async sub connect {
     $self->{parser} = _parser_class()->new(api => 1);
     $self->{connected} = 1;
     $self->{inflight} = [];
+    $self->{_pid} = $$;  # Track PID for fork safety
 
     # Run Redis protocol handshake (AUTH, SELECT, CLIENT SETNAME)
     await $self->_redis_handshake;
@@ -350,6 +354,30 @@ sub disconnect {
     }
 
     return $self;
+}
+
+# Check if fork occurred and invalidate connection
+sub _check_fork {
+    my ($self) = @_;
+
+    if ($self->{_pid} && $self->{_pid} != $$) {
+        # Fork detected - invalidate connection (parent owns the socket)
+        $self->{connected} = 0;
+        $self->{socket} = undef;
+        $self->{parser} = undef;
+        $self->{inflight} = [];
+
+        my $old_pid = $self->{_pid};
+        $self->{_pid} = $$;
+
+        if ($self->{_telemetry}) {
+            $self->{_telemetry}->log_event('fork_detected', "old PID: $old_pid, new PID: $$");
+        }
+
+        return 1;  # Fork occurred
+    }
+
+    return 0;
 }
 
 # Build Redis command in RESP format
@@ -560,6 +588,9 @@ async sub _reconnect {
 # Execute a Redis command
 async sub command {
     my ($self, $cmd, @args) = @_;
+
+    # Check for fork - invalidate connection if PID changed
+    $self->_check_fork;
 
     # Block regular commands on pubsub connection
     if ($self->{in_pubsub}) {

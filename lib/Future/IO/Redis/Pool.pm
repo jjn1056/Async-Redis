@@ -44,6 +44,9 @@ sub new {
         _pending => [],   # Background futures (creation, cleanup)
         _total_created   => 0,
         _total_destroyed => 0,
+
+        # Fork safety
+        _pid => $$,
     }, $class;
 
     return $self;
@@ -66,9 +69,46 @@ sub stats {
     };
 }
 
+# Check if fork occurred and clear pool
+sub _check_fork {
+    my ($self) = @_;
+
+    if ($self->{_pid} && $self->{_pid} != $$) {
+        # Fork detected - invalidate all connections
+        $self->_clear_all_connections;
+        $self->{_pid} = $$;
+        return 1;
+    }
+
+    return 0;
+}
+
+# Clear all connections (called after fork)
+sub _clear_all_connections {
+    my ($self) = @_;
+
+    # Clear idle connections without closing (parent owns the sockets)
+    $self->{_idle} = [];
+
+    # Clear active connection tracking (caller still has reference)
+    $self->{_active} = {};
+
+    # Cancel waiters
+    for my $waiter (@{$self->{_waiters}}) {
+        $waiter->fail("Pool invalidated after fork") unless $waiter->is_ready;
+    }
+    $self->{_waiters} = [];
+
+    # Clear pending futures
+    $self->{_pending} = [];
+}
+
 # Acquire a connection from the pool
 async sub acquire {
     my ($self) = @_;
+
+    # Check for fork - clear pool if PID changed
+    $self->_check_fork;
 
     # Try to get an idle connection
     while (@{$self->{_idle}}) {
@@ -127,6 +167,12 @@ sub release {
     my ($self, $conn) = @_;
 
     return unless $conn;
+
+    # Check for fork - if forked, don't return to pool
+    if ($self->_check_fork) {
+        # Pool was cleared, just drop this connection
+        return;
+    }
 
     # Remove from active
     delete $self->{_active}{"$conn"};
