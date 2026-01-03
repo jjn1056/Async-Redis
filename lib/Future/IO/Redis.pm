@@ -18,6 +18,7 @@ use Future::IO::Redis::Error::Connection;
 use Future::IO::Redis::Error::Timeout;
 use Future::IO::Redis::Error::Disconnected;
 use Future::IO::Redis::Error::Redis;
+use Future::IO::Redis::Error::Protocol;
 
 # Import auto-generated command methods
 use Future::IO::Redis::Commands;
@@ -38,6 +39,9 @@ use Future::IO::Redis::Iterator;
 # Pipeline support
 use Future::IO::Redis::Pipeline;
 use Future::IO::Redis::AutoPipeline;
+
+# PubSub support
+use Future::IO::Redis::Subscription;
 
 # Try XS version first, fall back to pure Perl
 BEGIN {
@@ -135,6 +139,11 @@ sub new {
         # Transaction state
         in_multi => 0,
         watching => 0,
+
+        # PubSub state
+        in_pubsub     => 0,
+        _subscription => undef,
+        _pump_running => 0,
     }, $class;
 
     return $self;
@@ -515,6 +524,16 @@ async sub _reconnect {
 # Execute a Redis command
 async sub command {
     my ($self, $cmd, @args) = @_;
+
+    # Block regular commands on pubsub connection
+    if ($self->{in_pubsub}) {
+        my $ucmd = uc($cmd // '');
+        unless ($ucmd =~ /^(SUBSCRIBE|UNSUBSCRIBE|PSUBSCRIBE|PUNSUBSCRIBE|SSUBSCRIBE|SUNSUBSCRIBE|PING|QUIT)$/) {
+            die Future::IO::Redis::Error::Protocol->new(
+                message => "Cannot execute '$cmd' on connection in PubSub mode",
+            );
+        }
+    }
 
     # Apply key prefixing if configured
     if (defined $self->{prefix} && $self->{prefix} ne '') {
@@ -921,6 +940,7 @@ async sub _execute_transaction {
 # Accessor for pool cleanliness tracking
 sub in_multi { shift->{in_multi} }
 sub watching { shift->{watching} }
+sub in_pubsub { shift->{in_pubsub} }
 
 async sub watch {
     my ($self, @keys) = @_;
@@ -1019,28 +1039,98 @@ async sub publish {
     return await $self->command('PUBLISH', $channel, $message);
 }
 
-# Subscribe to channels - returns a message iterator
+async sub spublish {
+    my ($self, $channel, $message) = @_;
+    return await $self->command('SPUBLISH', $channel, $message);
+}
+
+# Subscribe to channels - returns a Subscription object
 async sub subscribe {
     my ($self, @channels) = @_;
 
-    die "Not connected" unless $self->{connected};
-    die "Already in subscribe mode" if $self->{subscribing};
+    die Future::IO::Redis::Error::Disconnected->new(
+        message => "Not connected",
+    ) unless $self->{connected};
 
-    my $cmd = $self->_build_command('SUBSCRIBE', @channels);
-    await $self->_send($cmd);
+    # Create or reuse subscription
+    my $sub = $self->{_subscription} //= Future::IO::Redis::Subscription->new(redis => $self);
+
+    # Send SUBSCRIBE command
+    await $self->_send_command('SUBSCRIBE', @channels);
 
     # Read subscription confirmations
     for my $ch (@channels) {
-        my $msg = await $self->_read_response();
+        my $msg = await $self->_read_pubsub_frame();
         # Response: ['subscribe', $channel, $count]
+        $sub->_add_channel($ch);
     }
 
-    $self->{subscribing} = 1;
+    $self->{in_pubsub} = 1;
 
-    return Future::IO::Redis::Subscription->new(redis => $self);
+    return $sub;
 }
 
-# Read next pubsub message (blocking)
+# Pattern subscribe
+async sub psubscribe {
+    my ($self, @patterns) = @_;
+
+    die Future::IO::Redis::Error::Disconnected->new(
+        message => "Not connected",
+    ) unless $self->{connected};
+
+    my $sub = $self->{_subscription} //= Future::IO::Redis::Subscription->new(redis => $self);
+
+    await $self->_send_command('PSUBSCRIBE', @patterns);
+
+    for my $p (@patterns) {
+        my $msg = await $self->_read_pubsub_frame();
+        $sub->_add_pattern($p);
+    }
+
+    $self->{in_pubsub} = 1;
+
+    return $sub;
+}
+
+# Sharded subscribe (Redis 7+)
+async sub ssubscribe {
+    my ($self, @channels) = @_;
+
+    die Future::IO::Redis::Error::Disconnected->new(
+        message => "Not connected",
+    ) unless $self->{connected};
+
+    my $sub = $self->{_subscription} //= Future::IO::Redis::Subscription->new(redis => $self);
+
+    await $self->_send_command('SSUBSCRIBE', @channels);
+
+    for my $ch (@channels) {
+        my $msg = await $self->_read_pubsub_frame();
+        $sub->_add_sharded_channel($ch);
+    }
+
+    $self->{in_pubsub} = 1;
+
+    return $sub;
+}
+
+# Read pubsub frame (subscription confirmation or message)
+async sub _read_pubsub_frame {
+    my ($self) = @_;
+
+    my $msg = await $self->_read_response();
+    return $self->_decode_response($msg);
+}
+
+# Send command without reading response (for pubsub)
+async sub _send_command {
+    my ($self, @args) = @_;
+
+    my $cmd = $self->_build_command(@args);
+    await $self->_send($cmd);
+}
+
+# Read next pubsub message (blocking) - for compatibility
 async sub _read_pubsub_message {
     my ($self) = @_;
 
@@ -1098,39 +1188,6 @@ async sub _execute_pipeline {
     }
 
     return \@responses;
-}
-
-# ============================================================================
-# Helper Classes
-# ============================================================================
-
-package Future::IO::Redis::Subscription;
-
-use Future::AsyncAwait;
-
-sub new {
-    my ($class, %args) = @_;
-    return bless { redis => $args{redis} }, $class;
-}
-
-async sub next_message {
-    my ($self) = @_;
-    my $msg = await $self->{redis}->_read_pubsub_message();
-
-    if (ref $msg eq 'ARRAY' && $msg->[0] eq 'message') {
-        return {
-            channel => $msg->[1],
-            message => $msg->[2],
-        };
-    }
-
-    return $msg;
-}
-
-sub unsubscribe {
-    my ($self) = @_;
-    $self->{redis}{subscribing} = 0;
-    # Would need to send UNSUBSCRIBE and read confirmation
 }
 
 1;
