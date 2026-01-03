@@ -35,6 +35,9 @@ use Future::IO::Redis::Script;
 # Iterator support
 use Future::IO::Redis::Iterator;
 
+# Pipeline support
+use Future::IO::Redis::Pipeline;
+
 # Try XS version first, fall back to pure Perl
 BEGIN {
     eval { require Protocol::Redis::XS; 1 }
@@ -123,6 +126,9 @@ sub new {
 
         # Key prefixing
         prefix => $args{prefix},
+
+        # Pipeline settings
+        pipeline_depth => $args{pipeline_depth} // 10000,
 
         # Transaction state
         in_multi => 0,
@@ -1035,8 +1041,11 @@ async sub _read_pubsub_message {
 # ============================================================================
 
 sub pipeline {
-    my ($self) = @_;
-    return Future::IO::Redis::Pipeline->new(redis => $self);
+    my ($self, %opts) = @_;
+    return Future::IO::Redis::Pipeline->new(
+        redis     => $self,
+        max_depth => $opts{max_depth} // $self->{pipeline_depth},
+    );
 }
 
 # Execute multiple commands, return all responses
@@ -1045,6 +1054,8 @@ async sub _execute_pipeline {
 
     die "Not connected" unless $self->{connected};
 
+    return [] unless @$commands;
+
     # Send all commands
     my $data = '';
     for my $cmd (@$commands) {
@@ -1052,12 +1063,23 @@ async sub _execute_pipeline {
     }
     await $self->_send($data);
 
-    # Read all responses
+    # Read all responses, capturing per-slot Redis errors
     my @responses;
     my $count = scalar @$commands;
     for my $i (1 .. $count) {
         my $msg = await $self->_read_response();
-        push @responses, $self->_decode_response($msg);
+
+        # Capture Redis errors inline rather than dying
+        my $result;
+        eval {
+            $result = $self->_decode_response($msg);
+        };
+        if ($@) {
+            # Capture the error as a string in the results
+            $result = $@;
+            chomp $result if defined $result;
+        }
+        push @responses, $result;
     }
 
     return \@responses;
@@ -1094,35 +1116,6 @@ sub unsubscribe {
     my ($self) = @_;
     $self->{redis}{subscribing} = 0;
     # Would need to send UNSUBSCRIBE and read confirmation
-}
-
-package Future::IO::Redis::Pipeline;
-
-use Future::AsyncAwait;
-
-sub new {
-    my ($class, %args) = @_;
-    return bless {
-        redis => $args{redis},
-        commands => [],
-    }, $class;
-}
-
-sub add {
-    my ($self, @cmd) = @_;
-    push @{$self->{commands}}, \@cmd;
-    return $self;
-}
-
-# Convenience methods for pipeline
-sub set { shift->add('SET', @_) }
-sub get { shift->add('GET', @_) }
-sub incr { shift->add('INCR', @_) }
-sub del { shift->add('DEL', @_) }
-
-async sub execute {
-    my ($self) = @_;
-    return await $self->{redis}->_execute_pipeline($self->{commands});
 }
 
 1;
