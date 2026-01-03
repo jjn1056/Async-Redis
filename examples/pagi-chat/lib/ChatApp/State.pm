@@ -15,6 +15,7 @@ package ChatApp::State;
 
 use strict;
 use warnings;
+use Future;
 use Future::AsyncAwait;
 use Exporter 'import';
 use JSON::MaybeXS;
@@ -84,9 +85,12 @@ async sub init_redis {
 sub get_redis { $redis }
 sub get_pubsub { $pubsub }
 
+# Hold reference to background listener future
+my $broadcast_listener_future;
+
 # Background listener for cross-worker broadcasts
 sub _start_broadcast_listener {
-    (async sub {
+    $broadcast_listener_future = (async sub {
         while (my $msg = await $pubsub->next_message) {
             next unless $msg->{type} eq 'message';
 
@@ -107,7 +111,10 @@ sub _start_broadcast_listener {
                 eval { $local->{send_cb}->($payload) };
             }
         }
-    })->();
+    })->()->on_fail(sub {
+        my ($err) = @_;
+        warn "Broadcast listener error: $err";
+    })->retain;
 }
 
 # Register a local session (called when client connects to THIS worker)

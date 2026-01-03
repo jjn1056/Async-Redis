@@ -3,8 +3,8 @@
 use strict;
 use warnings;
 use Test2::V0;
-use lib 't/lib';
-use Test::Future::IO::Redis qw(init_loop skip_without_redis await_f cleanup_keys);
+use Test::Lib;
+use Test::Future::IO::Redis qw(init_loop skip_without_redis await_f cleanup_keys run);
 
 my $loop = init_loop();
 
@@ -15,7 +15,7 @@ SKIP: {
         my $r = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($r->connect);
+        run { $r->connect };
 
         # Use pipeline for many SET commands
         my $pipe = $r->pipeline;
@@ -23,7 +23,7 @@ SKIP: {
             $pipe->set("pset:$i", "value$i");
         }
 
-        my $results = await_f($pipe->execute);
+        my $results = run { $pipe->execute };
         is(scalar @$results, 20, 'all SET commands completed');
 
         # Verify all returned OK
@@ -32,11 +32,11 @@ SKIP: {
 
         # Verify values were set correctly (sequential GETs)
         for my $i (1..20) {
-            my $val = await_f($r->get("pset:$i"));
+            my $val = run { $r->get("pset:$i") };
             is($val, "value$i", "key $i correct");
         }
 
-        cleanup_keys($r, 'pset:*');
+        run { cleanup_keys($r, 'pset:*') };
         $r->disconnect;
     };
 
@@ -44,11 +44,11 @@ SKIP: {
         my $r = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($r->connect);
+        run { $r->connect };
 
         # Set up some keys (sequential)
         for my $i (1..10) {
-            await_f($r->set("pget:$i", "val$i"));
+            run { $r->set("pget:$i", "val$i") };
         }
 
         # Use pipeline for parallel GETs
@@ -57,7 +57,7 @@ SKIP: {
             $pipe->get("pget:$i");
         }
 
-        my $results = await_f($pipe->execute);
+        my $results = run { $pipe->execute };
 
         is(scalar @$results, 10, 'all GETs completed');
 
@@ -66,7 +66,7 @@ SKIP: {
             is($results->[$i], "val" . ($i + 1), "value " . ($i + 1) . " correct");
         }
 
-        cleanup_keys($r, 'pget:*');
+        run { cleanup_keys($r, 'pget:*') };
         $r->disconnect;
     };
 
@@ -74,7 +74,7 @@ SKIP: {
         my $r = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($r->connect);
+        run { $r->connect };
 
         # Use pipeline for mixed commands
         my $pipe = $r->pipeline;
@@ -83,7 +83,7 @@ SKIP: {
         $pipe->lpush('pmix:list', 'item1', 'item2');
         $pipe->sadd('pmix:set', 'member1', 'member2');
 
-        my $results = await_f($pipe->execute);
+        my $results = run { $pipe->execute };
         is(scalar @$results, 4, 'all commands completed');
 
         is($results->[0], 'OK', 'SET returned OK');
@@ -91,7 +91,7 @@ SKIP: {
         is($results->[2], 2, 'LPUSH returned 2');
         is($results->[3], 2, 'SADD returned 2');
 
-        cleanup_keys($r, 'pmix:*');
+        run { cleanup_keys($r, 'pmix:*') };
         $r->disconnect;
     };
 
@@ -99,20 +99,20 @@ SKIP: {
         my $r = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($r->connect);
+        run { $r->connect };
 
         # Sequential commands should work
         for my $i (1..5) {
-            my $result = await_f($r->set("seq:$i", "val$i"));
+            my $result = run { $r->set("seq:$i", "val$i") };
             is($result, 'OK', "SET $i succeeded");
         }
 
         for my $i (1..5) {
-            my $result = await_f($r->get("seq:$i"));
+            my $result = run { $r->get("seq:$i") };
             is($result, "val$i", "GET $i correct");
         }
 
-        cleanup_keys($r, 'seq:*');
+        run { cleanup_keys($r, 'seq:*') };
         $r->disconnect;
     };
 

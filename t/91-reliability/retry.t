@@ -2,8 +2,8 @@
 use strict;
 use warnings;
 use Test2::V0;
-use lib 't/lib';
-use Test::Future::IO::Redis qw(init_loop skip_without_redis await_f cleanup_keys);
+use Test::Lib;
+use Test::Future::IO::Redis qw(init_loop skip_without_redis await_f cleanup_keys run);
 
 my $loop = init_loop();
 
@@ -16,20 +16,20 @@ SKIP: {
             reconnect => 1,
             reconnect_delay => 0.1,
         );
-        await_f($r->connect);
+        run { $r->connect };
 
         # Set a value
-        await_f($r->set('retry:key1', 'value1'));
-        is(await_f($r->get('retry:key1')), 'value1', 'initial set works');
+        run { $r->set('retry:key1', 'value1') };
+        is(run { $r->get('retry:key1') }, 'value1', 'initial set works');
 
         # Force disconnect
         $r->disconnect;
 
         # Next command should trigger reconnect
-        await_f($r->set('retry:key2', 'value2'));
-        is(await_f($r->get('retry:key2')), 'value2', 'command after reconnect works');
+        run { $r->set('retry:key2', 'value2') };
+        is(run { $r->get('retry:key2') }, 'value2', 'command after reconnect works');
 
-        cleanup_keys($r, 'retry:*');
+        run { cleanup_keys($r, 'retry:*') };
         $r->disconnect;
     };
 
@@ -40,7 +40,7 @@ SKIP: {
             reconnect_delay => 0.05,
             reconnect_delay_max => 1,
         );
-        await_f($r->connect);
+        run { $r->connect };
 
         # Verify backoff calculation
         my $delay1 = $r->_calculate_backoff(1);
@@ -59,14 +59,14 @@ SKIP: {
             host => $ENV{REDIS_HOST} // 'localhost',
             reconnect => 0,
         );
-        await_f($r->connect);
+        run { $r->connect };
 
         # Disconnect
         $r->disconnect;
 
         # Should fail without reconnect
         my $error;
-        eval { await_f($r->ping) };
+        eval { run { $r->ping } };
         $error = $@;
 
         ok($error, 'error thrown when reconnect disabled');

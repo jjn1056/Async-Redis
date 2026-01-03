@@ -1,21 +1,12 @@
 # t/50-pubsub/subscribe.t
 use strict;
 use warnings;
-use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Future::AsyncAwait;
+use Test2::V0;
 use Future::IO::Redis;
 use Future;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $publisher = eval {
@@ -23,7 +14,7 @@ SKIP: {
             host => $ENV{REDIS_HOST} // 'localhost',
             connect_timeout => 2,
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $publisher;
@@ -32,10 +23,10 @@ SKIP: {
         my $subscriber = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($subscriber->connect);
+        run { $subscriber->connect };
 
         # Subscribe first
-        my $sub = await_f($subscriber->subscribe('test:sub:basic'));
+        my $sub = run { $subscriber->subscribe('test:sub:basic') };
         ok($sub->isa('Future::IO::Redis::Subscription'), 'returns Subscription object');
         is([sort $sub->channels], ['test:sub:basic'], 'tracks subscribed channels');
 
@@ -51,7 +42,7 @@ SKIP: {
         # Receive messages
         my @received;
         for my $i (1..3) {
-            my $msg = await_f($sub->next);
+            my $msg = run { $sub->next };
             push @received, $msg;
         }
 
@@ -69,16 +60,16 @@ SKIP: {
         my $subscriber = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($subscriber->connect);
+        run { $subscriber->connect };
 
         # Start subscription
-        my $sub = await_f($subscriber->subscribe('test:sub:block'));
+        my $sub = run { $subscriber->subscribe('test:sub:block') };
         ok($subscriber->in_pubsub, 'connection marked as in_pubsub');
 
         # Regular commands should fail on pubsub connection
         my $error;
         eval {
-            await_f($subscriber->get('some:key'));
+            run { $subscriber->get('some:key') };
         };
         $error = $@;
         ok($error, 'regular command fails on pubsub connection');

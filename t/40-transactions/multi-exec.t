@@ -1,32 +1,22 @@
 # t/40-transactions/multi-exec.t
 use strict;
 use warnings;
-use Test2::V0;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Future::AsyncAwait;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
-use IO::Async::Timer::Periodic;
+use Test2::V0;
 use Future::IO::Redis;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
         my $r = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost', connect_timeout => 2);
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
 
     # Cleanup
-    await_f($redis->del('tx:counter', 'tx:updated', 'tx:hash'));
+    run { $redis->del('tx:counter', 'tx:updated', 'tx:hash') };
 
     subtest 'basic MULTI/EXEC with callback' => sub {
         my $results = await_f($redis->multi(async sub {
@@ -46,7 +36,7 @@ SKIP: {
     };
 
     subtest 'transaction is atomic' => sub {
-        await_f($redis->set('tx:counter', '100'));
+        run { $redis->set('tx:counter', '100') };
 
         # Start a transaction
         my $results = await_f($redis->multi(async sub {
@@ -58,7 +48,7 @@ SKIP: {
 
         is($results, [101, 102, 103], 'all increments applied atomically');
 
-        my $final = await_f($redis->get('tx:counter'));
+        my $final = run { $redis->get('tx:counter') };
         is($final, '103', 'final value correct');
     };
 
@@ -72,7 +62,7 @@ SKIP: {
     };
 
     subtest 'transaction with mixed commands' => sub {
-        await_f($redis->del('tx:hash'));
+        run { $redis->del('tx:hash') };
 
         my $results = await_f($redis->multi(async sub {
             my ($tx) = @_;
@@ -93,7 +83,7 @@ SKIP: {
             interval => 0.01,
             on_tick => sub { push @ticks, 1 },
         );
-        $loop->add($timer);
+        get_loop()->add($timer);
         $timer->start;
 
         # Run 20 transactions
@@ -106,16 +96,16 @@ SKIP: {
         }
 
         $timer->stop;
-        $loop->remove($timer);
+        get_loop()->remove($timer);
 
         ok(@ticks >= 2, "Event loop ticked during transactions");
 
         # Cleanup
-        await_f($redis->del(map { "tx:nb:$_" } 1..20));
+        run { $redis->del(map { "tx:nb:$_" } 1..20) };
     };
 
     # Cleanup
-    await_f($redis->del('tx:counter', 'tx:updated', 'tx:hash'));
+    run { $redis->del('tx:counter', 'tx:updated', 'tx:hash') };
 }
 
 done_testing;

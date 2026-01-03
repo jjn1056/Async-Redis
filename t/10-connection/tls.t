@@ -1,22 +1,13 @@
 # t/10-connection/tls.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
-use IO::Async::Timer::Periodic;
 use Future::IO::Redis;
 use Time::HiRes qw(time);
 
-my $loop = IO::Async::Loop->new;
-
 # Helper: await a Future and return its result (throws on failure)
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 subtest 'TLS module availability' => sub {
     my $has_ssl = eval { require IO::Socket::SSL; 1 };
@@ -69,7 +60,7 @@ SKIP: {
 
         my $error;
         my $f = $redis->connect;
-        $loop->await($f);
+        get_loop()->await($f);
         eval { $f->get };
         $error = $@;
 
@@ -94,8 +85,8 @@ SKIP: {
             },
         );
 
-        await_f($redis->connect);
-        my $pong = await_f($redis->ping);
+        run { $redis->connect };
+        my $pong = run { $redis->ping };
         is($pong, 'PONG', 'TLS connection works');
 
         $redis->disconnect;
@@ -107,7 +98,7 @@ SKIP: {
             interval => 0.01,
             on_tick  => sub { push @ticks, time() },
         );
-        $loop->add($timer);
+        get_loop()->add($timer);
         $timer->start;
 
         my $redis = Future::IO::Redis->new(
@@ -118,11 +109,11 @@ SKIP: {
         );
 
         my $start = time();
-        await_f($redis->connect);
+        run { $redis->connect };
         my $elapsed = time() - $start;
 
         $timer->stop;
-        $loop->remove($timer);
+        get_loop()->remove($timer);
 
         # If handshake took any measurable time, we should have ticks
         if ($elapsed > 0.05) {
@@ -147,8 +138,8 @@ SKIP: {
             password => $ENV{TLS_REDIS_PASS},
         );
 
-        await_f($redis->connect);
-        my $pong = await_f($redis->ping);
+        run { $redis->connect };
+        my $pong = run { $redis->ping };
         is($pong, 'PONG', 'TLS + auth works');
 
         $redis->disconnect;

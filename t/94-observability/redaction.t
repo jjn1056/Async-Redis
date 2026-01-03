@@ -1,6 +1,8 @@
 # t/94-observability/redaction.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
 use Future::IO::Redis::Telemetry;
 

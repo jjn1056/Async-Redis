@@ -1,21 +1,12 @@
 # t/50-pubsub/multiple-channels.t
 use strict;
 use warnings;
-use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Future::AsyncAwait;
+use Test2::V0;
 use Future::IO::Redis;
 use Future;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $publisher = eval {
@@ -23,7 +14,7 @@ SKIP: {
             host => $ENV{REDIS_HOST} // 'localhost',
             connect_timeout => 2,
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $publisher;
@@ -32,11 +23,11 @@ SKIP: {
         my $subscriber = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($subscriber->connect);
+        run { $subscriber->connect };
 
         my @channels = map { "multi:chan:$_" } (1..10);
 
-        my $sub = await_f($subscriber->subscribe(@channels));
+        my $sub = run { $subscriber->subscribe(@channels) };
 
         is($sub->channel_count, 10, 'subscribed to 10 channels');
         is([sort $sub->channels], [sort @channels], 'all channels tracked');
@@ -48,10 +39,10 @@ SKIP: {
         my $subscriber = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($subscriber->connect);
+        run { $subscriber->connect };
 
         my @channels = map { "recv:chan:$_" } (1..5);
-        my $sub = await_f($subscriber->subscribe(@channels));
+        my $sub = run { $subscriber->subscribe(@channels) };
 
         # Publish in background
         my $publish_future = (async sub {
@@ -63,7 +54,7 @@ SKIP: {
 
         my %received_by_channel;
         for my $i (1..5) {
-            my $msg = await_f($sub->next);
+            my $msg = run { $sub->next };
             $received_by_channel{$msg->{channel}} = $msg->{data};
         }
 
@@ -81,14 +72,14 @@ SKIP: {
         my $subscriber = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($subscriber->connect);
+        run { $subscriber->connect };
 
         # Initial subscription
-        my $sub = await_f($subscriber->subscribe('add:initial'));
+        my $sub = run { $subscriber->subscribe('add:initial') };
         is($sub->channel_count, 1, 'initial subscription');
 
         # Add more channels
-        await_f($subscriber->subscribe('add:second', 'add:third'));
+        run { $subscriber->subscribe('add:second', 'add:third') };
         is($sub->channel_count, 3, 'added channels');
         is([sort $sub->channels], ['add:initial', 'add:second', 'add:third'], 'all tracked');
 

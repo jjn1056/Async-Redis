@@ -1,70 +1,60 @@
 # t/20-commands/sets.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
-use IO::Async::Timer::Periodic;
 use Future::IO::Redis;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
         my $r = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost', connect_timeout => 2);
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
 
     # Cleanup
-    await_f($redis->del('test:set1', 'test:set2'));
+    run { $redis->del('test:set1', 'test:set2') };
 
     subtest 'SADD and SMEMBERS' => sub {
-        my $added = await_f($redis->sadd('test:set1', 'a', 'b', 'c'));
+        my $added = run { $redis->sadd('test:set1', 'a', 'b', 'c') };
         is($added, 3, 'SADD returns count');
 
-        my $members = await_f($redis->smembers('test:set1'));
+        my $members = run { $redis->smembers('test:set1') };
         is([sort @$members], ['a', 'b', 'c'], 'SMEMBERS returns all members');
     };
 
     subtest 'SISMEMBER and SCARD' => sub {
-        my $is = await_f($redis->sismember('test:set1', 'a'));
+        my $is = run { $redis->sismember('test:set1', 'a') };
         is($is, 1, 'SISMEMBER returns 1 for member');
 
-        $is = await_f($redis->sismember('test:set1', 'z'));
+        $is = run { $redis->sismember('test:set1', 'z') };
         is($is, 0, 'SISMEMBER returns 0 for non-member');
 
-        my $card = await_f($redis->scard('test:set1'));
+        my $card = run { $redis->scard('test:set1') };
         is($card, 3, 'SCARD returns cardinality');
     };
 
     subtest 'SREM' => sub {
-        my $removed = await_f($redis->srem('test:set1', 'a'));
+        my $removed = run { $redis->srem('test:set1', 'a') };
         is($removed, 1, 'SREM returns count');
 
-        my $card = await_f($redis->scard('test:set1'));
+        my $card = run { $redis->scard('test:set1') };
         is($card, 2, 'cardinality decreased');
     };
 
     subtest 'SINTER, SUNION, SDIFF' => sub {
-        await_f($redis->sadd('test:set1', 'a', 'b', 'c'));
-        await_f($redis->sadd('test:set2', 'b', 'c', 'd'));
+        run { $redis->sadd('test:set1', 'a', 'b', 'c') };
+        run { $redis->sadd('test:set2', 'b', 'c', 'd') };
 
-        my $inter = await_f($redis->sinter('test:set1', 'test:set2'));
+        my $inter = run { $redis->sinter('test:set1', 'test:set2') };
         is([sort @$inter], ['b', 'c'], 'SINTER works');
 
-        my $union = await_f($redis->sunion('test:set1', 'test:set2'));
+        my $union = run { $redis->sunion('test:set1', 'test:set2') };
         is([sort @$union], ['a', 'b', 'c', 'd'], 'SUNION works');
 
-        my $diff = await_f($redis->sdiff('test:set1', 'test:set2'));
+        my $diff = run { $redis->sdiff('test:set1', 'test:set2') };
         is([sort @$diff], ['a'], 'SDIFF works');
     };
 
@@ -74,22 +64,22 @@ SKIP: {
             interval => 0.01,
             on_tick => sub { push @ticks, 1 },
         );
-        $loop->add($timer);
+        get_loop()->add($timer);
         $timer->start;
 
         for my $i (1..50) {
-            await_f($redis->sadd('test:set1', "member$i"));
+            run { $redis->sadd('test:set1', "member$i") };
         }
 
         $timer->stop;
-        $loop->remove($timer);
+        get_loop()->remove($timer);
 
         # Timing-sensitive test - just verify loop processed
         pass("Event loop processed during operations");
     };
 
     # Cleanup
-    await_f($redis->del('test:set1', 'test:set2'));
+    run { $redis->del('test:set1', 'test:set2') };
 }
 
 done_testing;

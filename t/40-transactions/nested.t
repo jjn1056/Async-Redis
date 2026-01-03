@@ -1,41 +1,32 @@
 # t/40-transactions/nested.t
 use strict;
 use warnings;
-use Test2::V0;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Future::AsyncAwait;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
+use Test2::V0;
 use Future::IO::Redis;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
         my $r = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost', connect_timeout => 2);
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
 
     subtest 'nested MULTI returns error' => sub {
-        await_f($redis->multi_start());
+        run { $redis->multi_start() };
 
         # Trying to start another MULTI should return error
         my $error;
         eval {
-            await_f($redis->multi_start());
+            run { $redis->multi_start() };
         };
         $error = $@;
 
         # Clean up
-        await_f($redis->discard());
+        run { $redis->discard() };
 
         ok($error, 'nested MULTI threw error');
         like("$error", qr/MULTI calls can not be nested/i, 'correct error message');
@@ -62,7 +53,7 @@ SKIP: {
 
     subtest 'connection usable after nested error' => sub {
         # Connection should still work
-        my $result = await_f($redis->ping);
+        my $result = run { $redis->ping };
         is($result, 'PONG', 'connection still usable');
     };
 }

@@ -1,0 +1,25 @@
+# Redis persistence files
+dump.rdb
+t/dump.rdb
+
+# Perl build artifacts
+blib/
+Makefile
+Makefile.old
+MYMETA.*
+pm_to_blib
+*.o
+*.bs
+
+# Dist::Zilla
+Future-IO-Redis-*/
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store

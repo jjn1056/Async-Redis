@@ -1,25 +1,15 @@
 # t/80-scan/match.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use Future::AsyncAwait;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
 use Future::IO::Redis;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
         my $r = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost', connect_timeout => 2);
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
@@ -31,14 +21,14 @@ SKIP: {
         'match:product:a', 'match:product:b',
     );
     for my $key (@keys) {
-        await_f($redis->set($key, 'value'));
+        run { $redis->set($key, 'value') };
     }
 
     subtest 'SCAN MATCH with wildcard' => sub {
         my $iter = $redis->scan_iter(match => 'match:user:*');
 
         my @found;
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @found, @$batch;
         }
 
@@ -52,7 +42,7 @@ SKIP: {
         my $iter = $redis->scan_iter(match => 'match:*:1');
 
         my @found;
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @found, @$batch;
         }
 
@@ -65,7 +55,7 @@ SKIP: {
         my $iter = $redis->scan_iter(match => 'match:product:?');
 
         my @found;
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @found, @$batch;
         }
 
@@ -76,7 +66,7 @@ SKIP: {
         my $iter = $redis->scan_iter(match => 'match:nonexistent:*');
 
         my @found;
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @found, @$batch;
         }
 
@@ -84,7 +74,7 @@ SKIP: {
     };
 
     # Cleanup
-    await_f($redis->del(@keys));
+    run { $redis->del(@keys) };
 }
 
 done_testing;

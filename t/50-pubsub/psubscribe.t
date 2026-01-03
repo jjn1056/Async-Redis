@@ -1,21 +1,12 @@
 # t/50-pubsub/psubscribe.t
 use strict;
 use warnings;
-use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Future::AsyncAwait;
+use Test2::V0;
 use Future::IO::Redis;
 use Future;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $publisher = eval {
@@ -23,7 +14,7 @@ SKIP: {
             host => $ENV{REDIS_HOST} // 'localhost',
             connect_timeout => 2,
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $publisher;
@@ -32,9 +23,9 @@ SKIP: {
         my $subscriber = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($subscriber->connect);
+        run { $subscriber->connect };
 
-        my $sub = await_f($subscriber->psubscribe('news:*'));
+        my $sub = run { $subscriber->psubscribe('news:*') };
         ok($sub->isa('Future::IO::Redis::Subscription'), 'returns Subscription');
         is([sort $sub->patterns], ['news:*'], 'tracks subscribed patterns');
 
@@ -49,7 +40,7 @@ SKIP: {
         # Receive 3 messages
         my @received;
         for my $i (1..3) {
-            my $msg = await_f($sub->next);
+            my $msg = run { $sub->next };
             push @received, $msg;
         }
 
@@ -68,9 +59,9 @@ SKIP: {
         my $subscriber = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($subscriber->connect);
+        run { $subscriber->connect };
 
-        my $sub = await_f($subscriber->psubscribe('alert:*', 'log:*'));
+        my $sub = run { $subscriber->psubscribe('alert:*', 'log:*') };
         is([sort $sub->patterns], ['alert:*', 'log:*'], 'both patterns tracked');
 
         # Publish in background
@@ -82,7 +73,7 @@ SKIP: {
 
         my @received;
         for my $i (1..2) {
-            my $msg = await_f($sub->next);
+            my $msg = run { $sub->next };
             push @received, $msg;
         }
 

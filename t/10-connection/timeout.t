@@ -1,22 +1,13 @@
 # t/10-connection/timeout.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
-use IO::Async::Timer::Periodic;
 use Future::IO::Redis;
 use Time::HiRes qw(time);
 
-my $loop = IO::Async::Loop->new;
-
 # Helper: await a Future and return its result (throws on failure)
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 subtest 'constructor accepts timeout parameters' => sub {
     my $redis = Future::IO::Redis->new(
@@ -54,7 +45,7 @@ subtest 'connect timeout fires on unreachable host' => sub {
 
     my $error;
     my $f = $redis->connect;
-    $loop->await($f);
+    get_loop()->await($f);
     eval { $f->get };  # ->get throws on failure
     $error = $@;
 
@@ -71,7 +62,7 @@ subtest 'event loop not blocked during connect timeout' => sub {
         interval => 0.05,
         on_tick  => sub { push @ticks, time() },
     );
-    $loop->add($timer);
+    get_loop()->add($timer);
     $timer->start;
 
     my $redis = Future::IO::Redis->new(
@@ -81,12 +72,12 @@ subtest 'event loop not blocked during connect timeout' => sub {
 
     my $start = time();
     my $f = $redis->connect;
-    $loop->await($f);
+    get_loop()->await($f);
     eval { $f->get };  # convert failure to exception (ignored)
     my $elapsed = time() - $start;
 
     $timer->stop;
-    $loop->remove($timer);
+    get_loop()->remove($timer);
 
     # Should have ticked multiple times during the 0.3s wait
     ok(@ticks >= 3, "timer ticked " . scalar(@ticks) . " times during ${elapsed}s timeout");
@@ -99,7 +90,7 @@ SKIP: {
             host            => $ENV{REDIS_HOST} // 'localhost',
             connect_timeout => 2,
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 4 unless $test_redis;
@@ -110,13 +101,21 @@ SKIP: {
             host            => $ENV{REDIS_HOST} // 'localhost',
             request_timeout => 0.3,
         );
-        await_f($redis->connect);
+        run { $redis->connect };
+
+        # Check if DEBUG command is available (not allowed in Docker Redis by default)
+        my $debug_available = eval { run { $redis->command('DEBUG', 'SLEEP', '0') }; 1 };
+        unless ($debug_available) {
+            $redis->disconnect;
+            plan skip_all => 'DEBUG command not available (requires enable-debug-command config)';
+            return;
+        }
 
         my $start = time();
         my $error;
         eval {
             # DEBUG SLEEP causes Redis to block for N seconds
-            await_f($redis->command('DEBUG', 'SLEEP', '2'));
+            run { $redis->command('DEBUG', 'SLEEP', '2') };
         };
         $error = $@;
         my $elapsed = time() - $start;
@@ -130,24 +129,32 @@ SKIP: {
     };
 
     subtest 'event loop not blocked during request timeout' => sub {
+        my $redis = Future::IO::Redis->new(
+            host            => $ENV{REDIS_HOST} // 'localhost',
+            request_timeout => 0.3,
+        );
+        run { $redis->connect };
+
+        # Check if DEBUG command is available (not allowed in Docker Redis by default)
+        my $debug_available = eval { run { $redis->command('DEBUG', 'SLEEP', '0') }; 1 };
+        unless ($debug_available) {
+            $redis->disconnect;
+            plan skip_all => 'DEBUG command not available (requires enable-debug-command config)';
+            return;
+        }
+
         my @ticks;
         my $timer = IO::Async::Timer::Periodic->new(
             interval => 0.05,
             on_tick  => sub { push @ticks, time() },
         );
-        $loop->add($timer);
+        get_loop()->add($timer);
         $timer->start;
 
-        my $redis = Future::IO::Redis->new(
-            host            => $ENV{REDIS_HOST} // 'localhost',
-            request_timeout => 0.3,
-        );
-        await_f($redis->connect);
-
-        eval { await_f($redis->command('DEBUG', 'SLEEP', '2')) };
+        eval { run { $redis->command('DEBUG', 'SLEEP', '2') } };
 
         $timer->stop;
-        $loop->remove($timer);
+        get_loop()->remove($timer);
 
         ok(@ticks >= 3, "timer ticked " . scalar(@ticks) . " times during timeout");
 
@@ -160,15 +167,15 @@ SKIP: {
             request_timeout         => 1,
             blocking_timeout_buffer => 1,
         );
-        await_f($redis->connect);
+        run { $redis->connect };
 
         # Clean up any existing list
-        await_f($redis->del('timeout:test:list'));
+        run { $redis->del('timeout:test:list') };
 
         my $start = time();
         # BLPOP with 0.5s server timeout
         # Client deadline should be 0.5 + 1 (buffer) = 1.5s
-        my $result = await_f($redis->command('BLPOP', 'timeout:test:list', '0.5'));
+        my $result = run { $redis->command('BLPOP', 'timeout:test:list', '0.5') };
         my $elapsed = time() - $start;
 
         # BLPOP returns undef on timeout
@@ -184,18 +191,18 @@ SKIP: {
             host            => $ENV{REDIS_HOST} // 'localhost',
             request_timeout => 5,
         );
-        await_f($redis->connect);
+        run { $redis->connect };
 
         # Normal commands should complete well within timeout
-        my $result = await_f($redis->command('PING'));
+        my $result = run { $redis->command('PING') };
         is($result, 'PONG', 'PING works');
 
-        await_f($redis->command('SET', 'timeout:test:key', 'value'));
-        my $value = await_f($redis->command('GET', 'timeout:test:key'));
+        run { $redis->command('SET', 'timeout:test:key', 'value') };
+        my $value = run { $redis->command('GET', 'timeout:test:key') };
         is($value, 'value', 'GET/SET work');
 
         # Cleanup
-        await_f($redis->del('timeout:test:key'));
+        run { $redis->del('timeout:test:key') };
         $redis->disconnect;
     };
 }

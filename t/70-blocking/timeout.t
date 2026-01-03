@@ -1,21 +1,11 @@
 # t/70-blocking/timeout.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use Future::AsyncAwait;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
 use Future::IO::Redis;
 use Time::HiRes qw(time);
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
@@ -24,20 +14,20 @@ SKIP: {
             connect_timeout => 2,
             blocking_timeout_buffer => 2,  # 2 second buffer
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
 
     subtest 'client timeout = server timeout + buffer' => sub {
-        await_f($redis->del('timeout:queue'));
+        run { $redis->del('timeout:queue') };
 
         # BLPOP with 1 second server timeout
         # Client should wait 1 + 2 = 3 seconds before client-side timeout
         # But server returns first, so we get undef at ~1s
 
         my $start = time();
-        my $result = await_f($redis->blpop('timeout:queue', 1));
+        my $result = run { $redis->blpop('timeout:queue', 1) };
         my $elapsed = time() - $start;
 
         is($result, undef, 'BLPOP returned undef');
@@ -51,12 +41,12 @@ SKIP: {
             host => $ENV{REDIS_HOST} // 'localhost',
             blocking_timeout_buffer => 0.5,  # short buffer
         );
-        await_f($redis_short->connect);
+        run { $redis_short->connect };
 
-        await_f($redis_short->del('timeout:race'));
+        run { $redis_short->del('timeout:race') };
 
         my $start = time();
-        my $result = await_f($redis_short->blpop('timeout:race', 1));
+        my $result = run { $redis_short->blpop('timeout:race', 1) };
         my $elapsed = time() - $start;
 
         is($result, undef, 'returned undef');
@@ -65,10 +55,10 @@ SKIP: {
     };
 
     subtest 'BZPOPMIN timeout' => sub {
-        await_f($redis->del('timeout:zset'));
+        run { $redis->del('timeout:zset') };
 
         my $start = time();
-        my $result = await_f($redis->bzpopmin('timeout:zset', 1));
+        my $result = run { $redis->bzpopmin('timeout:zset', 1) };
         my $elapsed = time() - $start;
 
         is($result, undef, 'BZPOPMIN returned undef on timeout');
@@ -76,10 +66,10 @@ SKIP: {
     };
 
     subtest 'BZPOPMAX timeout' => sub {
-        await_f($redis->del('timeout:zset'));
+        run { $redis->del('timeout:zset') };
 
         my $start = time();
-        my $result = await_f($redis->bzpopmax('timeout:zset', 1));
+        my $result = run { $redis->bzpopmax('timeout:zset', 1) };
         my $elapsed = time() - $start;
 
         is($result, undef, 'BZPOPMAX returned undef on timeout');
@@ -87,10 +77,10 @@ SKIP: {
     };
 
     subtest 'BRPOPLPUSH timeout' => sub {
-        await_f($redis->del('timeout:src', 'timeout:dst'));
+        run { $redis->del('timeout:src', 'timeout:dst') };
 
         my $start = time();
-        my $result = await_f($redis->brpoplpush('timeout:src', 'timeout:dst', 1));
+        my $result = run { $redis->brpoplpush('timeout:src', 'timeout:dst', 1) };
         my $elapsed = time() - $start;
 
         is($result, undef, 'BRPOPLPUSH returned undef on timeout');

@@ -1,33 +1,22 @@
 # t/80-scan/scan.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use Future::AsyncAwait;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
-use IO::Async::Timer::Periodic;
 use Future::IO::Redis;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
         my $r = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost', connect_timeout => 2);
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
 
     # Setup test keys
     for my $i (1..20) {
-        await_f($redis->set("scan:key:$i", "value$i"));
+        run { $redis->set("scan:key:$i", "value$i") };
     }
 
     subtest 'scan_iter returns iterator' => sub {
@@ -40,7 +29,7 @@ SKIP: {
         my $iter = $redis->scan_iter(match => 'scan:key:*');
 
         my @all_keys;
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @all_keys, @$batch;
         }
 
@@ -54,7 +43,7 @@ SKIP: {
         my $iter = $redis->scan_iter(match => 'scan:key:*', count => 5);
 
         my @batches;
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @batches, $batch;
         }
 
@@ -68,14 +57,14 @@ SKIP: {
         my $iter = $redis->scan_iter(match => 'scan:nonexistent:*');
 
         my @all;
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @all, @$batch;
         }
 
         is(scalar @all, 0, 'no keys found for nonexistent pattern');
 
         # Subsequent calls return undef
-        my $batch = await_f($iter->next);
+        my $batch = run { $iter->next };
         is($batch, undef, 'iterator exhausted');
     };
 
@@ -83,7 +72,7 @@ SKIP: {
         my $iter = $redis->scan_iter(match => 'scan:key:*');
 
         # Consume part of iteration
-        my $batch1 = await_f($iter->next);
+        my $batch1 = run { $iter->next };
         ok($batch1, 'got first batch');
 
         # Reset
@@ -91,7 +80,7 @@ SKIP: {
 
         # Should start over
         my @all_keys;
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @all_keys, @$batch;
         }
 
@@ -104,17 +93,17 @@ SKIP: {
             interval => 0.01,
             on_tick => sub { push @ticks, 1 },
         );
-        $loop->add($timer);
+        get_loop()->add($timer);
         $timer->start;
 
         my $iter = $redis->scan_iter(match => 'scan:key:*', count => 2);
         my @all;
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @all, @$batch;
         }
 
         $timer->stop;
-        $loop->remove($timer);
+        get_loop()->remove($timer);
 
         is(scalar @all, 20, 'got all keys');
         pass("Event loop ticked during SCAN iteration");
@@ -122,7 +111,7 @@ SKIP: {
 
     # Cleanup
     for my $i (1..20) {
-        await_f($redis->del("scan:key:$i"));
+        run { $redis->del("scan:key:$i") };
     }
 }
 

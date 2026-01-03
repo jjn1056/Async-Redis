@@ -3,8 +3,8 @@
 use strict;
 use warnings;
 use Test2::V0;
-use lib 't/lib';
-use Test::Future::IO::Redis qw(init_loop skip_without_redis await_f cleanup_keys);
+use Test::Lib;
+use Test::Future::IO::Redis qw(init_loop skip_without_redis await_f cleanup_keys run);
 use Time::HiRes qw(time);
 
 my $loop = init_loop();
@@ -16,7 +16,7 @@ SKIP: {
         my $r = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($r->connect);
+        run { $r->connect };
 
         my $commands = 10_000;
 
@@ -25,7 +25,7 @@ SKIP: {
         for my $i (1..$commands) {
             $pipeline->set("throughput:key:$i", $i);
         }
-        my $results = await_f($pipeline->execute);
+        my $results = run { $pipeline->execute };
         my $elapsed = time() - $start;
 
         is(scalar(@$results), $commands, 'all pipeline commands returned');
@@ -35,7 +35,7 @@ SKIP: {
 
         ok($ops_per_sec >= 10_000, "pipeline at least 10000 ops/sec (got " . int($ops_per_sec) . ")");
 
-        cleanup_keys($r, 'throughput:*');
+        run { cleanup_keys($r, 'throughput:*') };
         $r->disconnect;
     };
 
@@ -43,14 +43,14 @@ SKIP: {
         my $r = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($r->connect);
+        run { $r->connect };
 
         # Set up keys first
         my $setup_pipe = $r->pipeline;
         for my $i (1..1000) {
             $setup_pipe->set("pget:$i", "value$i");
         }
-        await_f($setup_pipe->execute);
+        run { $setup_pipe->execute };
 
         # Now GET them all
         my $commands = 10_000;
@@ -60,7 +60,7 @@ SKIP: {
         for my $i (1..$commands) {
             $pipeline->get("pget:" . (($i % 1000) + 1));
         }
-        my $results = await_f($pipeline->execute);
+        my $results = run { $pipeline->execute };
         my $elapsed = time() - $start;
 
         is(scalar(@$results), $commands, 'all GETs returned');
@@ -70,7 +70,7 @@ SKIP: {
 
         ok($ops_per_sec >= 10_000, "pipeline GET at least 10000 ops/sec");
 
-        cleanup_keys($r, 'pget:*');
+        run { cleanup_keys($r, 'pget:*') };
         $r->disconnect;
     };
 
@@ -78,7 +78,7 @@ SKIP: {
         my $r = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($r->connect);
+        run { $r->connect };
 
         my $batches = 100;
         my $ops_per_batch = 100;
@@ -94,7 +94,7 @@ SKIP: {
                 $pipeline->get($key);
                 $pipeline->incr("mix:counter");
             }
-            await_f($pipeline->execute);
+            run { $pipeline->execute };
         }
 
         my $elapsed = time() - $start;
@@ -103,10 +103,10 @@ SKIP: {
         note("$total_ops mixed ops in ${elapsed}s = " . int($ops_per_sec) . " ops/sec");
         ok($ops_per_sec >= 5000, "mixed pipeline at least 5000 ops/sec");
 
-        my $counter = await_f($r->get("mix:counter"));
+        my $counter = run { $r->get("mix:counter") };
         is($counter, $batches * $ops_per_batch, "counter correct");
 
-        cleanup_keys($r, 'mix:*');
+        run { cleanup_keys($r, 'mix:*') };
         $r->disconnect;
     };
 

@@ -18,12 +18,9 @@
 
 use strict;
 use warnings;
+use Future;
 use Future::AsyncAwait;
-
-# Event loop setup
-use IO::Async::Loop;
 use Future::IO;
-Future::IO->load_impl('IOAsync');
 
 use File::Basename qw(dirname);
 use lib dirname(__FILE__) . '/lib';
@@ -43,9 +40,17 @@ my $redis_initialized = 0;
 # Ensure Redis is initialized (called on first request per worker)
 async sub ensure_redis {
     return if $redis_initialized;
-    await init_redis();
-    $redis_initialized = 1;
-    print STDERR "[worker $$] Redis initialized\n";
+
+    my $result = await init_redis()->catch(sub {
+        my ($err) = @_;
+        warn "[worker $$] Redis init failed: $err";
+        return Future->done(undef);  # Continue without Redis
+    });
+
+    if ($result) {
+        $redis_initialized = 1;
+        print STDERR "[worker $$] Redis initialized\n";
+    }
 }
 
 # Logging middleware

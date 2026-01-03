@@ -1,30 +1,21 @@
 # t/30-pipeline/errors.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
 use Future::IO::Redis;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
         my $r = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost', connect_timeout => 2);
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
 
     subtest 'command-level Redis error captured inline' => sub {
-        await_f($redis->set('errors:string', 'hello'));
+        run { $redis->set('errors:string', 'hello') };
 
         my $results = await_f(
             $redis->pipeline
@@ -43,12 +34,12 @@ SKIP: {
         is($results->[2], 'OK', 'third SET succeeded (pipeline continued)');
 
         # Cleanup
-        await_f($redis->del('errors:string', 'errors:a', 'errors:b'));
+        run { $redis->del('errors:string', 'errors:a', 'errors:b') };
     };
 
     subtest 'multiple errors in single pipeline' => sub {
-        await_f($redis->set('errors:s1', 'string1'));
-        await_f($redis->set('errors:s2', 'string2'));
+        run { $redis->set('errors:s1', 'string1') };
+        run { $redis->set('errors:s2', 'string2') };
 
         my $results = await_f(
             $redis->pipeline
@@ -66,11 +57,11 @@ SKIP: {
         is($results->[3], 'string2', 'slot 3 has value');
 
         # Cleanup
-        await_f($redis->del('errors:s1', 'errors:s2'));
+        run { $redis->del('errors:s1', 'errors:s2') };
     };
 
     subtest 'check each result for errors pattern' => sub {
-        await_f($redis->set('errors:check', 'value'));
+        run { $redis->set('errors:check', 'value') };
 
         my $results = await_f(
             $redis->pipeline
@@ -92,7 +83,7 @@ SKIP: {
         is($errors[0]{index}, 1, 'error at index 1');
 
         # Cleanup
-        await_f($redis->del('errors:check'));
+        run { $redis->del('errors:check') };
     };
 
     subtest 'NOSCRIPT error captured' => sub {
@@ -111,7 +102,7 @@ SKIP: {
         is($results->[2], '1', 'GET succeeded');
 
         # Cleanup
-        await_f($redis->del('errors:x'));
+        run { $redis->del('errors:x') };
     };
 }
 

@@ -1,22 +1,12 @@
 # t/30-pipeline/auto-pipeline.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
-use IO::Async::Timer::Periodic;
 use Future::IO::Redis;
 use Future;
 use Time::HiRes qw(time);
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
@@ -25,13 +15,13 @@ SKIP: {
             connect_timeout => 2,
             auto_pipeline => 1,
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
 
     # Cleanup
-    await_f($redis->del(map { "ap:$_" } 1..100));
+    run { $redis->del(map { "ap:$_" } 1..100) };
 
     subtest 'auto-pipeline batches concurrent commands' => sub {
         # Fire 100 commands "at once"
@@ -53,10 +43,10 @@ SKIP: {
 
     subtest 'auto-pipeline transparent API' => sub {
         # Same API as non-pipelined
-        my $result = await_f($redis->set('ap:single', 'value'));
+        my $result = run { $redis->set('ap:single', 'value') };
         is($result, 'OK', 'single command works');
 
-        my $value = await_f($redis->get('ap:single'));
+        my $value = run { $redis->get('ap:single') };
         is($value, 'value', 'GET works');
     };
 
@@ -67,12 +57,12 @@ SKIP: {
             host => $ENV{REDIS_HOST} // 'localhost',
             auto_pipeline => 0,  # disabled
         );
-        await_f($redis_no_ap->connect);
+        run { $redis_no_ap->connect };
 
         # Sequential (no auto-pipeline)
         my $start = time();
         for my $i (1..50) {
-            await_f($redis_no_ap->set("ap:seq:$i", $i));
+            run { $redis_no_ap->set("ap:seq:$i", $i) };
         }
         my $sequential_time = time() - $start;
 
@@ -95,7 +85,7 @@ SKIP: {
             auto_pipeline => 1,
             pipeline_depth => 50,
         );
-        await_f($redis_limited->connect);
+        run { $redis_limited->connect };
 
         # Fire more commands than depth limit
         # Should batch into multiple pipelines automatically
@@ -107,7 +97,7 @@ SKIP: {
         is(scalar @results, 100, 'all 100 completed despite depth limit');
 
         # Cleanup
-        await_f($redis->del(map { "ap:depth:$_" } 1..100));
+        run { $redis->del(map { "ap:depth:$_" } 1..100) };
     };
 
     subtest 'non-blocking verification' => sub {
@@ -116,7 +106,7 @@ SKIP: {
             interval => 0.01,
             on_tick => sub { push @ticks, 1 },
         );
-        $loop->add($timer);
+        get_loop()->add($timer);
         $timer->start;
 
         # Fire 500 commands
@@ -124,16 +114,16 @@ SKIP: {
         await_f(Future->needs_all(@futures));
 
         $timer->stop;
-        $loop->remove($timer);
+        get_loop()->remove($timer);
 
         pass("Event loop remained responsive during 500 concurrent commands");
 
         # Cleanup
-        await_f($redis->del(map { "ap:nb:$_" } 1..500));
+        run { $redis->del(map { "ap:nb:$_" } 1..500) };
     };
 
     subtest 'errors propagate to correct futures' => sub {
-        await_f($redis->set('ap:string', 'hello'));
+        run { $redis->set('ap:string', 'hello') };
 
         my $f1 = $redis->set('ap:ok1', 'value');
         my $f2 = $redis->lpush('ap:string', 'item');  # Will fail (WRONGTYPE)
@@ -151,11 +141,11 @@ SKIP: {
         is($r3, 'OK', 'third command succeeded');
 
         # Cleanup
-        await_f($redis->del('ap:string', 'ap:ok1', 'ap:ok2'));
+        run { $redis->del('ap:string', 'ap:ok1', 'ap:ok2') };
     };
 
     # Cleanup
-    await_f($redis->del(map { "ap:$_" } 1..100));
+    run { $redis->del(map { "ap:$_" } 1..100) };
 }
 
 done_testing;

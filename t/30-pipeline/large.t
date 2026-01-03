@@ -1,26 +1,16 @@
 # t/30-pipeline/large.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
-use IO::Async::Timer::Periodic;
 use Future::IO::Redis;
 use Time::HiRes qw(time);
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
         my $r = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost', connect_timeout => 2);
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
@@ -37,7 +27,7 @@ SKIP: {
         is($pipe->count, $count, "pipeline has $count commands queued");
 
         my $start = time();
-        my $results = await_f($pipe->execute);
+        my $results = run { $pipe->execute };
         my $elapsed = time() - $start;
 
         is(scalar @$results, $count, "got $count results");
@@ -55,7 +45,7 @@ SKIP: {
             $pipe->get("large:$i");
         }
 
-        my $results = await_f($pipe->execute);
+        my $results = run { $pipe->execute };
 
         is(scalar @$results, $count, "got $count results");
         is($results->[0], 'value1', 'first value correct');
@@ -68,17 +58,17 @@ SKIP: {
             interval => 0.01,
             on_tick => sub { push @ticks, 1 },
         );
-        $loop->add($timer);
+        get_loop()->add($timer);
         $timer->start;
 
         my $pipe = $redis->pipeline;
         for my $i (1..$count) {
             $pipe->incr("large:$i");
         }
-        await_f($pipe->execute);
+        run { $pipe->execute };
 
         $timer->stop;
-        $loop->remove($timer);
+        get_loop()->remove($timer);
 
         pass("Event loop remained responsive during large pipeline");
     };
@@ -89,7 +79,7 @@ SKIP: {
         for my $i (1..$count) {
             $pipe->del("large:$i");
         }
-        await_f($pipe->execute);
+        run { $pipe->execute };
         pass("cleaned up $count keys");
     };
 }

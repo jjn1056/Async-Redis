@@ -2,8 +2,8 @@
 use strict;
 use warnings;
 use Test2::V0;
-use lib 't/lib';
-use Test::Future::IO::Redis qw(init_loop skip_without_redis await_f cleanup_keys);
+use Test::Lib;
+use Test::Future::IO::Redis qw(init_loop skip_without_redis await_f cleanup_keys run);
 
 my $loop = init_loop();
 
@@ -14,7 +14,7 @@ SKIP: {
         my $r = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($r->connect);
+        run { $r->connect };
 
         # Use pipeline for many commands
         my $pipe = $r->pipeline;
@@ -23,7 +23,7 @@ SKIP: {
         }
 
         # Execute pipeline
-        my $results = await_f($pipe->execute);
+        my $results = run { $pipe->execute };
         is(scalar @$results, 100, 'all SET commands completed');
 
         # Verify all returned OK
@@ -32,11 +32,11 @@ SKIP: {
 
         # Verify values (sequential GETs)
         for my $i (1..10) {  # Just check first 10 for speed
-            my $val = await_f($r->get("queue:key:$i"));
+            my $val = run { $r->get("queue:key:$i") };
             is($val, "value:$i", "key $i has correct value");
         }
 
-        cleanup_keys($r, 'queue:*');
+        run { cleanup_keys($r, 'queue:*') };
         $r->disconnect;
     };
 
@@ -44,7 +44,7 @@ SKIP: {
         my $r = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($r->connect);
+        run { $r->connect };
 
         my $pipe = $r->pipeline;
 
@@ -54,14 +54,14 @@ SKIP: {
         }
 
         # Execute pipeline
-        my $results = await_f($pipe->execute);
+        my $results = run { $pipe->execute };
         is(scalar @$results, 50, 'got 50 results');
 
         # Verify all are OK
         my @oks = grep { $_ eq 'OK' } @$results;
         is(scalar @oks, 50, 'all 50 returned OK');
 
-        cleanup_keys($r, 'pipe:*');
+        run { cleanup_keys($r, 'pipe:*') };
         $r->disconnect;
     };
 
@@ -69,7 +69,7 @@ SKIP: {
         my $r = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($r->connect);
+        run { $r->connect };
 
         # Initially no inflight
         is($r->inflight_count, 0, 'no inflight initially');
@@ -86,7 +86,7 @@ SKIP: {
         # After completion, inflight should be 0
         is($r->inflight_count, 0, 'no inflight after completion');
 
-        cleanup_keys($r, 'inflight:*');
+        run { cleanup_keys($r, 'inflight:*') };
         $r->disconnect;
     };
 

@@ -1,21 +1,11 @@
 # t/90-pool/basic.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
-use Future::AsyncAwait;
 use Future::IO::Redis::Pool;
 use Time::HiRes qw(time);
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     # Verify Redis is available
@@ -25,7 +15,7 @@ SKIP: {
             host => $ENV{REDIS_HOST} // 'localhost',
             connect_timeout => 2,
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $test_redis;
@@ -50,12 +40,12 @@ SKIP: {
             max  => 3,
         );
 
-        my $conn = await_f($pool->acquire);
+        my $conn = run { $pool->acquire };
         ok($conn, 'acquired connection');
         ok($conn->isa('Future::IO::Redis'), 'connection is Redis object');
 
         # Use connection
-        my $result = await_f($conn->ping);
+        my $result = run { $conn->ping };
         is($result, 'PONG', 'connection works');
 
         # Release
@@ -73,11 +63,11 @@ SKIP: {
             max  => 3,
         );
 
-        my $conn1 = await_f($pool->acquire);
+        my $conn1 = run { $pool->acquire };
         my $id1 = "$conn1";  # stringified address
         $pool->release($conn1);
 
-        my $conn2 = await_f($pool->acquire);
+        my $conn2 = run { $pool->acquire };
         my $id2 = "$conn2";
 
         is($id1, $id2, 'got same connection from pool');
@@ -94,7 +84,7 @@ SKIP: {
 
         my @conns;
         for my $i (1..3) {
-            push @conns, await_f($pool->acquire);
+            push @conns, run { $pool->acquire };
         }
 
         is(scalar @conns, 3, 'acquired max connections');
@@ -119,13 +109,13 @@ SKIP: {
             acquire_timeout => 1,
         );
 
-        my $conn1 = await_f($pool->acquire);
+        my $conn1 = run { $pool->acquire };
 
         # Second acquire should timeout
         my $start = time();
         my $error;
         eval {
-            await_f($pool->acquire);
+            run { $pool->acquire };
         };
         $error = $@;
         my $elapsed = time() - $start;

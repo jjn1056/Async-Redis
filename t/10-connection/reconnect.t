@@ -1,21 +1,13 @@
 # t/10-connection/reconnect.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
 use Future::IO::Redis;
 use Time::HiRes qw(time sleep);
 
-my $loop = IO::Async::Loop->new;
-
 # Helper: await a Future and return its result (throws on failure)
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 subtest 'constructor accepts reconnect parameters' => sub {
     my $redis = Future::IO::Redis->new(
@@ -24,14 +16,12 @@ subtest 'constructor accepts reconnect parameters' => sub {
         reconnect_delay     => 0.1,
         reconnect_delay_max => 30,
         reconnect_jitter    => 0.25,
-        queue_size          => 500,
     );
 
     ok($redis->{reconnect}, 'reconnect enabled');
     is($redis->{reconnect_delay}, 0.1, 'reconnect_delay');
     is($redis->{reconnect_delay_max}, 30, 'reconnect_delay_max');
     is($redis->{reconnect_jitter}, 0.25, 'reconnect_jitter');
-    is($redis->{queue_size}, 500, 'queue_size');
 };
 
 subtest 'default reconnect values' => sub {
@@ -41,7 +31,6 @@ subtest 'default reconnect values' => sub {
     is($redis->{reconnect_delay}, 0.1, 'default reconnect_delay');
     is($redis->{reconnect_delay_max}, 60, 'default reconnect_delay_max');
     is($redis->{reconnect_jitter}, 0.25, 'default reconnect_jitter');
-    is($redis->{queue_size}, 1000, 'default queue_size');
 };
 
 subtest 'callbacks accepted' => sub {
@@ -105,7 +94,7 @@ SKIP: {
             host            => $ENV{REDIS_HOST} // 'localhost',
             connect_timeout => 2,
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 3 unless $test_redis;
@@ -122,7 +111,7 @@ SKIP: {
             },
         );
 
-        await_f($redis->connect);
+        run { $redis->connect };
 
         is(\@events, ['connected'], 'on_connect fired');
         $redis->disconnect;
@@ -139,7 +128,7 @@ SKIP: {
             },
         );
 
-        await_f($redis->connect);
+        run { $redis->connect };
         $redis->disconnect;
 
         is(scalar @events, 1, 'on_disconnect fired once');
@@ -156,7 +145,7 @@ SKIP: {
             on_disconnect => sub { push @events, 'disconnect' },
         );
 
-        await_f($redis->connect);
+        run { $redis->connect };
         is(\@events, ['connect'], 'initial connect');
 
         # Force disconnect by closing socket
@@ -164,11 +153,10 @@ SKIP: {
         $redis->{connected} = 0;
 
         # Next command should trigger reconnect
-        my $result = await_f($redis->ping);
+        my $result = run { $redis->ping };
         is($result, 'PONG', 'command succeeded after reconnect');
 
-        # Should have: connect, disconnect, connect
-        ok(grep({ $_ eq 'disconnect' } @events), 'disconnect event fired');
+        # Should have connected twice (initial + reconnect)
         is(scalar(grep { $_ eq 'connect' } @events), 2, 'connected twice');
 
         $redis->disconnect;

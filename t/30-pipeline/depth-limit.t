@@ -1,19 +1,10 @@
 # t/30-pipeline/depth-limit.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
 use Future::IO::Redis;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
@@ -22,7 +13,7 @@ SKIP: {
             connect_timeout => 2,
             pipeline_depth => 100,  # Low limit for testing
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
@@ -75,7 +66,7 @@ SKIP: {
         is($pipe->count, 1000, '1000 commands queued with custom limit');
 
         # Execute but don't care about results
-        await_f($pipe->execute);
+        run { $pipe->execute };
         pass('executed 1000 command pipeline');
     };
 }

@@ -268,6 +268,98 @@ ok($tick_count >= 5, 'event loop not blocked');
 
 ---
 
+## Implementation Observations (Socket Cleanup)
+
+### Missing on_cancel Handlers in Future::IO::Impl::IOAsync
+
+**Problem:** `Future::IO::Impl::IOAsync` does not set up `on_cancel` handlers for `ready_for_read` and `ready_for_write`. When a socket is closed while watchers are registered, the cleanup callbacks may access closed handles, causing "uninitialized value" warnings.
+
+**Root Cause:** The default implementation (`Future::IO::_DefaultImpl`) has proper `on_cancel` handlers:
+```perl
+# From Future::IO::_DefaultImpl
+sub ready_for_read {
+    ...
+    $f->on_cancel( sub {
+        my $f = shift;
+        my $idx = 0;
+        $idx++ while $idx < @readers and $readers[$idx]->f != $f;
+        splice @readers, $idx, 1, ();
+    });
+    return $f;
+}
+```
+
+But `Future::IO::Impl::IOAsync` lacks these:
+```perl
+# From Future::IO::Impl::IOAsync - NO on_cancel handler!
+sub ready_for_read {
+    ...
+    $loop->watch_io(
+        handle => $fh,
+        on_read_ready => sub {
+            $watching->[0]->done;
+            shift @$watching;
+            return if scalar @$watching;
+            $loop->unwatch_io(...);
+            delete $watching_read_by_fileno{ $fh->fileno };  # WARNING: fileno may be undef!
+        },
+    );
+    return $f;
+}
+```
+
+**Impact:** When a connection is closed:
+1. Close triggers EOF event that gets queued in poll/select
+2. Our unwatch removes fd from poll set for future events
+3. But already-queued event still fires callback
+4. Callback tries `$fh->fileno` on closed socket, gets undef
+5. Warnings from IO::Async::Loop, IO::Async::Loop::Poll, and Future::IO::Impl::IOAsync
+
+**Current Workaround:**
+```perl
+# In Future::IO::Redis, we:
+# 1. Access internal state to cancel futures and remove from watching hashes
+no strict 'refs';
+if (my $watching = delete ${'Future::IO::Impl::IOAsync::watching_read_by_fileno'}{$fileno}) {
+    $_->cancel for grep { $_ && !$_->is_ready } @$watching;
+}
+
+# 2. Call unwatch_io before closing
+$loop->unwatch_io(handle => $socket, on_read_ready => 1);
+
+# 3. Suppress warnings in test helper
+$SIG{__WARN__} = sub {
+    my $msg = shift;
+    return if $msg =~ /uninitialized value.*fileno/i;
+    warn $msg;
+};
+```
+
+**Desired Fix:** Add `on_cancel` handlers to `Future::IO::Impl::IOAsync`:
+```perl
+sub ready_for_read {
+    ...
+    my $f = $loop->new_future;
+
+    $f->on_cancel(sub {
+        my $idx = 0;
+        $idx++ while $idx < @$watching && $watching->[$idx] != $f;
+        splice @$watching, $idx, 1 if $idx < @$watching;
+
+        unless (@$watching) {
+            $loop->unwatch_io(handle => $fh, on_read_ready => 1);
+            delete $watching_read_by_fileno{ $fh->fileno };
+        }
+    });
+
+    ...
+}
+```
+
+**Additional Observation:** Even with proper on_cancel, there's a race condition: events can be queued in poll/select before unwatch is processed. The event loop should ideally check if the handle is still valid before invoking callbacks.
+
+---
+
 ## Notes
 
 These observations come from building Future::IO::Redis, specifically:

@@ -1,21 +1,12 @@
 # t/90-pool/with-pattern.t
 use strict;
 use warnings;
-use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Future::AsyncAwait;
+use Test2::V0;
 use Future::IO::Redis::Pool;
 use Future;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $test_redis = eval {
@@ -24,7 +15,7 @@ SKIP: {
             host => $ENV{REDIS_HOST} // 'localhost',
             connect_timeout => 2,
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $test_redis;

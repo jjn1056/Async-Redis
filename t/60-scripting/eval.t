@@ -1,43 +1,32 @@
 # t/60-scripting/eval.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use Future::AsyncAwait;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
-use IO::Async::Timer::Periodic;
 use Future::IO::Redis;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
         my $r = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost', connect_timeout => 2);
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
 
     # Cleanup
-    await_f($redis->del('eval:key', 'eval:counter', 'eval:a', 'eval:b'));
+    run { $redis->del('eval:key', 'eval:counter', 'eval:a', 'eval:b') };
 
     subtest 'simple EVAL' => sub {
-        my $result = await_f($redis->eval(
+        my $result = run { $redis->eval(
             'return "hello"',
             0,  # numkeys
-        ));
+        ) };
         is($result, 'hello', 'simple return value');
     };
 
     subtest 'EVAL with KEYS' => sub {
-        await_f($redis->set('eval:key', 'myvalue'));
+        run { $redis->set('eval:key', 'myvalue') };
 
         my $result = await_f($redis->eval(
             'return redis.call("GET", KEYS[1])',
@@ -56,13 +45,13 @@ SKIP: {
         ));
         is($result, 'newvalue', 'SET via script worked');
 
-        my $value = await_f($redis->get('eval:key'));
+        my $value = run { $redis->get('eval:key') };
         is($value, 'newvalue', 'value persisted');
     };
 
     subtest 'EVAL with multiple keys' => sub {
-        await_f($redis->set('eval:a', '1'));
-        await_f($redis->set('eval:b', '2'));
+        run { $redis->set('eval:a', '1') };
+        run { $redis->set('eval:b', '2') };
 
         my $result = await_f($redis->eval(
             'return redis.call("GET", KEYS[1]) + redis.call("GET", KEYS[2])',
@@ -72,29 +61,29 @@ SKIP: {
         is($result, 3, 'computed sum from two keys');
 
         # Cleanup
-        await_f($redis->del('eval:a', 'eval:b'));
+        run { $redis->del('eval:a', 'eval:b') };
     };
 
     subtest 'EVAL returning array' => sub {
-        my $result = await_f($redis->eval(
+        my $result = run { $redis->eval(
             'return {1, 2, 3, "four"}',
             0,
-        ));
+        ) };
         is($result, [1, 2, 3, 'four'], 'array returned');
     };
 
     subtest 'EVAL returning table as array' => sub {
-        my $result = await_f($redis->eval(
+        my $result = run { $redis->eval(
             'return {"a", "b", "c"}',
             0,
-        ));
+        ) };
         is($result, ['a', 'b', 'c'], 'table returned as array');
     };
 
     subtest 'EVAL with increment script' => sub {
-        await_f($redis->set('eval:counter', '10'));
+        run { $redis->set('eval:counter', '10') };
 
-        my $result = await_f($redis->eval(<<'LUA', 1, 'eval:counter', 5));
+        my $result = run { $redis->eval(<<'LUA', 1, 'eval:counter', 5) };
 local current = tonumber(redis.call('GET', KEYS[1])) or 0
 local increment = tonumber(ARGV[1]) or 1
 local new = current + increment
@@ -104,7 +93,7 @@ LUA
 
         is($result, 15, 'increment script worked');
 
-        my $value = await_f($redis->get('eval:counter'));
+        my $value = run { $redis->get('eval:counter') };
         is($value, '15', 'value updated');
     };
 
@@ -128,22 +117,22 @@ LUA
             interval => 0.005,
             on_tick => sub { push @ticks, 1 },
         );
-        $loop->add($timer);
+        get_loop()->add($timer);
         $timer->start;
 
         for my $i (1..50) {
-            await_f($redis->eval('return ARGV[1]', 0, $i));
+            run { $redis->eval('return ARGV[1]', 0, $i) };
         }
 
         $timer->stop;
-        $loop->remove($timer);
+        get_loop()->remove($timer);
 
         # Just verify the loop was able to process - timing-sensitive test
         pass("Event loop ticked during EVAL calls");
     };
 
     # Cleanup
-    await_f($redis->del('eval:key', 'eval:counter'));
+    run { $redis->del('eval:key', 'eval:counter') };
 }
 
 done_testing;

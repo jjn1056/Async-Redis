@@ -1,10 +1,9 @@
 # t/94-observability/metrics.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
 
 # Mock OpenTelemetry meter
 package MockCounter {
@@ -81,21 +80,13 @@ package main;
 
 use Future::IO::Redis;
 
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
-
 SKIP: {
     my $test_redis = eval {
         my $r = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
             connect_timeout => 2,
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $test_redis;
@@ -107,14 +98,14 @@ SKIP: {
             host       => $ENV{REDIS_HOST} // 'localhost',
             otel_meter => $meter,
         );
-        await_f($redis->connect);
+        run { $redis->connect };
 
         # Execute some commands
         for (1..5) {
-            await_f($redis->set("metrics:key:$_", "value$_"));
+            run { $redis->set("metrics:key:$_", "value$_") };
         }
         for (1..3) {
-            await_f($redis->get("metrics:key:$_"));
+            run { $redis->get("metrics:key:$_") };
         }
 
         $redis->disconnect;
@@ -131,7 +122,7 @@ SKIP: {
         is(scalar @get_calls, 3, '3 GET commands recorded');
 
         # Cleanup
-        await_f($test_redis->del(map { "metrics:key:$_" } 1..5));
+        run { $test_redis->del(map { "metrics:key:$_" } 1..5) };
     };
 
     subtest 'meter records command latency' => sub {
@@ -141,8 +132,8 @@ SKIP: {
             host       => $ENV{REDIS_HOST} // 'localhost',
             otel_meter => $meter,
         );
-        await_f($redis->connect);
-        await_f($redis->ping);
+        run { $redis->connect };
+        run { $redis->ping };
         $redis->disconnect;
 
         my $histogram = $meter->histogram('redis.commands.duration');
@@ -163,7 +154,7 @@ SKIP: {
             host       => $ENV{REDIS_HOST} // 'localhost',
             otel_meter => $meter,
         );
-        await_f($redis->connect);
+        run { $redis->connect };
 
         my $connections = $meter->counter('redis.connections.active');
         ok($connections, 'connections counter created');
@@ -181,11 +172,11 @@ SKIP: {
             host       => $ENV{REDIS_HOST} // 'localhost',
             otel_meter => $meter,
         );
-        await_f($redis->connect);
+        run { $redis->connect };
 
         # Cause an error
-        await_f($redis->set('metrics:error', 'string'));
-        eval { await_f($redis->incr('metrics:error')) };
+        run { $redis->set('metrics:error', 'string') };
+        eval { run { $redis->incr('metrics:error') } };
 
         $redis->disconnect;
 
@@ -193,7 +184,7 @@ SKIP: {
         ok($errors, 'errors counter created');
         ok($errors->value >= 1, 'error recorded');
 
-        await_f($test_redis->del('metrics:error'));
+        run { $test_redis->del('metrics:error') };
     };
 
     subtest 'meter records pipeline size' => sub {
@@ -203,13 +194,13 @@ SKIP: {
             host       => $ENV{REDIS_HOST} // 'localhost',
             otel_meter => $meter,
         );
-        await_f($redis->connect);
+        run { $redis->connect };
 
         my $pipe = $redis->pipeline;
         $pipe->set('metrics:pipe:1', '1');
         $pipe->set('metrics:pipe:2', '2');
         $pipe->set('metrics:pipe:3', '3');
-        await_f($pipe->execute);
+        run { $pipe->execute };
 
         $redis->disconnect;
 
@@ -220,7 +211,7 @@ SKIP: {
         ok(@values >= 1, 'pipeline size recorded');
         is($values[0]{value}, 3, 'pipeline size is 3');
 
-        await_f($test_redis->del('metrics:pipe:1', 'metrics:pipe:2', 'metrics:pipe:3'));
+        run { $test_redis->del('metrics:pipe:1', 'metrics:pipe:2', 'metrics:pipe:3') };
     };
 
     subtest 'latency has command label' => sub {
@@ -230,9 +221,9 @@ SKIP: {
             host       => $ENV{REDIS_HOST} // 'localhost',
             otel_meter => $meter,
         );
-        await_f($redis->connect);
-        await_f($redis->ping);
-        await_f($redis->set('metrics:label', 'test'));
+        run { $redis->connect };
+        run { $redis->ping };
+        run { $redis->set('metrics:label', 'test') };
         $redis->disconnect;
 
         my $histogram = $meter->histogram('redis.commands.duration');
@@ -248,7 +239,7 @@ SKIP: {
         } @values;
         ok(@set_latencies >= 1, 'SET latency has command label');
 
-        await_f($test_redis->del('metrics:label'));
+        run { $test_redis->del('metrics:label') };
     };
 
     $test_redis->disconnect;

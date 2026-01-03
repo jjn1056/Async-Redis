@@ -1,40 +1,30 @@
 # t/80-scan/hscan.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use Future::AsyncAwait;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
 use Future::IO::Redis;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
         my $r = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost', connect_timeout => 2);
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
 
     # Setup test hash
-    await_f($redis->del('hscan:hash'));
+    run { $redis->del('hscan:hash') };
     for my $i (1..50) {
-        await_f($redis->hset('hscan:hash', "field:$i", "value$i"));
+        run { $redis->hset('hscan:hash', "field:$i", "value$i") };
     }
 
     subtest 'hscan_iter iterates all fields' => sub {
         my $iter = $redis->hscan_iter('hscan:hash');
 
         my @all_pairs;
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @all_pairs, @$batch;
         }
 
@@ -51,7 +41,7 @@ SKIP: {
         my $iter = $redis->hscan_iter('hscan:hash', match => 'field:1*');
 
         my @all_pairs;
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @all_pairs, @$batch;
         }
 
@@ -66,7 +56,7 @@ SKIP: {
         my $iter = $redis->hscan_iter('hscan:hash', count => 10);
 
         my @batches;
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @batches, $batch;
         }
 
@@ -77,7 +67,7 @@ SKIP: {
     };
 
     # Cleanup
-    await_f($redis->del('hscan:hash'));
+    run { $redis->del('hscan:hash') };
 }
 
 done_testing;

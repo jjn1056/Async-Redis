@@ -1,21 +1,11 @@
 # t/50-pubsub/unsubscribe.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
-use Future::AsyncAwait;
 use Future::IO::Redis;
 use Future;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
@@ -23,7 +13,7 @@ SKIP: {
             host => $ENV{REDIS_HOST} // 'localhost',
             connect_timeout => 2,
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
@@ -32,10 +22,10 @@ SKIP: {
         my $subscriber = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($subscriber->connect);
+        run { $subscriber->connect };
 
-        my $sub = await_f($subscriber->subscribe('chan:a', 'chan:b'));
-        await_f($subscriber->psubscribe('pattern:*'));
+        my $sub = run { $subscriber->subscribe('chan:a', 'chan:b') };
+        run { $subscriber->psubscribe('pattern:*') };
 
         my @replay = $sub->get_replay_commands;
 
@@ -56,12 +46,12 @@ SKIP: {
         my $subscriber = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($subscriber->connect);
+        run { $subscriber->connect };
 
-        my $sub = await_f($subscriber->subscribe('regular:chan'));
+        my $sub = run { $subscriber->subscribe('regular:chan') };
         is($sub->channel_count, 1, 'one channel');
 
-        await_f($subscriber->psubscribe('pat:*'));
+        run { $subscriber->psubscribe('pat:*') };
         is($sub->channel_count, 2, 'two after pattern added');
 
         $subscriber->disconnect;

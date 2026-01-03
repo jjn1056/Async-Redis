@@ -2,7 +2,8 @@ package Test::Future::IO::Redis;
 
 use strict;
 use warnings;
-use Exporter 'import';
+use parent 'Exporter';
+use Future::AsyncAwait;
 use Test2::V0;
 use IO::Async::Loop;
 use IO::Async::Timer::Periodic;
@@ -11,27 +12,71 @@ use Future::IO;
 use Future::IO::Redis;
 
 # For testing, we use IO::Async as our concrete event loop.
-# Production code can use any Future::IO-compatible loop (UV, Glib, etc.)
 Future::IO->load_impl('IOAsync');
+
+# Suppress known harmless warnings from IO::Async/Future::IO cleanup
+# These occur because Future::IO::Impl::IOAsync doesn't set up on_cancel
+# handlers for ready_for_read/ready_for_write, so when sockets are closed
+# during disconnect, the cleanup callbacks may access closed handles.
+# See: https://metacpan.org/pod/Future::IO::Impl::IOAsync
+$SIG{__WARN__} = sub {
+    my $msg = shift;
+    # Suppress IO::Async cleanup warnings about closed socket fileno
+    return if $msg =~ /uninitialized value.*fileno/i;
+    return if $msg =~ /uninitialized value in (?:hash element|delete)/;
+    warn $msg;
+};
 
 our @EXPORT_OK = qw(
     init_loop
     get_loop
+    run
     await_f
     skip_without_redis
     cleanup_keys
-    cleanup_keys_async
     with_timeout
     fails_with
     delay
-    run_command_async
-    run_docker_async
+    run_command
+    run_docker
     measure_ticks
     redis_host
     redis_port
 );
 
+our %EXPORT_TAGS = (
+    # Import with :redis to auto-skip if Redis unavailable
+    # Usage: use Test::Future::IO::Redis ':redis';
+    redis => [qw(init_loop get_loop run await_f skip_without_redis cleanup_keys delay redis_host redis_port)],
+);
+
+sub import {
+    my $class = shift;
+    my @args = @_;
+
+    my $auto_skip = 0;
+    @args = grep {
+        if ($_ eq ':redis') { $auto_skip = 1; 0 }
+        else { 1 }
+    } @args;
+
+    # If :redis tag, add the standard exports
+    if ($auto_skip) {
+        push @args, @{$EXPORT_TAGS{redis}};
+    }
+
+    # Do the normal Exporter import
+    $class->export_to_level(1, $class, @args);
+
+    # Auto-skip if :redis was requested (after exports are done)
+    if ($auto_skip) {
+        init_loop();
+        _check_redis();
+    }
+}
+
 our $loop;
+our $test_redis;  # Shared Redis connection from skip_without_redis
 
 # Get Redis connection details from environment
 sub redis_host { $ENV{REDIS_HOST} // 'localhost' }
@@ -49,77 +94,102 @@ sub get_loop {
     return $loop;
 }
 
-# Await a future and return its result
+# Run an async block and return result - the main test helper
+# Usage: my $result = run { $redis->get('key') };  # returns Future
+sub run (&) {
+    my ($code) = @_;
+    my $result = $code->();
+
+    # If it's a Future, await it
+    if (ref($result) && $result->isa('Future')) {
+        get_loop()->await($result);
+        return $result->get;
+    }
+
+    # Otherwise return as-is
+    return $result;
+}
+
+# Await a future directly - backward compatible alias
+# Usage: my $result = await_f($redis->get('key'));
 sub await_f {
     my ($f) = @_;
     get_loop()->await($f);
     return $f->get;
 }
 
-# Skip if no Redis available
-sub skip_without_redis {
+# Check Redis at import time (called from import)
+sub _check_redis {
     my $redis = eval {
         my $r = Future::IO::Redis->new(
             host => redis_host(),
             port => redis_port(),
             connect_timeout => 2,
         );
-        get_loop()->await($r->connect);
+        run { $r->connect };
         $r;
     };
-    return $redis if $redis;
+    if ($redis) {
+        $test_redis = $redis;
+        return;
+    }
     skip_all("Redis not available at " . redis_host() . ":" . redis_port() . ": $@");
 }
 
-# Clean up test keys - blocking version (use in cleanup only)
-sub cleanup_keys {
-    my ($redis, $pattern) = @_;
-    eval {
-        get_loop()->await(_cleanup_keys_impl($redis, $pattern));
+# Skip if no Redis available - returns connected Redis object
+sub skip_without_redis {
+    return $test_redis if $test_redis;
+
+    my $redis = eval {
+        my $r = Future::IO::Redis->new(
+            host => redis_host(),
+            port => redis_port(),
+            connect_timeout => 2,
+        );
+        run { $r->connect };
+        $r;
     };
+    if ($redis) {
+        $test_redis = $redis;
+        return $redis;
+    }
+    skip_all("Redis not available at " . redis_host() . ":" . redis_port() . ": $@");
 }
 
-# Clean up test keys - async version (preferred)
-sub cleanup_keys_async {
+# Clean up test keys
+async sub cleanup_keys {
     my ($redis, $pattern) = @_;
-    return _cleanup_keys_impl($redis, $pattern);
-}
-
-sub _cleanup_keys_impl {
-    my ($redis, $pattern) = @_;
-    return $redis->keys($pattern)->then(sub {
-        my ($keys) = @_;
-        return Future->done unless @$keys;
-        return $redis->del(@$keys);
-    });
+    my $keys = await $redis->keys($pattern);
+    return unless @$keys;
+    await $redis->del(@$keys);
 }
 
 # Test with timeout wrapper
-sub with_timeout {
+async sub with_timeout {
     my ($timeout, $future) = @_;
     my $timeout_f = Future::IO->sleep($timeout)->then(sub {
         Future->fail("Test timeout after ${timeout}s");
     });
-    return Future->wait_any($future, $timeout_f);
+    return await Future->wait_any($future, $timeout_f);
 }
 
-# Assert Future fails with specific error type (blocking)
+# Assert Future fails with specific error type
 sub fails_with {
     my ($future, $error_class, $message) = @_;
     my $error;
-    eval { get_loop()->await($future); 1 } or $error = $@;
+    eval { run { $future } } or $error = $@;
     ok($error && ref($error) && $error->isa($error_class), $message)
         or diag("Expected $error_class, got: " . (ref($error) || $error // 'undef'));
 }
 
-# Async delay - use instead of sleep()!
-sub delay {
+# Async delay
+async sub delay {
     my ($seconds) = @_;
-    return Future::IO->sleep($seconds);
+    await Future::IO->sleep($seconds);
 }
 
 # Run external command asynchronously
-sub run_command_async {
+async sub run_command {
     my (@cmd) = @_;
     my $future = get_loop()->new_future;
     my $stdout = '';
@@ -140,18 +210,17 @@ sub run_command_async {
     );
 
     get_loop()->add($process);
-    return $future;
+    return await $future;
 }
 
 # Docker-specific helper
-sub run_docker_async {
+async sub run_docker {
     my (@args) = @_;
-    return run_command_async('docker', @args);
+    return await run_command('docker', @args);
 }
 
 # Measure event loop ticks during an operation
-# Returns ($result, $tick_count)
-sub measure_ticks {
+async sub measure_ticks {
     my ($future, $interval) = @_;
     $interval //= 0.01;  # 10ms default
 
@@ -163,19 +232,18 @@ sub measure_ticks {
     get_loop()->add($timer);
     $timer->start;
 
-    my $result_f = $future->then(sub {
-        my (@result) = @_;
-        $timer->stop;
-        get_loop()->remove($timer);
-        return Future->done(\@result, scalar(@ticks));
-    })->catch(sub {
-        my ($error) = @_;
-        $timer->stop;
-        get_loop()->remove($timer);
-        return Future->fail($error);
-    });
+    my @result;
+    my $error;
+    eval {
+        @result = await $future;
+        1;
+    } or $error = $@;
 
-    return $result_f;
+    $timer->stop;
+    get_loop()->remove($timer);
+
+    die $error if $error;
+    return (\@result, scalar(@ticks));
 }
 
 1;
@@ -188,39 +256,38 @@ Test::Future::IO::Redis - Test utilities for Future::IO::Redis
 
 =head1 SYNOPSIS
 
-    use lib 't/lib';
-    use Test::Future::IO::Redis qw(
-        init_loop skip_without_redis await_f delay cleanup_keys
-    );
+    use Test::Lib;
+    use Test::Future::IO::Redis ':redis';
+    use Future::AsyncAwait;
 
-    my $loop = init_loop();
+    # Tests auto-skip if Redis unavailable
+    # Use run {} to execute async code in tests:
+
+    my $result = run {
+        my $redis = Future::IO::Redis->new;
+        await $redis->connect;
+        await $redis->set('key', 'value');
+        await $redis->get('key');
+    };
+    is($result, 'value', 'got value');
+
+    # Or get Redis from skip_without_redis:
     my $redis = skip_without_redis();
-
-    # Use await_f for simple awaits
-    my $result = await_f($redis->get('key'));
-
-    # Cleanup
-    cleanup_keys($redis, 'test:*');
+    my $pong = run { await $redis->ping };
+    is($pong, 'PONG', 'ping works');
 
 =head1 DESCRIPTION
 
-Test utilities for Future::IO::Redis that maintain async discipline.
+Test utilities for Future::IO::Redis using async/await.
 
 =head1 FUNCTIONS
 
 =over 4
 
-=item init_loop()
+=item run { async code }
 
-Initialize and return the IO::Async::Loop.
-
-=item get_loop()
-
-Get the current loop (initializes if needed).
-
-=item await_f($future)
-
-Await a future and return its result.
+Execute an async block and return its result. This is the main
+test helper - wrap any async operations in run { }.
 
 =item skip_without_redis()
 
@@ -229,7 +296,7 @@ Future::IO::Redis object if successful.
 
 =item cleanup_keys($redis, $pattern)
 
-Delete all keys matching pattern.
+Async function to delete all keys matching pattern.
 
 =item with_timeout($seconds, $future)
 
@@ -241,15 +308,15 @@ Assert that a future fails with the specified error class.
 
 =item delay($seconds)
 
-Return a future that resolves after the specified delay.
+Async function that delays for the specified time.
 
-=item run_command_async(@cmd)
+=item run_command(@cmd)
 
-Run an external command asynchronously.
+Async function to run an external command.
 
-=item run_docker_async(@args)
+=item run_docker(@args)
 
-Run a docker command asynchronously.
+Async function to run a docker command.
 
 =item measure_ticks($future, $interval)
 

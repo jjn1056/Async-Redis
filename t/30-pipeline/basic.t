@@ -1,32 +1,22 @@
 # t/30-pipeline/basic.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
-use IO::Async::Timer::Periodic;
 use Future::IO::Redis;
 use Time::HiRes qw(time);
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
         my $r = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost', connect_timeout => 2);
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
 
     # Cleanup
-    await_f($redis->del('pipe:key1', 'pipe:key2', 'pipe:counter'));
+    run { $redis->del('pipe:key1', 'pipe:key2', 'pipe:counter') };
 
     subtest 'basic pipeline execution' => sub {
         my $pipe = $redis->pipeline;
@@ -37,7 +27,7 @@ SKIP: {
         $pipe->get('pipe:key1');
         $pipe->incr('pipe:counter');
 
-        my $results = await_f($pipe->execute);
+        my $results = run { $pipe->execute };
 
         is(ref $results, 'ARRAY', 'results is array');
         is(scalar @$results, 4, 'four results');
@@ -49,12 +39,12 @@ SKIP: {
 
     subtest 'pipeline is faster than individual commands' => sub {
         # Warm up
-        await_f($redis->set('pipe:warmup', 'value'));
+        run { $redis->set('pipe:warmup', 'value') };
 
         # Individual commands
         my $start = time();
         for my $i (1..100) {
-            await_f($redis->set("pipe:ind:$i", $i));
+            run { $redis->set("pipe:ind:$i", $i) };
         }
         my $individual_time = time() - $start;
 
@@ -64,7 +54,7 @@ SKIP: {
         for my $i (1..100) {
             $pipe->set("pipe:batch:$i", $i);
         }
-        await_f($pipe->execute);
+        run { $pipe->execute };
         my $pipeline_time = time() - $start;
 
         ok($pipeline_time < $individual_time,
@@ -76,7 +66,7 @@ SKIP: {
 
     subtest 'empty pipeline returns empty array' => sub {
         my $pipe = $redis->pipeline;
-        my $results = await_f($pipe->execute);
+        my $results = run { $pipe->execute };
 
         is($results, [], 'empty pipeline returns []');
     };
@@ -85,11 +75,11 @@ SKIP: {
         my $pipe = $redis->pipeline;
         $pipe->ping;
 
-        my $results = await_f($pipe->execute);
+        my $results = run { $pipe->execute };
         is($results->[0], 'PONG', 'first execute works');
 
         # Second execute should fail or return empty
-        my $results2 = eval { await_f($pipe->execute) };
+        my $results2 = eval { run { $pipe->execute } };
         ok(!$results2 || @$results2 == 0 || $@,
             'second execute fails or returns empty');
     };
@@ -100,26 +90,26 @@ SKIP: {
             interval => 0.01,
             on_tick => sub { push @ticks, 1 },
         );
-        $loop->add($timer);
+        get_loop()->add($timer);
         $timer->start;
 
         my $pipe = $redis->pipeline;
         for my $i (1..200) {
             $pipe->set("pipe:nb:$i", $i);
         }
-        await_f($pipe->execute);
+        run { $pipe->execute };
 
         $timer->stop;
-        $loop->remove($timer);
+        get_loop()->remove($timer);
 
         pass("Event loop remained responsive during pipeline execution");
 
         # Cleanup
-        await_f($redis->del(map { "pipe:nb:$_" } 1..200));
+        run { $redis->del(map { "pipe:nb:$_" } 1..200) };
     };
 
     # Cleanup
-    await_f($redis->del('pipe:key1', 'pipe:key2', 'pipe:counter'));
+    run { $redis->del('pipe:key1', 'pipe:key2', 'pipe:counter') };
 }
 
 done_testing;

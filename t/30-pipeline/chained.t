@@ -1,24 +1,15 @@
 # t/30-pipeline/chained.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
 use Future::IO::Redis;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
         my $r = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost', connect_timeout => 2);
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
@@ -36,11 +27,11 @@ SKIP: {
         is($results, ['OK', 'OK', '1', '2'], 'chained pipeline works');
 
         # Cleanup
-        await_f($redis->del('chain:a', 'chain:b'));
+        run { $redis->del('chain:a', 'chain:b') };
     };
 
     subtest 'chained with mixed commands' => sub {
-        await_f($redis->del('chain:list', 'chain:hash'));
+        run { $redis->del('chain:list', 'chain:hash') };
 
         my $results = await_f(
             $redis->pipeline
@@ -57,7 +48,7 @@ SKIP: {
         is($results->[3], 'value', 'HGET returned value');
 
         # Cleanup
-        await_f($redis->del('chain:list', 'chain:hash'));
+        run { $redis->del('chain:list', 'chain:hash') };
     };
 
     subtest 'chained returns pipeline for method chaining' => sub {
@@ -69,8 +60,8 @@ SKIP: {
         $ret = $pipe->get('chain:x');
         is($ret, $pipe, 'get returns pipeline');
 
-        await_f($pipe->execute);
-        await_f($redis->del('chain:x'));
+        run { $pipe->execute };
+        run { $redis->del('chain:x') };
     };
 }
 

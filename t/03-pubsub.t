@@ -2,27 +2,19 @@
 
 use strict;
 use warnings;
-use Test2::V0;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Future::AsyncAwait;
+use Test2::V0;
 use Time::HiRes qw(time);
 
 use lib 'lib';
 use Future::IO::Redis;
 
 # Skip if no Redis available
-my $redis_host = $ENV{REDIS_HOST} // 'localhost';
-my $redis_port = $ENV{REDIS_PORT} // 6379;
-
-plan skip_all => 'Set REDIS_HOST to run tests'
-    unless $ENV{REDIS_HOST} || `docker ps 2>/dev/null` =~ /redis/;
 
 # Load Future::IO implementation
 eval { require Future::IO::Impl::IOAsync };
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
-
-my $loop = IO::Async::Loop->new;
 
 # ============================================================================
 # Test: Pub/Sub basic flow
@@ -30,15 +22,15 @@ my $loop = IO::Async::Loop->new;
 
 subtest 'publish and subscribe' => sub {
     # Publisher connection
-    my $pub = Future::IO::Redis->new(host => $redis_host, port => $redis_port);
-    $loop->await($pub->connect);
+    my $pub = Future::IO::Redis->new(host => redis_host(), port => redis_port());
+    get_loop()->await($pub->connect);
 
     # Subscriber connection
-    my $sub = Future::IO::Redis->new(host => $redis_host, port => $redis_port);
-    $loop->await($sub->connect);
+    my $sub = Future::IO::Redis->new(host => redis_host(), port => redis_port());
+    get_loop()->await($sub->connect);
 
     my @received;
-    my $done = $loop->new_future;
+    my $done = get_loop()->new_future;
 
     # Start subscriber in background
     my $sub_future = (async sub {
@@ -54,18 +46,18 @@ subtest 'publish and subscribe' => sub {
     })->();
 
     # Give subscriber time to subscribe
-    $loop->await(Future::IO->sleep(0.1));
+    get_loop()->await(Future::IO->sleep(0.1));
 
     # Publish messages
     my $listeners;
-    $listeners = $loop->await($pub->publish('test:channel', 'message 1'));
+    $listeners = get_loop()->await($pub->publish('test:channel', 'message 1'));
     ok $listeners >= 1, "publish returned $listeners listeners";
 
-    $loop->await($pub->publish('test:channel', 'message 2'));
-    $loop->await($pub->publish('test:channel', 'message 3'));
+    get_loop()->await($pub->publish('test:channel', 'message 2'));
+    get_loop()->await($pub->publish('test:channel', 'message 3'));
 
     # Wait for subscriber to receive all
-    $loop->await($done);
+    get_loop()->await($done);
 
     is scalar(@received), 3, 'received 3 messages';
     is $received[0]{channel}, 'test:channel', 'correct channel';
@@ -82,13 +74,13 @@ subtest 'publish and subscribe' => sub {
 # ============================================================================
 
 subtest 'multiple channel subscription' => sub {
-    my $pub = Future::IO::Redis->new(host => $redis_host, port => $redis_port);
-    my $sub = Future::IO::Redis->new(host => $redis_host, port => $redis_port);
+    my $pub = Future::IO::Redis->new(host => redis_host(), port => redis_port());
+    my $sub = Future::IO::Redis->new(host => redis_host(), port => redis_port());
 
-    $loop->await(Future->needs_all($pub->connect, $sub->connect));
+    get_loop()->await(Future->needs_all($pub->connect, $sub->connect));
 
     my @received;
-    my $done = $loop->new_future;
+    my $done = get_loop()->new_future;
 
     # Subscribe to multiple channels
     my $sub_future = (async sub {
@@ -101,14 +93,14 @@ subtest 'multiple channel subscription' => sub {
         $done->done;
     })->();
 
-    $loop->await(Future::IO->sleep(0.1));
+    get_loop()->await(Future::IO->sleep(0.1));
 
     # Publish to different channels
-    $loop->await($pub->publish('chan:a', 'msg-a'));
-    $loop->await($pub->publish('chan:b', 'msg-b'));
-    $loop->await($pub->publish('chan:c', 'msg-c'));
+    get_loop()->await($pub->publish('chan:a', 'msg-a'));
+    get_loop()->await($pub->publish('chan:b', 'msg-b'));
+    get_loop()->await($pub->publish('chan:c', 'msg-c'));
 
-    $loop->await($done);
+    get_loop()->await($done);
 
     is scalar(@received), 3, 'received from all channels';
 
@@ -126,11 +118,11 @@ subtest 'multiple channel subscription' => sub {
 # ============================================================================
 
 subtest 'pubsub nonblocking' => sub {
-    my $pub = Future::IO::Redis->new(host => $redis_host, port => $redis_port);
-    my $sub = Future::IO::Redis->new(host => $redis_host, port => $redis_port);
-    my $worker = Future::IO::Redis->new(host => $redis_host, port => $redis_port);
+    my $pub = Future::IO::Redis->new(host => redis_host(), port => redis_port());
+    my $sub = Future::IO::Redis->new(host => redis_host(), port => redis_port());
+    my $worker = Future::IO::Redis->new(host => redis_host(), port => redis_port());
 
-    $loop->await(Future->needs_all($pub->connect, $sub->connect, $worker->connect));
+    get_loop()->await(Future->needs_all($pub->connect, $sub->connect, $worker->connect));
 
     my @pubsub_msgs;
     my @worker_results;
@@ -147,7 +139,7 @@ subtest 'pubsub nonblocking' => sub {
         }
     })->();
 
-    $loop->await(Future::IO->sleep(0.1));
+    get_loop()->await(Future::IO->sleep(0.1));
 
     # Worker doing regular Redis operations AND publishing results
     my $worker_future = (async sub {
@@ -164,14 +156,14 @@ subtest 'pubsub nonblocking' => sub {
     })->();
 
     # Wait for both
-    $loop->await(Future->needs_all($sub_future, $worker_future));
+    get_loop()->await(Future->needs_all($sub_future, $worker_future));
 
     is scalar(@pubsub_msgs), 5, 'received 5 pubsub messages';
     is scalar(@worker_results), 5, 'worker completed 5 items';
 
     # Cleanup
-    $loop->await($worker->del(map { "work:item:$_" } 1..5));
-    $loop->await($worker->del('work:counter'));
+    get_loop()->await($worker->del(map { "work:item:$_" } 1..5));
+    get_loop()->await($worker->del('work:counter'));
 
     $pub->disconnect;
     $sub->disconnect;

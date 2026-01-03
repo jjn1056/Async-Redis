@@ -1,19 +1,10 @@
 # t/94-observability/debug.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
 use Future::IO::Redis;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $test_redis = eval {
@@ -21,7 +12,7 @@ SKIP: {
             host => $ENV{REDIS_HOST} // 'localhost',
             connect_timeout => 2,
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $test_redis;
@@ -34,8 +25,8 @@ SKIP: {
             host  => $ENV{REDIS_HOST} // 'localhost',
             debug => 1,
         );
-        await_f($redis->connect);
-        await_f($redis->ping);
+        run { $redis->connect };
+        run { $redis->ping };
         $redis->disconnect;
 
         ok(@warnings > 0, 'warnings captured');
@@ -53,9 +44,9 @@ SKIP: {
                 push @logs, { direction => $direction, data => $data };
             },
         );
-        await_f($redis->connect);
-        await_f($redis->set('debug:key', 'value'));
-        await_f($redis->get('debug:key'));
+        run { $redis->connect };
+        run { $redis->set('debug:key', 'value') };
+        run { $redis->get('debug:key') };
         $redis->disconnect;
 
         ok(@logs > 0, 'custom logger called');
@@ -70,7 +61,7 @@ SKIP: {
         ok((grep { $_->{data} =~ /GET debug:key/ } @sends), 'GET logged');
 
         # Cleanup
-        await_f($test_redis->del('debug:key'));
+        run { $test_redis->del('debug:key') };
     };
 
     subtest 'debug logs redact AUTH' => sub {
@@ -102,8 +93,8 @@ SKIP: {
         my $redis = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
-        await_f($redis->connect);
-        await_f($redis->ping);
+        run { $redis->connect };
+        run { $redis->ping };
         $redis->disconnect;
 
         my @redis_warnings = grep { /REDIS/ } @warnings;
@@ -117,9 +108,9 @@ SKIP: {
             host  => $ENV{REDIS_HOST} // 'localhost',
             debug => sub { push @logs, $_[1] },
         );
-        await_f($redis->connect);
-        await_f($redis->set('debug:secret', 'supersecretvalue'));
-        my $value = await_f($redis->get('debug:secret'));
+        run { $redis->connect };
+        run { $redis->set('debug:secret', 'supersecretvalue') };
+        my $value = run { $redis->get('debug:secret') };
         $redis->disconnect;
 
         # Actual value was returned
@@ -132,7 +123,7 @@ SKIP: {
         }
 
         # Cleanup
-        await_f($test_redis->del('debug:secret'));
+        run { $test_redis->del('debug:secret') };
     };
 
     $test_redis->disconnect;

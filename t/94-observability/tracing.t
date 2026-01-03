@@ -1,10 +1,9 @@
 # t/94-observability/tracing.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
 
 # Mock OpenTelemetry tracer
 package MockSpan {
@@ -57,21 +56,13 @@ package main;
 
 use Future::IO::Redis;
 
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
-
 SKIP: {
     my $test_redis = eval {
         my $r = Future::IO::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
             connect_timeout => 2,
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $test_redis;
@@ -83,9 +74,9 @@ SKIP: {
             host        => $ENV{REDIS_HOST} // 'localhost',
             otel_tracer => $tracer,
         );
-        await_f($redis->connect);
-        await_f($redis->set('trace:key', 'value'));
-        await_f($redis->get('trace:key'));
+        run { $redis->connect };
+        run { $redis->set('trace:key', 'value') };
+        run { $redis->get('trace:key') };
         $redis->disconnect;
 
         my @spans = $tracer->spans;
@@ -106,7 +97,7 @@ SKIP: {
         like($get_span->{attributes}{'db.statement'}, qr/GET trace:key/, 'GET statement');
 
         # Cleanup
-        await_f($test_redis->del('trace:key'));
+        run { $test_redis->del('trace:key') };
     };
 
     subtest 'span records error on command failure' => sub {
@@ -116,12 +107,12 @@ SKIP: {
             host        => $ENV{REDIS_HOST} // 'localhost',
             otel_tracer => $tracer,
         );
-        await_f($redis->connect);
+        run { $redis->connect };
 
         # Cause an error - INCR on string
-        await_f($redis->set('trace:error', 'notanumber'));
+        run { $redis->set('trace:error', 'notanumber') };
         eval {
-            await_f($redis->incr('trace:error'));
+            run { $redis->incr('trace:error') };
         };
 
         my @spans = $tracer->spans;
@@ -131,7 +122,7 @@ SKIP: {
         ok($incr_span->{exception}, 'exception recorded');
 
         $redis->disconnect;
-        await_f($test_redis->del('trace:error'));
+        run { $test_redis->del('trace:error') };
     };
 
     subtest 'AUTH password redacted in span' => sub {
@@ -151,8 +142,8 @@ SKIP: {
             otel_tracer => $tracer,
             database    => 2,
         );
-        await_f($redis->connect);
-        await_f($redis->ping);
+        run { $redis->connect };
+        run { $redis->ping };
         $redis->disconnect;
 
         my @spans = $tracer->spans;
@@ -169,15 +160,15 @@ SKIP: {
             otel_tracer       => $tracer,
             otel_include_args => 0,
         );
-        await_f($redis->connect);
-        await_f($redis->set('trace:noargs', 'secretvalue'));
+        run { $redis->connect };
+        run { $redis->set('trace:noargs', 'secretvalue') };
         $redis->disconnect;
 
         my @spans = $tracer->spans;
         my ($set_span) = grep { $_->{name} eq 'redis.SET' } @spans;
         is($set_span->{attributes}{'db.statement'}, 'SET', 'only command name, no args');
 
-        await_f($test_redis->del('trace:noargs'));
+        run { $test_redis->del('trace:noargs') };
     };
 
     subtest 'span kind is client' => sub {
@@ -187,8 +178,8 @@ SKIP: {
             host        => $ENV{REDIS_HOST} // 'localhost',
             otel_tracer => $tracer,
         );
-        await_f($redis->connect);
-        await_f($redis->ping);
+        run { $redis->connect };
+        run { $redis->ping };
         $redis->disconnect;
 
         my @spans = $tracer->spans;

@@ -1,21 +1,11 @@
 # t/10-connection/fork-safety.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
-use Future::AsyncAwait;
 use Future::IO::Redis;
 use POSIX qw(_exit);
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
@@ -24,7 +14,7 @@ SKIP: {
             connect_timeout => 2,
             reconnect => 1,
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
@@ -39,7 +29,7 @@ SKIP: {
             if $^O eq 'MSWin32';
 
         # Store a value
-        await_f($redis->set('fork:test', 'parent_value'));
+        run { $redis->set('fork:test', 'parent_value') };
 
         my $pipe_to_child;
         my $pipe_from_child;
@@ -103,8 +93,8 @@ SKIP: {
         );
 
         # Get a connection in parent
-        my $conn1 = await_f($pool->acquire);
-        await_f($conn1->set('fork:pool', 'pool_value'));
+        my $conn1 = run { $pool->acquire };
+        run { $conn1->set('fork:pool', 'pool_value') };
         $pool->release($conn1);
 
         # Check pool stats before fork
@@ -153,13 +143,13 @@ SKIP: {
         like($child_output, qr/SUCCESS/, "pool cleared after fork in child: $child_output");
 
         # Parent pool should still work
-        my $conn2 = await_f($pool->acquire);
-        my $val = await_f($conn2->get('fork:pool'));
+        my $conn2 = run { $pool->acquire };
+        my $val = run { $conn2->get('fork:pool') };
         is($val, 'pool_value', 'parent pool still works after child fork');
         $pool->release($conn2);
 
         # Cleanup
-        await_f($redis->del('fork:pool'));
+        run { $redis->del('fork:pool') };
     };
 
     subtest 'parent connection still works after fork' => sub {
@@ -177,12 +167,12 @@ SKIP: {
         waitpid($pid, 0);
 
         # Parent connection should still work
-        my $result = await_f($redis->ping);
+        my $result = run { $redis->ping };
         is($result, 'PONG', 'parent connection works after fork');
     };
 
     # Cleanup
-    await_f($redis->del('fork:test'));
+    run { $redis->del('fork:test') };
     $redis->disconnect;
 }
 

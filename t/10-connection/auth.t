@@ -1,20 +1,12 @@
 # t/10-connection/auth.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
 use Future::IO::Redis;
 
-my $loop = IO::Async::Loop->new;
-
 # Helper: await a Future and return its result (throws on failure)
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 subtest 'constructor accepts auth parameters' => sub {
     my $redis = Future::IO::Redis->new(
@@ -58,7 +50,7 @@ SKIP: {
             host            => $ENV{REDIS_HOST} // 'localhost',
             connect_timeout => 2,
         );
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 3 unless $test_redis;
@@ -70,16 +62,16 @@ SKIP: {
             database => 1,
         );
 
-        await_f($redis->connect);
+        run { $redis->connect };
 
         # Set a key in database 1
-        await_f($redis->set('auth:test:db1', 'value1'));
+        run { $redis->set('auth:test:db1', 'value1') };
 
         # Verify we're in database 1
-        my $val = await_f($redis->get('auth:test:db1'));
+        my $val = run { $redis->get('auth:test:db1') };
         is($val, 'value1', 'key accessible in db 1');
 
-        await_f($redis->del('auth:test:db1'));
+        run { $redis->del('auth:test:db1') };
         $redis->disconnect;
 
         # Connect to database 0, key should not exist
@@ -87,9 +79,9 @@ SKIP: {
             host     => $ENV{REDIS_HOST} // 'localhost',
             database => 0,
         );
-        await_f($redis2->connect);
+        run { $redis2->connect };
 
-        my $val2 = await_f($redis2->get('auth:test:db1'));
+        my $val2 = run { $redis2->get('auth:test:db1') };
         is($val2, undef, 'key not in db 0');
 
         $redis2->disconnect;
@@ -101,10 +93,10 @@ SKIP: {
             client_name => 'test-client-12345',
         );
 
-        await_f($redis->connect);
+        run { $redis->connect };
 
         # Verify client name was set
-        my $name = await_f($redis->command('CLIENT', 'GETNAME'));
+        my $name = run { $redis->command('CLIENT', 'GETNAME') };
         is($name, 'test-client-12345', 'client name set');
 
         $redis->disconnect;
@@ -121,26 +113,26 @@ SKIP: {
             on_connect  => sub { $connect_count++ },
         );
 
-        await_f($redis->connect);
+        run { $redis->connect };
         is($connect_count, 1, 'connected once');
 
         # Set key in db 2
-        await_f($redis->set('auth:reconnect:key', 'val'));
+        run { $redis->set('auth:reconnect:key', 'val') };
 
         # Force disconnect
         close $redis->{socket};
         $redis->{connected} = 0;
 
         # Command should reconnect and still be in db 2
-        my $val = await_f($redis->get('auth:reconnect:key'));
+        my $val = run { $redis->get('auth:reconnect:key') };
         is($val, 'val', 'still in database 2 after reconnect');
         is($connect_count, 2, 'reconnected');
 
         # Verify client name restored
-        my $name = await_f($redis->command('CLIENT', 'GETNAME'));
+        my $name = run { $redis->command('CLIENT', 'GETNAME') };
         is($name, 'reconnect-test', 'client name restored');
 
-        await_f($redis->del('auth:reconnect:key'));
+        run { $redis->del('auth:reconnect:key') };
         $redis->disconnect;
     };
 }
@@ -156,8 +148,8 @@ SKIP: {
             password => $ENV{REDIS_AUTH_PASS},
         );
 
-        await_f($redis->connect);
-        my $pong = await_f($redis->ping);
+        run { $redis->connect };
+        my $pong = run { $redis->ping };
         is($pong, 'PONG', 'authenticated successfully');
 
         $redis->disconnect;
@@ -171,7 +163,7 @@ SKIP: {
 
         my $error;
         my $f = $redis->connect;
-        $loop->await($f);
+        get_loop()->await($f);
         eval { $f->get };
         $error = $@;
 
@@ -192,8 +184,8 @@ SKIP: {
             password => $ENV{REDIS_ACL_PASS},
         );
 
-        await_f($redis->connect);
-        my $pong = await_f($redis->ping);
+        run { $redis->connect };
+        my $pong = run { $redis->ping };
         is($pong, 'PONG', 'ACL authenticated successfully');
 
         $redis->disconnect;

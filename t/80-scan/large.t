@@ -1,26 +1,15 @@
 # t/80-scan/large.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use Future::AsyncAwait;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
-use IO::Async::Timer::Periodic;
 use Future::IO::Redis;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
         my $r = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost', connect_timeout => 2);
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
@@ -33,7 +22,7 @@ SKIP: {
         for my $i (1..$key_count) {
             $pipe->set("large:key:$i", "value$i");
         }
-        await_f($pipe->execute);
+        run { $pipe->execute };
         pass("created $key_count keys");
     };
 
@@ -43,7 +32,7 @@ SKIP: {
         my @all_keys;
         my $batch_count = 0;
 
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @all_keys, @$batch;
             $batch_count++;
         }
@@ -61,18 +50,18 @@ SKIP: {
             interval => 0.01,
             on_tick => sub { push @ticks, 1 },
         );
-        $loop->add($timer);
+        get_loop()->add($timer);
         $timer->start;
 
         my $iter = $redis->scan_iter(match => 'large:key:*', count => 50);
         my $count = 0;
 
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             $count += @$batch;
         }
 
         $timer->stop;
-        $loop->remove($timer);
+        get_loop()->remove($timer);
 
         is($count, $key_count, 'found all keys');
         pass("Event loop ticked during large scan");
@@ -87,7 +76,7 @@ SKIP: {
         my $max_batch_size = 0;
         my $batch_count = 0;
 
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             my $size = scalar @$batch;
             $max_batch_size = $size if $size > $max_batch_size;
             $batch_count++;
@@ -102,12 +91,12 @@ SKIP: {
         my $iter = $redis->scan_iter(match => 'large:key:*', count => 500);
 
         my @to_delete;
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @to_delete, @$batch;
         }
 
         if (@to_delete) {
-            await_f($redis->del(@to_delete));
+            run { $redis->del(@to_delete) };
         }
 
         pass("cleaned up $key_count keys");

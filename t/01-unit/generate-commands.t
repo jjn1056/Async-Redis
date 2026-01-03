@@ -31,10 +31,8 @@ subtest 'generator produces Commands.pm' => sub {
 };
 
 subtest 'generator handles missing input' => sub {
-    my $result = system($^X, 'bin/generate-commands',
-        '--input', '/nonexistent/file.json',
-        '--output', '/dev/null',
-    );
+    # Redirect stderr to suppress expected error message
+    my $result = system("$^X bin/generate-commands --input /nonexistent/file.json --output /dev/null 2>/dev/null");
 
     isnt($result, 0, 'generator fails on missing input');
 };

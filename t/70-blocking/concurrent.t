@@ -1,51 +1,40 @@
 # t/70-blocking/concurrent.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use Future::AsyncAwait;
 use Future;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
-use IO::Async::Timer::Periodic;
 use Future::IO::Redis;
 use Time::HiRes qw(time);
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis1 = eval {
         my $r = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost', connect_timeout => 2);
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis1;
 
     # Second connection for concurrent operations
     my $redis2 = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost');
-    await_f($redis2->connect);
+    run { $redis2->connect };
 
     # Third connection for pushing data
     my $pusher = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost');
-    await_f($pusher->connect);
+    run { $pusher->connect };
 
     subtest 'multiple concurrent BLPOP on different queues' => sub {
-        await_f($redis1->del('conc:q1', 'conc:q2'));
+        run { $redis1->del('conc:q1', 'conc:q2') };
 
         # Start two BLPOP operations concurrently
         my $f1 = $redis1->blpop('conc:q1', 5);
         my $f2 = $redis2->blpop('conc:q2', 5);
 
         # Push to both after short delay
-        await_f($loop->delay_future(after => 0.2));
-        await_f($pusher->rpush('conc:q1', 'item1'));
-        await_f($pusher->rpush('conc:q2', 'item2'));
+        run { get_loop()->delay_future(after => 0.2) };
+        run { $pusher->rpush('conc:q1', 'item1') };
+        run { $pusher->rpush('conc:q2', 'item2') };
 
         # Wait for both
         my @results = await_f(Future->needs_all($f1, $f2));
@@ -54,21 +43,21 @@ SKIP: {
         is($results[1], ['conc:q2', 'item2'], 'second BLPOP got item');
 
         # Cleanup
-        await_f($redis1->del('conc:q1', 'conc:q2'));
+        run { $redis1->del('conc:q1', 'conc:q2') };
     };
 
     subtest 'multiple BLPOP waiters on same queue' => sub {
-        await_f($redis1->del('conc:shared'));
+        run { $redis1->del('conc:shared') };
 
         # Two connections waiting on same queue
         my $f1 = $redis1->blpop('conc:shared', 5);
         my $f2 = $redis2->blpop('conc:shared', 5);
 
         # Small delay to ensure both are waiting
-        await_f($loop->delay_future(after => 0.1));
+        run { get_loop()->delay_future(after => 0.1) };
 
         # Push two items so both waiters get something
-        await_f($pusher->rpush('conc:shared', 'item1', 'item2'));
+        run { $pusher->rpush('conc:shared', 'item1', 'item2') };
 
         # Wait for both
         my @results = await_f(Future->needs_all($f1, $f2));
@@ -81,18 +70,18 @@ SKIP: {
         isnt($results[0][1], $results[1][1], 'waiters got different items');
 
         # Cleanup
-        await_f($redis1->del('conc:shared'));
+        run { $redis1->del('conc:shared') };
     };
 
     subtest 'non-blocking during concurrent waits' => sub {
-        await_f($redis1->del('conc:nb'));
+        run { $redis1->del('conc:nb') };
 
         my @ticks;
         my $timer = IO::Async::Timer::Periodic->new(
             interval => 0.01,
             on_tick => sub { push @ticks, 1 },
         );
-        $loop->add($timer);
+        get_loop()->add($timer);
         $timer->start;
 
         # Start concurrent BLPOP operations
@@ -103,7 +92,7 @@ SKIP: {
         await_f(Future->needs_all($f1, $f2));
 
         $timer->stop;
-        $loop->remove($timer);
+        get_loop()->remove($timer);
 
         # Should tick throughout the concurrent waits
         ok(@ticks >= 50, "Event loop ticked " . scalar(@ticks) . " times during concurrent BLPOPs");

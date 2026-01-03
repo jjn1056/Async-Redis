@@ -69,18 +69,48 @@ When Client A sends a message:
 
 ## Running
 
-```bash
-# Start Redis
-docker run -d -p 6379:6379 redis
+### 1. Start Redis
 
+Using docker-compose (recommended):
+
+```bash
+# Start Redis (from project root)
+docker compose -f examples/docker-compose.yml up -d
+
+# Check status
+docker compose -f examples/docker-compose.yml ps
+
+# View logs
+docker compose -f examples/docker-compose.yml logs -f
+
+# Stop Redis
+docker compose -f examples/docker-compose.yml down
+
+# Stop and remove data
+docker compose -f examples/docker-compose.yml down -v
+```
+
+Or using docker directly:
+
+```bash
+docker run -d -p 6379:6379 --name redis-example redis:7-alpine
+```
+
+### 2. Run the Chat Server
+
+```bash
 # Run with multiple workers
 REDIS_HOST=localhost pagi-server \
     --app examples/pagi-chat/app.pl \
     --port 5000 \
     --workers 4
-
-# Open http://localhost:5000 in multiple browser tabs
 ```
+
+### 3. Test Multi-Worker Chat
+
+Open http://localhost:5000 in multiple browser tabs. Messages sent from one tab
+will be received by all other tabs, even though they may be connected to different
+worker processes.
 
 ## What This Demonstrates
 

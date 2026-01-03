@@ -1,40 +1,30 @@
 # t/80-scan/sscan.t
 use strict;
 use warnings;
+use Test::Lib;
+use Test::Future::IO::Redis ':redis';
 use Test2::V0;
-use Future::AsyncAwait;
-use IO::Async::Loop;
-use Future::IO;
-Future::IO->load_impl("IOAsync");
 use Future::IO::Redis;
-
-my $loop = IO::Async::Loop->new;
-
-sub await_f {
-    my ($f) = @_;
-    $loop->await($f);
-    return $f->get;
-}
 
 SKIP: {
     my $redis = eval {
         my $r = Future::IO::Redis->new(host => $ENV{REDIS_HOST} // 'localhost', connect_timeout => 2);
-        await_f($r->connect);
+        run { $r->connect };
         $r;
     };
     skip "Redis not available: $@", 1 unless $redis;
 
     # Setup test set
-    await_f($redis->del('sscan:set'));
+    run { $redis->del('sscan:set') };
     for my $i (1..100) {
-        await_f($redis->sadd('sscan:set', "member:$i"));
+        run { $redis->sadd('sscan:set', "member:$i") };
     }
 
     subtest 'sscan_iter iterates all members' => sub {
         my $iter = $redis->sscan_iter('sscan:set');
 
         my @all_members;
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @all_members, @$batch;
         }
 
@@ -48,7 +38,7 @@ SKIP: {
         my $iter = $redis->sscan_iter('sscan:set', match => 'member:5*');
 
         my @all_members;
-        while (my $batch = await_f($iter->next)) {
+        while (my $batch = run { $iter->next }) {
             push @all_members, @$batch;
         }
 
@@ -58,7 +48,7 @@ SKIP: {
     };
 
     # Cleanup
-    await_f($redis->del('sscan:set'));
+    run { $redis->del('sscan:set') };
 }
 
 done_testing;
