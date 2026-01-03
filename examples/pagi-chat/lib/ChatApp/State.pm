@@ -1,0 +1,472 @@
+package ChatApp::State;
+
+#
+# Redis-backed State Management
+#
+# This replaces the in-memory state from PAGI's websocket-chat-v2 example
+# with Redis, enabling multi-worker deployments.
+#
+# Key differences:
+# - Sessions stored in Redis hashes
+# - Room membership in Redis sets
+# - Messages in Redis lists
+# - PubSub for cross-worker broadcasting
+#
+
+use strict;
+use warnings;
+use Future::AsyncAwait;
+use Exporter 'import';
+use JSON::MaybeXS;
+use Time::HiRes qw(time);
+use Scalar::Util qw(weaken);
+
+our @EXPORT_OK = qw(
+    init_redis get_redis get_pubsub
+    get_session create_session update_session remove_session
+    get_session_by_name set_session_connected set_session_disconnected
+    is_session_connected
+    get_room add_room remove_room get_all_rooms
+    add_user_to_room remove_user_from_room get_room_users
+    add_message get_room_messages
+    get_stats generate_id sanitize_username sanitize_room_name
+    subscribe_broadcasts register_local_session unregister_local_session
+    broadcast_to_room add_local_room
+);
+
+my $JSON = JSON::MaybeXS->new->utf8->canonical;
+
+# Redis connections (per-worker)
+my $redis;
+my $pubsub;
+my $pubsub_subscription;
+
+# Local session callbacks (for this worker only)
+# Redis PubSub delivers to all workers, but we only call callbacks for OUR clients
+my %local_sessions;
+
+use constant {
+    MAX_MESSAGES_PER_ROOM => 100,
+    SESSION_TTL           => 86400,    # 24 hours
+    BROADCAST_CHANNEL     => 'chat:broadcast',
+};
+
+# Initialize Redis connections for this worker
+async sub init_redis {
+    my (%args) = @_;
+
+    require Future::IO::Redis;
+
+    my $host = $args{host} // $ENV{REDIS_HOST} // 'localhost';
+    my $port = $args{port} // $ENV{REDIS_PORT} // 6379;
+
+    # Main connection for commands
+    $redis = Future::IO::Redis->new(host => $host, port => $port);
+    await $redis->connect;
+
+    # Separate connection for PubSub
+    my $pubsub_redis = Future::IO::Redis->new(host => $host, port => $port);
+    await $pubsub_redis->connect;
+    $pubsub = await $pubsub_redis->subscribe(BROADCAST_CHANNEL);
+
+    # Start background listener for broadcasts
+    _start_broadcast_listener();
+
+    # Initialize default rooms
+    await add_room('general', 'system');
+    await add_room('random', 'system');
+    await add_room('help', 'system');
+
+    print STDERR "Worker $$: Redis state initialized\n";
+    return $redis;
+}
+
+sub get_redis { $redis }
+sub get_pubsub { $pubsub }
+
+# Background listener for cross-worker broadcasts
+sub _start_broadcast_listener {
+    (async sub {
+        while (my $msg = await $pubsub->next_message) {
+            next unless $msg->{type} eq 'message';
+
+            my $data = eval { $JSON->decode($msg->{data}) };
+            next unless $data;
+
+            my $room_name = $data->{room};
+            my $exclude_id = $data->{exclude_id};
+            my $payload = $data->{payload};
+
+            # Deliver to local sessions in this room
+            for my $session_id (keys %local_sessions) {
+                next if defined $exclude_id && $session_id eq $exclude_id;
+
+                my $local = $local_sessions{$session_id};
+                next unless $local && $local->{rooms}{$room_name} && $local->{send_cb};
+
+                eval { $local->{send_cb}->($payload) };
+            }
+        }
+    })->();
+}
+
+# Register a local session (called when client connects to THIS worker)
+sub register_local_session {
+    my ($session_id, $send_cb) = @_;
+    $local_sessions{$session_id} = {
+        send_cb => $send_cb,
+        rooms   => {},
+    };
+}
+
+# Track room membership locally
+sub add_local_room {
+    my ($session_id, $room_name) = @_;
+    $local_sessions{$session_id}{rooms}{$room_name} = 1 if $local_sessions{$session_id};
+}
+
+sub remove_local_room {
+    my ($session_id, $room_name) = @_;
+    delete $local_sessions{$session_id}{rooms}{$room_name} if $local_sessions{$session_id};
+}
+
+sub unregister_local_session {
+    my ($session_id) = @_;
+    delete $local_sessions{$session_id};
+}
+
+# Broadcast to room via Redis PubSub (reaches all workers)
+async sub broadcast_to_room {
+    my ($room_name, $payload, $exclude_id) = @_;
+
+    my $msg = $JSON->encode({
+        room       => $room_name,
+        exclude_id => $exclude_id,
+        payload    => $payload,
+    });
+
+    await $redis->publish(BROADCAST_CHANNEL, $msg);
+}
+
+sub generate_id {
+    require Digest::SHA;
+    return Digest::SHA::sha256_hex(time() . $$ . rand());
+}
+
+sub sanitize_username {
+    my ($name) = @_;
+    $name //= '';
+    $name =~ s/[^\w]/_/g;
+    $name = substr($name, 0, 20);
+    $name = 'User' . int(rand(1000)) if length($name) < 2;
+    return $name;
+}
+
+sub sanitize_room_name {
+    my ($name) = @_;
+    $name //= '';
+    $name =~ s/[^\w-]/_/g;
+    $name = lc(substr($name, 0, 30));
+    $name = 'room' . int(rand(1000)) if length($name) < 2;
+    return $name;
+}
+
+# Session management (Redis hashes)
+async sub get_session {
+    my ($session_id) = @_;
+    return unless $session_id;
+
+    my $data = await $redis->hgetall("session:$session_id");
+    return unless $data && %$data;
+
+    # Deserialize rooms
+    $data->{rooms} = $data->{rooms} ? $JSON->decode($data->{rooms}) : {};
+    $data->{connected} = $data->{connected} ? 1 : 0;
+
+    return $data;
+}
+
+async sub get_session_by_name {
+    my ($name) = @_;
+
+    # Scan for session with this name (not efficient, but works for demo)
+    my $cursor = 0;
+    do {
+        my ($new_cursor, $keys) = await $redis->scan($cursor, MATCH => 'session:*', COUNT => 100);
+        $cursor = $new_cursor;
+
+        for my $key (@$keys) {
+            my $session = await $redis->hgetall($key);
+            if ($session && $session->{name} eq $name && $session->{connected}) {
+                $session->{rooms} = $session->{rooms} ? $JSON->decode($session->{rooms}) : {};
+                return $session;
+            }
+        }
+    } while ($cursor);
+
+    return;
+}
+
+async sub create_session {
+    my ($session_id, $name, $send_cb) = @_;
+
+    my $session = {
+        id        => $session_id,
+        name      => $name,
+        connected => 1,
+        joined_at => time(),
+        last_seen => time(),
+        rooms     => {},
+    };
+
+    await $redis->hmset("session:$session_id",
+        id        => $session_id,
+        name      => $name,
+        connected => 1,
+        joined_at => $session->{joined_at},
+        last_seen => $session->{last_seen},
+        rooms     => '{}',
+    );
+    await $redis->expire("session:$session_id", SESSION_TTL);
+
+    # Track locally for this worker
+    register_local_session($session_id, $send_cb);
+
+    return $session;
+}
+
+async sub update_session {
+    my ($session_id, $updates) = @_;
+
+    my @args;
+    for my $key (keys %$updates) {
+        my $val = $updates->{$key};
+        $val = $JSON->encode($val) if ref $val;
+        push @args, $key, $val;
+    }
+
+    await $redis->hmset("session:$session_id", @args) if @args;
+    await $redis->expire("session:$session_id", SESSION_TTL);
+}
+
+async sub set_session_connected {
+    my ($session_id, $send_cb) = @_;
+
+    await update_session($session_id, { connected => 1, last_seen => time() });
+    register_local_session($session_id, $send_cb);
+
+    return get_session($session_id);
+}
+
+async sub set_session_disconnected {
+    my ($session_id) = @_;
+
+    await update_session($session_id, { connected => 0 });
+    unregister_local_session($session_id);
+}
+
+async sub is_session_connected {
+    my ($session_id) = @_;
+    my $connected = await $redis->hget("session:$session_id", 'connected');
+    return $connected ? 1 : 0;
+}
+
+async sub remove_session {
+    my ($session_id) = @_;
+
+    my $session = await get_session($session_id);
+    return unless $session;
+
+    # Leave all rooms
+    for my $room_name (keys %{$session->{rooms}}) {
+        await remove_user_from_room($session_id, $room_name, 1);
+    }
+
+    await $redis->del("session:$session_id");
+    unregister_local_session($session_id);
+
+    return $session;
+}
+
+# Room management
+async sub get_room {
+    my ($name) = @_;
+
+    my $exists = await $redis->exists("room:$name");
+    return unless $exists;
+
+    my $data = await $redis->hgetall("room:$name:meta");
+    return {
+        name       => $name,
+        created_at => $data->{created_at} // time(),
+        created_by => $data->{created_by} // 'system',
+    };
+}
+
+async sub add_room {
+    my ($name, $created_by) = @_;
+    $created_by //= 'system';
+
+    my $exists = await $redis->exists("room:$name");
+    return if $exists;
+
+    await $redis->hmset("room:$name:meta",
+        name       => $name,
+        created_at => time(),
+        created_by => $created_by,
+    );
+    await $redis->sadd("rooms", $name);
+
+    return { name => $name, created_by => $created_by };
+}
+
+async sub remove_room {
+    my ($name) = @_;
+    return if $name eq 'general';  # Can't delete general
+
+    await $redis->del("room:$name:meta", "room:$name:users", "room:$name:messages");
+    await $redis->srem("rooms", $name);
+}
+
+async sub get_all_rooms {
+    my $names = await $redis->smembers("rooms");
+    my %rooms;
+
+    for my $name (@$names) {
+        my $user_count = await $redis->scard("room:$name:users");
+        $rooms{$name} = {
+            name  => $name,
+            users => { map { $_ => 1 } @{await $redis->smembers("room:$name:users")} },
+        };
+    }
+
+    return \%rooms;
+}
+
+async sub add_user_to_room {
+    my ($session_id, $room_name) = @_;
+
+    # Ensure room exists
+    await add_room($room_name);
+
+    # Add to room's user set
+    await $redis->sadd("room:$room_name:users", $session_id);
+
+    # Update session's room list
+    my $session = await get_session($session_id);
+    if ($session) {
+        $session->{rooms}{$room_name} = 1;
+        await update_session($session_id, { rooms => $session->{rooms} });
+        add_local_room($session_id, $room_name);
+    }
+
+    # Add system message
+    await add_message($room_name, 'system', "$session->{name} joined the room", 'system');
+}
+
+async sub remove_user_from_room {
+    my ($session_id, $room_name, $silent) = @_;
+
+    my $session = await get_session($session_id);
+
+    await $redis->srem("room:$room_name:users", $session_id);
+
+    if ($session) {
+        delete $session->{rooms}{$room_name};
+        await update_session($session_id, { rooms => $session->{rooms} });
+        remove_local_room($session_id, $room_name);
+
+        unless ($silent) {
+            await add_message($room_name, 'system', "$session->{name} left the room", 'system');
+        }
+    }
+
+    # Clean up empty non-default rooms
+    my $count = await $redis->scard("room:$room_name:users");
+    if ($count == 0 && $room_name !~ /^(general|random|help)$/) {
+        await remove_room($room_name);
+    }
+}
+
+async sub get_room_users {
+    my ($room_name) = @_;
+
+    my $user_ids = await $redis->smembers("room:$room_name:users");
+    my @users;
+
+    for my $session_id (@$user_ids) {
+        my $session = await get_session($session_id);
+        next unless $session && $session->{connected};
+        push @users, {
+            id   => $session_id,
+            name => $session->{name},
+        };
+    }
+
+    return \@users;
+}
+
+# Message storage
+async sub add_message {
+    my ($room_name, $from, $text, $type) = @_;
+    $type //= 'message';
+
+    my $msg_id = await $redis->incr("room:$room_name:msg_counter");
+
+    my $msg = {
+        id   => $msg_id,
+        from => $from,
+        text => $text,
+        type => $type,
+        ts   => time(),
+    };
+
+    await $redis->rpush("room:$room_name:messages", $JSON->encode($msg));
+    await $redis->ltrim("room:$room_name:messages", -MAX_MESSAGES_PER_ROOM, -1);
+
+    return $msg;
+}
+
+async sub get_room_messages {
+    my ($room_name, $limit) = @_;
+    $limit //= 50;
+
+    my $messages = await $redis->lrange("room:$room_name:messages", -$limit, -1);
+    return [ map { $JSON->decode($_) } @$messages ];
+}
+
+async sub get_stats {
+    # Count connected sessions
+    my $online = 0;
+    my $cursor = 0;
+    do {
+        my ($new_cursor, $keys) = await $redis->scan($cursor, MATCH => 'session:*', COUNT => 100);
+        $cursor = $new_cursor;
+        for my $key (@$keys) {
+            my $connected = await $redis->hget($key, 'connected');
+            $online++ if $connected;
+        }
+    } while ($cursor);
+
+    my $rooms = await $redis->smembers("rooms");
+
+    return {
+        users_online => $online,
+        rooms_count  => scalar(@$rooms),
+    };
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+ChatApp::State - Redis-backed state for multi-worker chat
+
+=head1 DESCRIPTION
+
+Replaces in-memory state with Redis, enabling the chat to run across
+multiple worker processes. Uses Redis PubSub for real-time broadcasting.
+
+=cut

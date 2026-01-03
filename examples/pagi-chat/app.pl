@@ -1,117 +1,151 @@
 #!/usr/bin/env perl
+
 #
-# Multi-Worker WebSocket Chat using PAGI + Future::IO::Redis
+# Multi-Worker Chat using PAGI + Future::IO::Redis
 #
-# This example demonstrates Future::IO::Redis PubSub for real-time
-# messaging across multiple worker processes. Each worker maintains
-# its own Redis subscription and broadcasts to its connected clients.
+# This is a port of PAGI's websocket-chat-v2 example, adapted to use
+# Redis for state management and PubSub for cross-worker broadcasting.
+#
+# Key difference: the original uses in-memory state (single worker only).
+# This version stores state in Redis, enabling multi-worker deployments.
 #
 # Run with multiple workers:
-#   pagi-server --app examples/pagi-chat/app.pl --port 5000 --workers 4
+#   REDIS_HOST=localhost pagi-server --app examples/pagi-chat/app.pl --port 5000 --workers 4
 #
-# Test with multiple browser tabs or:
-#   websocat ws://localhost:5000/
+# Then open http://localhost:5000 in multiple browser tabs.
+# Messages will sync across all workers via Redis PubSub.
 #
-# Messages sent by any client are broadcast to ALL clients across
-# ALL workers via Redis PubSub.
-#
+
 use strict;
 use warnings;
 use Future::AsyncAwait;
-use Future::IO;
-use PAGI::WebSocket;
 
-# Use IO::Async as our event loop (PAGI uses this)
+# Event loop setup
 use IO::Async::Loop;
+use Future::IO;
 Future::IO->load_impl('IOAsync');
 
-use lib 'lib';
-use Future::IO::Redis;
+use File::Basename qw(dirname);
+use lib dirname(__FILE__) . '/lib';
+use lib dirname(__FILE__) . '/../../lib';  # For Future::IO::Redis
 
-my $CHANNEL = 'chat:lobby';
+use ChatApp::State qw(init_redis);
+use ChatApp::HTTP;
+use ChatApp::WebSocket;
 
-# Track connected clients for this worker
-my @clients;
+# Pre-instantiate handlers
+my $http_handler = ChatApp::HTTP::handler();
+my $ws_handler = ChatApp::WebSocket::handler();
 
-# Redis subscriber (one per worker, set up on first connection)
-my $subscriber;
-my $subscriber_ready;
+# Track if Redis is initialized for this worker
+my $redis_initialized = 0;
 
-# Set up the Redis subscriber for this worker
-async sub ensure_subscriber {
-    return if $subscriber_ready;
+# Ensure Redis is initialized (called on first request per worker)
+async sub ensure_redis {
+    return if $redis_initialized;
+    await init_redis();
+    $redis_initialized = 1;
+    print STDERR "[worker $$] Redis initialized\n";
+}
 
-    my $redis = Future::IO::Redis->new(
-        host => $ENV{REDIS_HOST} // 'localhost',
-        port => $ENV{REDIS_PORT} // 6379,
-    );
-    await $redis->connect;
+# Logging middleware
+sub with_logging {
+    my ($app) = @_;
 
-    $subscriber = await $redis->subscribe($CHANNEL);
-    $subscriber_ready = 1;
+    return async sub {
+        my ($scope, $receive, $send) = @_;
+        my $start = time();
+        my $type = $scope->{type};
+        my $path = $scope->{path} // '-';
+        my $method = $scope->{method} // '-';
 
-    # Background task: receive messages and broadcast to local clients
-    (async sub {
-        while (my $msg = await $subscriber->next_message) {
-            next unless $msg->{type} eq 'message';
-
-            # Broadcast to all clients connected to THIS worker
-            for my $ws (@clients) {
-                eval { await $ws->send_text($msg->{data}) };
+        my $status = '-';
+        my $wrapped_send = async sub {
+            my ($event) = @_;
+            if ($event->{type} =~ /\.start$/ && defined $event->{status}) {
+                $status = $event->{status};
             }
-        }
-    })->();
+            await $send->($event);
+        };
 
-    print "Worker $$ subscribed to $CHANNEL\n";
+        eval { await $app->($scope, $receive, $wrapped_send) };
+        my $error = $@;
+
+        my $duration = sprintf("%.3f", time() - $start);
+        say STDERR "[$type] $method $path $status ${duration}s (worker $$)";
+
+        die $error if $error;
+    };
 }
 
-# Publish a message (uses separate connection for pub)
-async sub publish_message {
-    my ($text) = @_;
+# Main application
+my $app = with_logging(async sub {
+    my ($scope, $receive, $send) = @_;
+    my $type = $scope->{type} // '';
+    my $path = $scope->{path} // '/';
 
-    # Create a fresh connection for publishing
-    # (subscriber connection is in pubsub mode)
-    my $redis = Future::IO::Redis->new(
-        host => $ENV{REDIS_HOST} // 'localhost',
-        port => $ENV{REDIS_PORT} // 6379,
-    );
-    await $redis->connect;
-    await $redis->publish($CHANNEL, $text);
-    $redis->disconnect;
-}
+    # Handle lifespan events
+    if ($type eq 'lifespan') {
+        return await _handle_lifespan($scope, $receive, $send);
+    }
 
-my $app = async sub {
+    # Ensure Redis is ready (lazy init per worker)
+    await ensure_redis();
+
+    # Route WebSocket
+    if ($type eq 'websocket' && $path eq '/ws/chat') {
+        return await $ws_handler->($scope, $receive, $send);
+    }
+
+    # Route HTTP
+    if ($type eq 'http') {
+        return await $http_handler->($scope, $receive, $send);
+    }
+
+    die "Unsupported scope type: $type";
+});
+
+async sub _handle_lifespan {
     my ($scope, $receive, $send) = @_;
 
-    die "Expected websocket" if $scope->{type} ne 'websocket';
+    while (1) {
+        my $event = await $receive->();
 
-    # Ensure subscriber is running for this worker
-    await ensure_subscriber();
-
-    my $ws = PAGI::WebSocket->new($scope, $receive, $send);
-    await $ws->accept;
-
-    # Track this client
-    push @clients, $ws;
-    my $client_id = "user-" . substr(rand(), 2, 6);
-    print "Worker $$: $client_id connected (" . scalar(@clients) . " local clients)\n";
-
-    # Announce join
-    await publish_message("*** $client_id joined the chat ***");
-
-    $ws->on_close(sub {
-        my ($code) = @_;
-        @clients = grep { $_ != $ws } @clients;
-        print "Worker $$: $client_id disconnected (" . scalar(@clients) . " local clients)\n";
-        # Note: Can't await in callback, fire-and-forget
-        publish_message("*** $client_id left the chat ***");
-    });
-
-    # Handle incoming messages
-    await $ws->each_text(async sub {
-        my ($text) = @_;
-        await publish_message("[$client_id] $text");
-    });
-};
+        if ($event->{type} eq 'lifespan.startup') {
+            say STDERR "[lifespan] Worker $$ starting...";
+            await $send->({ type => 'lifespan.startup.complete' });
+        }
+        elsif ($event->{type} eq 'lifespan.shutdown') {
+            say STDERR "[lifespan] Worker $$ shutting down...";
+            await $send->({ type => 'lifespan.shutdown.complete' });
+            last;
+        }
+    }
+}
 
 $app;
+
+__END__
+
+=head1 NAME
+
+PAGI Chat - Multi-Worker Redis-backed Chat Example
+
+=head1 DESCRIPTION
+
+Demonstrates Future::IO::Redis enabling multi-worker real-time applications.
+
+=head1 USAGE
+
+    # Start Redis
+    docker run -d -p 6379:6379 redis
+
+    # Run with multiple workers
+    REDIS_HOST=localhost pagi-server \
+        --app examples/pagi-chat/app.pl \
+        --port 5000 \
+        --workers 4
+
+    # Open http://localhost:5000 in multiple browser tabs
+
+=cut

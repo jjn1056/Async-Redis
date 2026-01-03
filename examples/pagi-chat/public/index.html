@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PAGI Chat + Redis</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <!-- Login Screen -->
+    <div id="login-screen" class="screen">
+        <div class="login-container">
+            <h1>PAGI Chat</h1>
+            <p class="subtitle">Multi-Worker Demo with Future::IO::Redis</p>
+            <form id="login-form">
+                <input type="text" id="username" placeholder="Enter your name..." maxlength="20" required>
+                <button type="submit" class="btn btn-primary">Join Chat</button>
+            </form>
+            <p class="info">Messages sync across all workers via Redis PubSub</p>
+        </div>
+    </div>
+
+    <!-- Chat Screen -->
+    <div id="chat-screen" class="screen hidden">
+        <div class="chat-layout">
+            <!-- Sidebar -->
+            <aside class="sidebar">
+                <div class="sidebar-header">
+                    <h2>PAGI Chat</h2>
+                    <span id="connection-status" class="status connecting">...</span>
+                </div>
+
+                <div class="user-info">
+                    <span id="display-name">Loading...</span>
+                </div>
+
+                <div class="sidebar-section">
+                    <h3>Rooms</h3>
+                    <ul id="rooms-list"></ul>
+                    <input type="text" id="new-room" placeholder="New room name...">
+                </div>
+
+                <div class="sidebar-section">
+                    <h3>Users in Room</h3>
+                    <ul id="users-list"></ul>
+                </div>
+
+                <div class="sidebar-section stats">
+                    <div><span id="stat-users">0</span> online</div>
+                    <div><span id="stat-rooms">0</span> rooms</div>
+                    <div>Worker: <span id="stat-worker">?</span></div>
+                </div>
+            </aside>
+
+            <!-- Main Chat -->
+            <main class="chat-main">
+                <header class="chat-header">
+                    <h2 id="current-room">#general</h2>
+                </header>
+
+                <div id="messages" class="messages"></div>
+
+                <form id="message-form" class="message-input">
+                    <input type="text" id="message-input" placeholder="Type a message... (/help for commands)" maxlength="1000">
+                    <button type="submit" class="btn btn-primary">Send</button>
+                </form>
+            </main>
+        </div>
+    </div>
+
+    <script src="/js/app.js"></script>
+</body>
+</html>
