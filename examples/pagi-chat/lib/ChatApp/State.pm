@@ -104,8 +104,8 @@ sub _start_selector_runner {
         gen  => sub { _broadcast_listener() },
     );
 
-    # Run the selector loop in the background
-    $background_selector->run;
+    # Run the selector loop in the background (retain keeps Future alive)
+    $background_selector->run->retain;
 }
 
 # Add a fire-and-forget background task to the selector
