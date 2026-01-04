@@ -105,19 +105,7 @@ sub _start_selector_runner {
     );
 
     # Run the selector loop in the background
-    # Using explicit while loop with select() per Future::Selector docs
-    (async sub {
-        while (1) {
-            my @ready = await $background_selector->select;
-            # Process completed tasks (pairs of data, future)
-            while (my ($data, $f) = splice @ready, 0, 2) {
-                if ($f->is_failed) {
-                    my $err = $f->failure;
-                    warn "[selector] Task '$data' failed: $err\n";
-                }
-            }
-        }
-    })->();
+    $background_selector->run;
 }
 
 # Add a fire-and-forget background task to the selector
