@@ -87,19 +87,39 @@ async sub _handle_slow_request {
     my $start = time();
     my $worker = $$;
 
-    # Get Redis connection
-    my $r = await get_redis();
+    my ($seconds, $microseconds, $error);
 
-    # Non-blocking sleep for 1 second
-    # This is the key: the event loop can handle other requests during this sleep
-    await Future::IO->sleep(1);
+    eval {
+        # Get Redis connection
+        my $r = await get_redis();
 
-    # Get Redis server time (returns hashref with seconds/microseconds)
-    my $time = await $r->time;
-    my $seconds = $time->{seconds};
-    my $microseconds = $time->{microseconds};
+        # Non-blocking sleep for 1 second
+        # This is the key: the event loop can handle other requests during this sleep
+        await Future::IO->sleep(1);
+
+        # Get Redis server time (returns hashref with seconds/microseconds)
+        my $time = await $r->time;
+        $seconds = $time->{seconds};
+        $microseconds = $time->{microseconds};
+    };
+    $error = $@;
 
     my $elapsed = sprintf("%.3f", time() - $start);
+
+    # Handle errors gracefully
+    if ($error) {
+        warn "[slow-redis] Worker $worker error: $error\n";
+        await $send->({
+            type    => 'http.response.start',
+            status  => 500,
+            headers => [['content-type', 'text/plain']],
+        });
+        await $send->({
+            type => 'http.response.body',
+            body => "Redis error: $error\n",
+        });
+        return;
+    }
 
     # Build response
     my $body = <<"EOF";
@@ -138,12 +158,31 @@ async sub _handle_fast_request {
     my $start = time();
     my $worker = $$;
 
-    my $r = await get_redis();
-    my $time = await $r->time;
-    my $seconds = $time->{seconds};
-    my $microseconds = $time->{microseconds};
+    my ($seconds, $microseconds, $error);
+
+    eval {
+        my $r = await get_redis();
+        my $time = await $r->time;
+        $seconds = $time->{seconds};
+        $microseconds = $time->{microseconds};
+    };
+    $error = $@;
 
     my $elapsed = sprintf("%.6f", time() - $start);
+
+    if ($error) {
+        warn "[slow-redis] Worker $worker error: $error\n";
+        await $send->({
+            type    => 'http.response.start',
+            status  => 500,
+            headers => [['content-type', 'text/plain']],
+        });
+        await $send->({
+            type => 'http.response.body',
+            body => "Redis error: $error\n",
+        });
+        return;
+    }
 
     my $body = "Fast: worker=$worker redis_time=$seconds.$microseconds elapsed=${elapsed}s\n";
 
