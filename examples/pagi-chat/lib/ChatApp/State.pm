@@ -94,9 +94,6 @@ async sub init_redis {
 sub get_redis { $redis }
 sub get_pubsub { $pubsub }
 
-# Background selector runner
-my $selector_runner_future;
-
 # Start the selector with the PubSub listener as the main long-running task
 sub _start_selector_runner {
     # Add the broadcast listener as a long-running task
@@ -107,9 +104,9 @@ sub _start_selector_runner {
         gen  => sub { _broadcast_listener() },
     );
 
-    # Run the selector loop in the background
+    # Run the selector loop in the background (fire-and-forget with retain)
     # Using explicit while loop with select() per Future::Selector docs
-    $selector_runner_future = (async sub {
+    (async sub {
         while (1) {
             my @ready = await $background_selector->select;
             # Process completed tasks (pairs of data, future)
@@ -120,7 +117,7 @@ sub _start_selector_runner {
                 }
             }
         }
-    })->();
+    })->()->retain;
 }
 
 # Add a fire-and-forget background task to the selector
