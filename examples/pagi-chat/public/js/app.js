@@ -712,7 +712,7 @@
                 elements.loginScreen.classList.add('hidden');
                 elements.chatScreen.classList.remove('hidden');
                 connectWebSocket();
-                connectSSE();
+                // connectSSE();  // SSE not implemented - stats update via WebSocket
             }
         });
 
