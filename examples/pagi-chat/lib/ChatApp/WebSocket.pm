@@ -97,20 +97,21 @@ sub handler {
         $ws->on_close(sub {
             my ($code, $reason) = @_;
 
-            # Mark disconnected and cleanup local state (fire-and-forget)
-            add_background_task(
-                set_session_disconnected($session_id),
-                "disconnect session $session_id"
-            );
-
-            # Broadcast leave to rooms (fire-and-forget)
+            # Handle disconnect in a single background task to ensure proper ordering
             add_background_task(
                 (async sub {
                     my $sess = await get_session($session_id);
                     return unless $sess;
 
+                    # First, leave all rooms and broadcast to each
                     for my $room_name (keys %{$sess->{rooms}}) {
+                        # Remove from room FIRST (updates Redis)
+                        await remove_user_from_room($session_id, $room_name, 1);
+
+                        # Get updated user list (without the leaving user)
                         my $users = await get_room_users($room_name);
+
+                        # Broadcast to remaining users in the room
                         await broadcast_to_room($room_name, {
                             type  => 'user_left',
                             room  => $room_name,
@@ -118,8 +119,11 @@ sub handler {
                             users => $users,
                         }, $session_id);
                     }
+
+                    # Then mark session as disconnected
+                    await set_session_disconnected($session_id);
                 })->(),
-                "broadcast leave for $session_id"
+                "disconnect and broadcast leave for $session_id"
             );
         });
 

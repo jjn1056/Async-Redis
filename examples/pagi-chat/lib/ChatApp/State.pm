@@ -346,6 +346,7 @@ async sub create_session {
         rooms     => '{}',
     );
     await $redis->expire("session:$session_id", SESSION_TTL);
+    await $redis->sadd('connected:sessions', $session_id);
 
     # Track locally for this worker
     register_local_session($session_id, $send_cb);
@@ -371,6 +372,7 @@ async sub set_session_connected {
     my ($session_id, $send_cb) = @_;
 
     await update_session($session_id, { connected => 1, last_seen => time() });
+    await $redis->sadd('connected:sessions', $session_id);
     register_local_session($session_id, $send_cb);
 
     return await get_session($session_id);
@@ -380,6 +382,7 @@ async sub set_session_disconnected {
     my ($session_id) = @_;
 
     await update_session($session_id, { connected => 0 });
+    await $redis->srem('connected:sessions', $session_id);
     unregister_local_session($session_id);
 }
 
@@ -401,6 +404,7 @@ async sub remove_session {
     }
 
     await $redis->del("session:$session_id");
+    await $redis->srem('connected:sessions', $session_id);
     unregister_local_session($session_id);
 
     return $session;
@@ -557,25 +561,15 @@ async sub get_room_messages {
 }
 
 async sub get_stats {
-    # Count connected sessions
-    my $online = 0;
-    my $cursor = "0";
-    do {
-        my $result = await $redis->scan($cursor, MATCH => 'session:*', COUNT => 100);
-        $cursor = $result->[0];
-        my $keys = $result->[1] // [];
-        for my $key (@$keys) {
-            my $connected = await $redis->hget($key, 'connected');
-            $online++ if $connected;
-        }
-    } while ($cursor && $cursor ne "0");
+    # Count connected sessions using dedicated SET (fast O(1))
+    my $online = await $redis->scard('connected:sessions') // 0;
 
-    my $rooms = await $redis->smembers("rooms");
-    $rooms = [] unless $rooms && ref($rooms) eq 'ARRAY';
+    # Count rooms
+    my $rooms_count = await $redis->scard('rooms') // 0;
 
     return {
         users_online => $online,
-        rooms_count  => scalar(@$rooms),
+        rooms_count  => $rooms_count,
         uptime       => int(time() - $server_start_time),
     };
 }
