@@ -1600,39 +1600,61 @@ Execute arbitrary Redis command.
 
 =head2 Redis Commands
 
-All standard Redis commands are available as methods:
+All standard Redis commands are available as methods. See
+L<https://redis.io/docs/latest/commands/> for the complete Redis command
+reference.
 
     # Strings
     await $redis->set('key', 'value');
+    await $redis->set('key', 'value', ex => 300);  # with 5min expiry
+    await $redis->set('key', 'value', nx => 1);    # only if not exists
     my $value = await $redis->get('key');
     await $redis->incr('counter');
+    await $redis->incrby('counter', 5);
     await $redis->mset('k1', 'v1', 'k2', 'v2');
     my $values = await $redis->mget('k1', 'k2');
+    await $redis->append('key', ' more');
+    await $redis->setex('key', 60, 'value');       # set with 60s expiry
 
     # Hashes
-    await $redis->hset('hash', 'field', 'value');
-    my $value = await $redis->hget('hash', 'field');
-    my $all = await $redis->hgetall('hash');
+    await $redis->hset('user:1', 'name', 'Alice', 'email', 'alice@example.com');
+    my $name = await $redis->hget('user:1', 'name');
+    my $user = await $redis->hgetall('user:1');    # returns hashref
+    await $redis->hincrby('user:1', 'visits', 1);
+    my $exists = await $redis->hexists('user:1', 'name');
+    await $redis->hdel('user:1', 'email');
 
     # Lists
-    await $redis->lpush('list', 'value');
-    my $value = await $redis->rpop('list');
-    my $items = await $redis->lrange('list', 0, -1);
+    await $redis->lpush('queue', 'job1', 'job2');
+    await $redis->rpush('queue', 'job3');
+    my $job = await $redis->lpop('queue');
+    my $job = await $redis->rpop('queue');
+    my $job = await $redis->blpop('queue', 5);     # blocking pop, 5s timeout
+    my $items = await $redis->lrange('queue', 0, -1);
+    my $len = await $redis->llen('queue');
 
     # Sets
-    await $redis->sadd('set', 'member');
-    my $members = await $redis->smembers('set');
+    await $redis->sadd('tags', 'perl', 'redis', 'async');
+    await $redis->srem('tags', 'async');
+    my $members = await $redis->smembers('tags');
+    my $is_member = await $redis->sismember('tags', 'perl');
+    my $common = await $redis->sinter('tags1', 'tags2');
 
     # Sorted Sets
-    await $redis->zadd('zset', 1, 'member');
-    my $range = await $redis->zrange('zset', 0, -1);
+    await $redis->zadd('leaderboard', 100, 'alice', 85, 'bob');
+    await $redis->zincrby('leaderboard', 10, 'alice');
+    my $top = await $redis->zrange('leaderboard', 0, 9, 'WITHSCORES');
+    my $rank = await $redis->zrank('leaderboard', 'alice');
+    my $score = await $redis->zscore('leaderboard', 'alice');
 
     # Keys
     my $exists = await $redis->exists('key');
     await $redis->expire('key', 300);
+    my $ttl = await $redis->ttl('key');
     await $redis->del('key1', 'key2');
-
-See L<https://redis.io/commands> for full command reference.
+    await $redis->rename('old', 'new');
+    my $type = await $redis->type('key');
+    my $keys = await $redis->keys('user:*');       # use SCAN in production
 
 =head2 pipeline
 
