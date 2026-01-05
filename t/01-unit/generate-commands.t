@@ -9,8 +9,8 @@ subtest 'generator produces Commands.pm' => sub {
     my $output = File::Spec->catfile($tempdir, 'Commands.pm');
 
     # Run generator with our cached commands.json
-    my $result = system($^X, 'bin/generate-commands',
-        '--input', 'share/commands.json',
+    my $result = system($^X, 'script/generate-commands',
+        '--input', 'script/commands.json',
         '--output', $output,
     );
 
@@ -32,7 +32,7 @@ subtest 'generator produces Commands.pm' => sub {
 
 subtest 'generator handles missing input' => sub {
     # Redirect stderr to suppress expected error message
-    my $result = system("$^X bin/generate-commands --input /nonexistent/file.json --output /dev/null 2>/dev/null");
+    my $result = system("$^X script/generate-commands --input /nonexistent/file.json --output /dev/null 2>/dev/null");
 
     isnt($result, 0, 'generator fails on missing input');
 };
@@ -41,8 +41,8 @@ subtest 'naming conventions' => sub {
     my $tempdir = tempdir(CLEANUP => 1);
     my $output = File::Spec->catfile($tempdir, 'Commands.pm');
 
-    system($^X, 'bin/generate-commands',
-        '--input', 'share/commands.json',
+    system($^X, 'script/generate-commands',
+        '--input', 'script/commands.json',
         '--output', $output,
     );
 
