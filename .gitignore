@@ -23,3 +23,7 @@ Future-IO-Redis-*/
 
 # OS
 .DS_Store
+
+# Claude Code
+CLAUDE.md
+TODO*.md
