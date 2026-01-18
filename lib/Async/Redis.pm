@@ -105,7 +105,12 @@ sub new {
         blocking_timeout_buffer => $args{blocking_timeout_buffer} // 2,
 
         # Inflight tracking with deadlines
+        # Entry: { future => $f, cmd => $cmd, args => \@args, deadline => $t, sent_at => $t }
         inflight => [],
+
+        # Response reader synchronization
+        _reading_responses => 0,
+        _response_reader   => undef,
 
         # Reconnection settings
         reconnect           => $args{reconnect} // 0,
@@ -254,6 +259,8 @@ async sub connect {
     $self->{parser} = _parser_class()->new(api => 1);
     $self->{connected} = 1;
     $self->{inflight} = [];
+    $self->{_reading_responses} = 0;
+    $self->{_response_reader} = undef;
     $self->{_pid} = $$;  # Track PID for fork safety
 
     # Run Redis protocol handshake (AUTH, SELECT, CLIENT SETNAME)
@@ -361,6 +368,8 @@ sub disconnect {
     }
     $self->{connected} = 0;
     $self->{parser} = undef;
+    $self->{_reading_responses} = 0;
+    $self->{_response_reader} = undef;
 
     if ($was_connected && $self->{on_disconnect}) {
         $self->{on_disconnect}->($self, $reason);
@@ -434,6 +443,8 @@ sub _check_fork {
         $self->{socket} = undef;
         $self->{parser} = undef;
         $self->{inflight} = [];
+        $self->{_reading_responses} = 0;
+        $self->{_response_reader} = undef;
 
         my $old_pid = $self->{_pid};
         $self->{_pid} = $$;
@@ -467,6 +478,25 @@ async sub _send {
     my ($self, $data) = @_;
     await Future::IO->write_exactly($self->{socket}, $data);
     return length($data);
+}
+
+# Add command to inflight queue - returns queue depth
+sub _add_inflight {
+    my ($self, $future, $cmd, $args, $deadline) = @_;
+    push @{$self->{inflight}}, {
+        future   => $future,
+        cmd      => $cmd,
+        args     => $args,
+        deadline => $deadline,
+        sent_at  => Time::HiRes::time(),
+    };
+    return scalar @{$self->{inflight}};
+}
+
+# Shift first entry from inflight queue
+sub _shift_inflight {
+    my ($self) = @_;
+    return shift @{$self->{inflight}};
 }
 
 # Read and parse one response
@@ -824,6 +854,8 @@ sub _reset_connection {
 
     $self->{connected} = 0;
     $self->{parser} = undef;
+    $self->{_reading_responses} = 0;
+    $self->{_response_reader} = undef;
 
     if ($was_connected && $self->{on_disconnect}) {
         $self->{on_disconnect}->($self, $reason);
