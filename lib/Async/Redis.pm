@@ -799,18 +799,39 @@ async sub command {
     # Calculate deadline based on command type
     my $deadline = $self->_calculate_deadline($cmd, @args);
 
+    # Create response future and register in inflight queue BEFORE sending
+    # This ensures responses are matched in order
+    my $response_future = Future->new;
+    $self->_add_inflight($response_future, $cmd, \@args, $deadline);
+
     my $result;
     my $error;
 
-    eval {
+    my $send_ok = eval {
         # Send command
         await $self->_send($raw_cmd);
-
-        # Read response with timeout
-        my $response = await $self->_read_response_with_deadline($deadline, \@args);
-        $result = $self->_decode_response($response);
+        1;
     };
-    $error = $@;
+
+    if (!$send_ok) {
+        $error = $@;
+        # Send failed - remove from inflight and fail
+        $self->_shift_inflight;  # Remove the entry we just added
+        $response_future->fail($error) unless $response_future->is_ready;
+    } else {
+        # Trigger the response reader (fire and forget - it runs in background)
+        $self->_ensure_response_reader->retain;
+
+        # Wait for our response future to be completed by the reader
+        my $await_ok = eval {
+            $result = await $response_future;
+            1;
+        };
+
+        if (!$await_ok) {
+            $error = $@;
+        }
+    }
 
     # Telemetry: log result and end span
     if ($self->{_telemetry}) {
