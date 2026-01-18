@@ -1337,6 +1337,24 @@ async sub watch_multi {
 # PUB/SUB
 # ============================================================================
 
+# Wait for inflight commands to complete before mode change
+async sub _wait_for_inflight_drain {
+    my ($self, $timeout) = @_;
+    $timeout //= 30;
+
+    return unless @{$self->{inflight}};
+
+    my $deadline = Time::HiRes::time() + $timeout;
+
+    while (@{$self->{inflight}} && Time::HiRes::time() < $deadline) {
+        await Future::IO->sleep(0.001);
+    }
+
+    if (@{$self->{inflight}}) {
+        $self->_fail_all_inflight("Timeout waiting for inflight commands");
+    }
+}
+
 async sub publish {
     my ($self, $channel, $message) = @_;
     return await $self->command('PUBLISH', $channel, $message);
@@ -1354,6 +1372,9 @@ async sub subscribe {
     die Async::Redis::Error::Disconnected->new(
         message => "Not connected",
     ) unless $self->{connected};
+
+    # Wait for pending commands before entering PubSub mode
+    await $self->_wait_for_inflight_drain;
 
     # Create or reuse subscription
     my $sub = $self->{_subscription} //= Async::Redis::Subscription->new(redis => $self);
@@ -1381,6 +1402,9 @@ async sub psubscribe {
         message => "Not connected",
     ) unless $self->{connected};
 
+    # Wait for pending commands before entering PubSub mode
+    await $self->_wait_for_inflight_drain;
+
     my $sub = $self->{_subscription} //= Async::Redis::Subscription->new(redis => $self);
 
     await $self->_send_command('PSUBSCRIBE', @patterns);
@@ -1402,6 +1426,9 @@ async sub ssubscribe {
     die Async::Redis::Error::Disconnected->new(
         message => "Not connected",
     ) unless $self->{connected};
+
+    # Wait for pending commands before entering PubSub mode
+    await $self->_wait_for_inflight_drain;
 
     my $sub = $self->{_subscription} //= Async::Redis::Subscription->new(redis => $self);
 
@@ -1466,21 +1493,7 @@ async sub _execute_pipeline {
 
     # Wait for any inflight regular commands to complete before pipeline
     # This prevents interleaving pipeline responses with regular command responses
-    if (@{$self->{inflight}}) {
-        # Wait for all inflight futures with a timeout
-        my $timeout = 30;  # 30 second max wait
-        my $deadline = Time::HiRes::time() + $timeout;
-
-        while (@{$self->{inflight}} && Time::HiRes::time() < $deadline) {
-            # Small sleep to yield control
-            await Future::IO->sleep(0.001);
-        }
-
-        # If still inflight after timeout, fail them
-        if (@{$self->{inflight}}) {
-            $self->_fail_all_inflight("Pipeline timeout waiting for inflight commands");
-        }
-    }
+    await $self->_wait_for_inflight_drain;
 
     # Take over reading - prevent response reader from running
     $self->{_reading_responses} = 1;
