@@ -1,6 +1,6 @@
 Revision history for Future-IO-Redis
 
-0.002  2026-01-17
+0.001002  2026-01-17
     - Bug Fix: Concurrent command response matching
         - Fixed race condition where multiple async commands on a single
           connection could receive mismatched responses
@@ -19,7 +19,7 @@ Revision history for Future-IO-Redis
         - Stress test with 100 concurrent commands
         - Inflight tracking verification
 
-0.001  2026-01-03
+0.001001  2026-01-03
     - Initial release
     - Core Features:
         - Full async/await support via Future::IO
