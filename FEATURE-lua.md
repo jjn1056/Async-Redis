@@ -471,8 +471,8 @@ git branch -D feature/lua-script-helpers
 
 | Step | Status | Tests Before | Tests After | Commit |
 |------|--------|--------------|-------------|--------|
-| 1. Enhance Script.pm | NOT STARTED | | | |
-| 2. Script Registry | NOT STARTED | | | |
+| 1. Enhance Script.pm | COMPLETE | 66/352 pass | 66/352 pass | 70afaf8 |
+| 2. Script Registry | IN PROGRESS | | | |
 | 3. Pipeline Integration | NOT STARTED | | | |
 | 4. Test Suite | NOT STARTED | | | |
 | 5. Documentation | NOT STARTED | | | |

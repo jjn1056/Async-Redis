@@ -151,6 +151,9 @@ sub new {
         # Fork safety
         _pid => $$,
 
+        # Script registry
+        _scripts => {},
+
         # Telemetry options
         debug              => $args{debug},
         otel_tracer        => $args{otel_tracer},
@@ -1099,6 +1102,104 @@ sub script {
         redis  => $self,
         script => $code,
     );
+}
+
+# Define a named script command
+# Usage: $redis->define_command(name => { keys => N, lua => '...' })
+sub define_command {
+    my ($self, $name, $def) = @_;
+
+    die "Command name required" unless defined $name && length $name;
+    die "Command definition required" unless ref $def eq 'HASH';
+    die "Lua script required (lua => '...')" unless defined $def->{lua};
+
+    # Validate name (alphanumeric and underscore only)
+    die "Invalid command name '$name' - use only alphanumeric and underscore"
+        unless $name =~ /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+
+    my $script = Async::Redis::Script->new(
+        redis       => $self,
+        script      => $def->{lua},
+        name        => $name,
+        num_keys    => $def->{keys} // 'dynamic',
+        description => $def->{description},
+    );
+
+    $self->{_scripts}{$name} = $script;
+
+    # Optional: install as method on this instance
+    if ($def->{install}) {
+        $self->_install_script_method($name);
+    }
+
+    return $script;
+}
+
+# Run a registered script by name
+# Usage: $redis->run_script('name', @keys_then_args)
+# If num_keys is 'dynamic', first arg is the key count
+async sub run_script {
+    my ($self, $name, @args) = @_;
+
+    my $script = $self->{_scripts}{$name}
+        or die "Unknown script: '$name' - use define_command() first";
+
+    my $num_keys = $script->num_keys;
+
+    # Handle dynamic key count
+    if ($num_keys eq 'dynamic') {
+        $num_keys = shift @args;
+        die "Key count required as first argument for dynamic script '$name'"
+            unless defined $num_keys;
+    }
+
+    # Split args into keys and argv
+    my @keys = splice(@args, 0, $num_keys);
+    return await $script->run(\@keys, \@args);
+}
+
+# Get a registered script by name
+sub get_script {
+    my ($self, $name) = @_;
+    return $self->{_scripts}{$name};
+}
+
+# List all registered script names
+sub list_scripts {
+    my ($self) = @_;
+    return CORE::keys %{$self->{_scripts}};
+}
+
+# Preload all registered scripts to Redis
+# Useful before pipeline execution
+async sub preload_scripts {
+    my ($self) = @_;
+
+    my @names = $self->list_scripts;
+    return 0 unless @names;
+
+    for my $name (@names) {
+        my $script = $self->{_scripts}{$name};
+        await $self->script_load($script->script);
+    }
+
+    return scalar @names;
+}
+
+# Install a script as a method (internal)
+sub _install_script_method {
+    my ($self, $name) = @_;
+
+    # Create closure that captures $name
+    my $method = sub {
+        my ($self, @args) = @_;
+        return $self->run_script($name, @args);
+    };
+
+    # Install on the class (affects all instances)
+    no strict 'refs';
+    no warnings 'redefine';
+    *{"Async::Redis::$name"} = $method;
 }
 
 # ============================================================================
