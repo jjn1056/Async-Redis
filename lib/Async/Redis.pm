@@ -1624,6 +1624,41 @@ Key features:
 
 =item * Full RESP2 protocol support
 
+=item * Safe concurrent commands on single connection
+
+=back
+
+=head1 CONCURRENT COMMANDS
+
+Async::Redis safely handles multiple concurrent commands on a single
+connection using a response queue pattern. When you fire multiple async
+commands without explicitly awaiting them:
+
+    my @futures = (
+        $redis->set('k1', 'v1'),
+        $redis->set('k2', 'v2'),
+        $redis->get('k1'),
+    );
+    my @results = await Future->needs_all(@futures);
+
+Each command is registered in an inflight queue before being sent to Redis.
+A single reader coroutine processes responses in FIFO order, matching each
+response to the correct waiting future. This prevents response mismatch bugs
+that can occur when multiple coroutines race to read from the socket.
+
+For high-throughput scenarios, consider using:
+
+=over 4
+
+=item * B<Explicit pipelines> - C<< $redis->pipeline >> batches commands
+for a single network round-trip
+
+=item * B<Auto-pipeline> - C<< auto_pipeline => 1 >> automatically batches
+commands within an event loop tick
+
+=item * B<Connection pools> - L<Async::Redis::Pool> for parallel execution
+across multiple connections
+
 =back
 
 =head1 CONSTRUCTOR
