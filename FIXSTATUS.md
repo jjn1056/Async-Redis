@@ -25,17 +25,37 @@ Bug demonstrated:
 - mixed command types: INCR expected 2 got 1, LPUSH expected 1 got 3
 - inflight tracking: Connection desynced, caused timeout
 
-### Step 2: Implement Inflight Queue Data Structure - PENDING
+### Step 2: Implement Inflight Queue Data Structure - COMPLETE
+- [x] Add _reading_responses and _response_reader flags
+- [x] Add _add_inflight() helper method
+- [x] Add _shift_inflight() helper method
+- [x] Reset flags in connect/disconnect/_reset_connection/_check_fork
 
-### Step 3: Implement Single Reader Loop - PENDING
+### Step 3: Implement Single Reader Loop - COMPLETE
+- [x] Add _fail_all_inflight() for error handling
+- [x] Add _ensure_response_reader() with FIFO processing
 
-### Step 4: Modify command() to Use Response Queue - PENDING
+### Step 4: Modify command() to Use Response Queue - COMPLETE
+- [x] Create response Future before sending
+- [x] Register in inflight queue before sending
+- [x] Trigger reader after send
+- [x] Await response Future instead of reading directly
+- [x] All 66 tests pass (352 test cases)
 
-### Step 5: Update Pipeline Integration - PENDING
+### Step 5: Update Pipeline Integration - COMPLETE
+- [x] Add _wait_for_inflight_drain() helper
+- [x] Wait for inflight before pipeline
+- [x] Set/reset _reading_responses flag
+- [x] All pipeline tests pass
 
-### Step 6: Update PubSub and Transaction Integration - PENDING
+### Step 6: Update PubSub and Transaction Integration - COMPLETE
+- [x] Add inflight drain to subscribe/psubscribe/ssubscribe
+- [x] Clean transition to PubSub mode
+- [x] All PubSub and transaction tests pass
 
-### Step 7: Fix Original Failing Test - PENDING
+### Step 7: Fix Original Failing Test - COMPLETE
+- [x] t/91-reliability/queue-overflow.t passes
+- [x] inflight tracking works correctly
 
 ### Step 8: Code Review - PENDING
 
