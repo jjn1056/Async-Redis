@@ -499,6 +499,71 @@ sub _shift_inflight {
     return shift @{$self->{inflight}};
 }
 
+# Fail all pending inflight futures with given error
+sub _fail_all_inflight {
+    my ($self, $error) = @_;
+    while (my $entry = $self->_shift_inflight) {
+        if ($entry->{future} && !$entry->{future}->is_ready) {
+            $entry->{future}->fail($error);
+        }
+    }
+}
+
+# Ensure response reader is running - the core response queue mechanism
+# Only one reader should be active at a time, processing responses in FIFO order
+async sub _ensure_response_reader {
+    my ($self) = @_;
+
+    # Already reading - don't start another reader
+    return if $self->{_reading_responses};
+
+    $self->{_reading_responses} = 1;
+
+    while (@{$self->{inflight}} && $self->{connected}) {
+        my $entry = $self->{inflight}[0];
+
+        # Read response with deadline from the entry
+        my $response;
+        my $read_ok = eval {
+            $response = await $self->_read_response_with_deadline(
+                $entry->{deadline},
+                $entry->{args}
+            );
+            1;
+        };
+
+        if (!$read_ok) {
+            my $read_error = $@;
+            # Connection/timeout error - fail all inflight and abort
+            $self->_fail_all_inflight($read_error);
+            $self->{_reading_responses} = 0;
+            return;
+        }
+
+        # Remove this entry from the queue now that we have its response
+        $self->_shift_inflight;
+
+        # Decode response (sync operation, eval works fine here)
+        my $result;
+        my $decode_ok = eval {
+            $result = $self->_decode_response($response);
+            1;
+        };
+
+        # Complete the future
+        if (!$decode_ok) {
+            my $decode_error = $@;
+            # Redis error (like WRONGTYPE) - fail just this future
+            $entry->{future}->fail($decode_error) unless $entry->{future}->is_ready;
+        } else {
+            # Success - complete the future with result
+            $entry->{future}->done($result) unless $entry->{future}->is_ready;
+        }
+    }
+
+    $self->{_reading_responses} = 0;
+}
+
 # Read and parse one response
 async sub _read_response {
     my ($self) = @_;
