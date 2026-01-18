@@ -110,7 +110,6 @@ sub new {
 
         # Response reader synchronization
         _reading_responses => 0,
-        _response_reader   => undef,
 
         # Reconnection settings
         reconnect           => $args{reconnect} // 0,
@@ -260,7 +259,6 @@ async sub connect {
     $self->{connected} = 1;
     $self->{inflight} = [];
     $self->{_reading_responses} = 0;
-    $self->{_response_reader} = undef;
     $self->{_pid} = $$;  # Track PID for fork safety
 
     # Run Redis protocol handshake (AUTH, SELECT, CLIENT SETNAME)
@@ -369,7 +367,6 @@ sub disconnect {
     $self->{connected} = 0;
     $self->{parser} = undef;
     $self->{_reading_responses} = 0;
-    $self->{_response_reader} = undef;
 
     if ($was_connected && $self->{on_disconnect}) {
         $self->{on_disconnect}->($self, $reason);
@@ -444,8 +441,7 @@ sub _check_fork {
         $self->{parser} = undef;
         $self->{inflight} = [];
         $self->{_reading_responses} = 0;
-        $self->{_response_reader} = undef;
-
+    
         my $old_pid = $self->{_pid};
         $self->{_pid} = $$;
 
@@ -941,7 +937,6 @@ sub _reset_connection {
     $self->{connected} = 0;
     $self->{parser} = undef;
     $self->{_reading_responses} = 0;
-    $self->{_response_reader} = undef;
 
     if ($was_connected && $self->{on_disconnect}) {
         $self->{on_disconnect}->($self, $reason);
