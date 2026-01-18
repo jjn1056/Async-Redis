@@ -1464,32 +1464,65 @@ async sub _execute_pipeline {
 
     return [] unless @$commands;
 
-    my $start_time = Time::HiRes::time();
+    # Wait for any inflight regular commands to complete before pipeline
+    # This prevents interleaving pipeline responses with regular command responses
+    if (@{$self->{inflight}}) {
+        # Wait for all inflight futures with a timeout
+        my $timeout = 30;  # 30 second max wait
+        my $deadline = Time::HiRes::time() + $timeout;
 
-    # Send all commands
-    my $data = '';
-    for my $cmd (@$commands) {
-        $data .= $self->_build_command(@$cmd);
+        while (@{$self->{inflight}} && Time::HiRes::time() < $deadline) {
+            # Small sleep to yield control
+            await Future::IO->sleep(0.001);
+        }
+
+        # If still inflight after timeout, fail them
+        if (@{$self->{inflight}}) {
+            $self->_fail_all_inflight("Pipeline timeout waiting for inflight commands");
+        }
     }
-    await $self->_send($data);
 
-    # Read all responses, capturing per-slot Redis errors
+    # Take over reading - prevent response reader from running
+    $self->{_reading_responses} = 1;
+
+    my $start_time = Time::HiRes::time();
     my @responses;
     my $count = scalar @$commands;
-    for my $i (1 .. $count) {
-        my $msg = await $self->_read_response();
 
-        # Capture Redis errors inline rather than dying
-        my $result;
-        eval {
-            $result = $self->_decode_response($msg);
-        };
-        if ($@) {
-            # Capture the error as a string in the results
-            $result = $@;
-            chomp $result if defined $result;
+    my $ok = eval {
+        # Send all commands
+        my $data = '';
+        for my $cmd (@$commands) {
+            $data .= $self->_build_command(@$cmd);
         }
-        push @responses, $result;
+        await $self->_send($data);
+
+        # Read all responses, capturing per-slot Redis errors
+        for my $i (1 .. $count) {
+            my $msg = await $self->_read_response();
+
+            # Capture Redis errors inline rather than dying
+            my $result;
+            eval {
+                $result = $self->_decode_response($msg);
+            };
+            if ($@) {
+                # Capture the error as a string in the results
+                $result = $@;
+                chomp $result if defined $result;
+            }
+            push @responses, $result;
+        }
+        1;
+    };
+
+    my $error = $@;
+
+    # Release reading lock
+    $self->{_reading_responses} = 0;
+
+    if (!$ok) {
+        die $error;
     }
 
     # Telemetry: record pipeline metrics
