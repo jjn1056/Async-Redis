@@ -226,7 +226,8 @@ async sub connect {
     # Now check the result
     if ($completed_f->is_failed) {
         my ($error) = $completed_f->failure;
-        close $socket;
+        # Don't call close() - let $socket go out of scope when we die.
+        # Perl's DESTROY will close it after the exception unwinds.
 
         if ($error eq 'connect_timeout') {
             die Async::Redis::Error::Timeout->new(
@@ -247,7 +248,8 @@ async sub connect {
             $socket = await $self->_tls_upgrade($socket);
         };
         if ($@) {
-            close $socket;
+            # Don't call close() - let $socket go out of scope when we die.
+            # Perl's DESTROY will close it after the exception unwinds.
             die $@;
         }
     }
@@ -391,25 +393,30 @@ sub DESTROY {
 # Properly close socket, canceling any pending futures first
 sub _close_socket {
     my ($self) = @_;
-    my $socket = $self->{socket} or return;
+
+    # Take ownership - removes from $self immediately
+    my $socket = delete $self->{socket} or return;
     my $fileno = fileno($socket);
 
-    # Cancel any pending inflight futures - this should propagate to
-    # Future::IO internals and clean up any watchers on this socket.
-    # (Called here for DESTROY path; disconnect() also cancels before calling us)
-    if (my $inflight = $self->{inflight}) {
+    # Cancel any pending inflight futures - this propagates to
+    # Future::IO internals and cleans up any watchers on this socket.
+    # Important: must happen while fileno is still valid!
+    if (my $inflight = delete $self->{inflight}) {
         for my $entry (@$inflight) {
             if ($entry->{future} && !$entry->{future}->is_ready) {
                 $entry->{future}->cancel;
             }
         }
-        $self->{inflight} = [];
     }
+    $self->{inflight} = [];
 
-    # Close the socket
+    # Initiate clean TCP shutdown (FIN) while fileno still valid
     shutdown($socket, 2) if defined $fileno;
-    close $socket;
-    $self->{socket} = undef;
+
+    # DON'T call close()!
+    # $socket falls out of scope here, Perl's DESTROY calls close().
+    # By this point, Future::IO has already unregistered its watchers
+    # via the cancel() calls above.
 }
 
 # Check if fork occurred and invalidate connection
