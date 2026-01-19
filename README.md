@@ -272,7 +272,7 @@ Pipelining provides ~30x throughput improvement over sequential commands.
 
 ## Author
 
-John Googoo
+John Napiorkowski
 
 ## License
 

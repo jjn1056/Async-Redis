@@ -2211,7 +2211,7 @@ This enables:
 
 =head1 AUTHOR
 
-John Googoo
+John Napiorkowski
 
 =head1 COPYRIGHT AND LICENSE
 
