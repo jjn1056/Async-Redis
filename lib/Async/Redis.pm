@@ -8,7 +8,7 @@ our $VERSION = '0.001003';
 
 use Future;
 use Future::AsyncAwait;
-use Future::IO 0.17;  # Need read/write methods
+use Future::IO 0.18;  # Need load_best_impl
 use Socket qw(pack_sockaddr_in inet_aton AF_INET SOCK_STREAM);
 use IO::Socket::INET;
 use Time::HiRes ();
@@ -1655,16 +1655,10 @@ Async::Redis - Async Redis client using Future::IO
 
     use Async::Redis;
     use Future::AsyncAwait;
-
-    # Use any Future::IO-compatible event loop
-    # IO::Async:
-    use IO::Async::Loop;
     use Future::IO;
-    Future::IO->load_impl('IOAsync');
-    my $loop = IO::Async::Loop->new;
 
-    # Or UV:   Future::IO->load_impl('UV');
-    # Or Glib: Future::IO->load_impl('Glib');
+    # Automatically select the best available event loop implementation
+    Future::IO->load_best_impl;
 
     my $redis = Async::Redis->new(
         host => 'localhost',
@@ -1690,9 +1684,7 @@ Async::Redis - Async Redis client using Future::IO
         while (my $msg = await $sub->next_message) {
             print "Received: $msg->{message}\n";
         }
-    })->();
-
-    $loop->run;
+    })->()->await;
 
 =head1 DESCRIPTION
 
