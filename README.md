@@ -251,7 +251,7 @@ Pipelining provides ~30x throughput improvement over sequential commands.
 ## Dependencies
 
 **Required:**
-- Future::IO (0.18+)
+- Future::IO (0.19+)
 - Future::AsyncAwait
 - Protocol::Redis
 

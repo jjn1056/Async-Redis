@@ -8,7 +8,8 @@ our $VERSION = '0.001003';
 
 use Future;
 use Future::AsyncAwait;
-use Future::IO 0.18;  # Need load_best_impl
+use Future::IO 0.19;  # Need load_best_impl
+Future::IO->load_best_impl;
 use Socket qw(pack_sockaddr_in inet_aton AF_INET SOCK_STREAM);
 use IO::Socket::INET;
 use Time::HiRes ();
@@ -208,12 +209,6 @@ async sub connect {
     my $connect_f = Future::IO->connect($socket, $sockaddr);
     my $sleep_f = Future::IO->sleep($self->{connect_timeout});
 
-    # Capture a reference to the IO::Async loop for later cleanup
-    # IO::Async::Future has a ->loop method that returns the loop
-    if ($sleep_f->can('loop')) {
-        $self->{_io_async_loop} = $sleep_f->loop;
-    }
-
     my $timeout_f = $sleep_f->then(sub {
         return Future->fail('connect_timeout');
     });
@@ -393,41 +388,25 @@ sub DESTROY {
     }
 }
 
-# Properly close socket, cleaning up Future::IO watchers first
+# Properly close socket, canceling any pending futures first
 sub _close_socket {
     my ($self) = @_;
     my $socket = $self->{socket} or return;
     my $fileno = fileno($socket);
 
-    # Clean up Future::IO::Impl::IOAsync watchers before closing socket
-    if (defined $fileno) {
-        # Access internal state of Future::IO::Impl::IOAsync to clean up watchers
-        # This is necessary because the module doesn't provide a public cleanup API
-        # and its ready_for_read/ready_for_write don't set up on_cancel handlers
-        no strict 'refs';
-        no warnings 'once';
-
-        # Cancel pending read futures
-        if (my $watching = delete ${'Future::IO::Impl::IOAsync::watching_read_by_fileno'}{$fileno}) {
-            for my $f (@$watching) {
-                $f->cancel if $f && !$f->is_ready;
+    # Cancel any pending inflight futures - this should propagate to
+    # Future::IO internals and clean up any watchers on this socket.
+    # (Called here for DESTROY path; disconnect() also cancels before calling us)
+    if (my $inflight = $self->{inflight}) {
+        for my $entry (@$inflight) {
+            if ($entry->{future} && !$entry->{future}->is_ready) {
+                $entry->{future}->cancel;
             }
         }
-
-        # Cancel pending write futures
-        if (my $watching = delete ${'Future::IO::Impl::IOAsync::watching_write_by_fileno'}{$fileno}) {
-            for my $f (@$watching) {
-                $f->cancel if $f && !$f->is_ready;
-            }
-        }
-
-        # Unwatch from IO::Async loop before closing socket
-        if (my $loop = $self->{_io_async_loop}) {
-            eval { $loop->unwatch_io(handle => $socket, on_read_ready => 1) };
-            eval { $loop->unwatch_io(handle => $socket, on_write_ready => 1) };
-        }
+        $self->{inflight} = [];
     }
 
+    # Close the socket
     shutdown($socket, 2) if defined $fileno;
     close $socket;
     $self->{socket} = undef;
