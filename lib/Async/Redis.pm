@@ -1677,10 +1677,10 @@ Async::Redis - Async Redis client using Future::IO
 
     use Async::Redis;
     use Future::AsyncAwait;
-    use Future::IO;
 
-    # Automatically select the best available event loop implementation
-    Future::IO->load_best_impl;
+    # For standalone scripts: configure Future::IO first
+    use Future::IO;
+    Future::IO->load_best_impl;  # Selects UV, IO::Async, etc.
 
     my $redis = Async::Redis->new(
         host => 'localhost',
@@ -1707,6 +1707,11 @@ Async::Redis - Async Redis client using Future::IO
             print "Received: $msg->{message}\n";
         }
     })->()->await;
+
+B<Important:> If you're embedding Async::Redis in a larger application
+(web framework, existing event loop, etc.), see L</EVENT LOOP CONFIGURATION>
+for how to properly configure Future::IO. Libraries should never call
+C<load_best_impl> - only your application's entry point should.
 
 =head1 DESCRIPTION
 
@@ -2214,6 +2219,101 @@ Async::Redis is fork-safe. When a fork is detected, the child
 process will automatically invalidate its connection state and
 reconnect when needed. The parent retains ownership of the original
 connection.
+
+=head1 EVENT LOOP CONFIGURATION
+
+Async::Redis uses L<Future::IO> for event loop abstraction, making it
+compatible with IO::Async, UV, AnyEvent, and other event loops. However,
+B<Async::Redis does not choose which event loop to use> - that's the
+application's responsibility.
+
+=head2 The Golden Rule
+
+B<Only executable scripts should configure Future::IO.> Library modules
+(C<.pm> files) should never call C<load_best_impl> or C<load_impl> because
+they don't know what event loop the application wants to use.
+
+When you use Async::Redis inside a larger application, you are a "guest"
+in that application's event loop. The application (the "host") decides
+which Future::IO implementation to use, and all libraries must cooperate.
+
+=head2 For Standalone Scripts
+
+If you're writing a standalone script that uses Async::Redis directly,
+configure Future::IO at the top of your script:
+
+    #!/usr/bin/env perl
+    use strict;
+    use warnings;
+    use Future::IO;
+    Future::IO->load_best_impl;  # Auto-select best available
+
+    use Async::Redis;
+    my $redis = Async::Redis->new(host => 'localhost');
+    # ...
+
+C<load_best_impl> will select the best available backend, typically
+preferring UV if installed, then IO::Async, then others.
+
+=head2 For IO::Async Applications
+
+If your application uses IO::Async for its event loop:
+
+    use IO::Async::Loop;
+    use Future::IO;
+    Future::IO->load_impl('IOAsync');  # Explicitly use IO::Async
+
+    my $loop = IO::Async::Loop->new;
+
+    use Async::Redis;
+    my $redis = Async::Redis->new(host => 'localhost');
+
+=head2 For UV Applications
+
+If your application uses UV (libuv) for its event loop:
+
+    use UV;
+    use Future::IO;
+    Future::IO->load_impl('UV');  # Explicitly use UV
+
+    use Async::Redis;
+    my $redis = Async::Redis->new(host => 'localhost');
+
+=head2 When Using Multiple Async Libraries
+
+When combining Async::Redis with other Future::IO-based libraries (like
+web frameworks, database clients, etc.), all libraries will share the
+same Future::IO backend. This is by design - they're all cooperating
+within the same event loop.
+
+The key is that the B<application> configures Future::IO B<once>, before
+loading any libraries that use it:
+
+    # Application startup
+    use Future::IO;
+    Future::IO->load_impl('IOAsync');  # Application's choice
+
+    # Now load libraries - they all use the configured backend
+    use Async::Redis;
+    use Some::Other::Async::Library;
+    use My::Web::Framework;
+
+=head2 What Happens Without Configuration
+
+If nothing explicitly configures Future::IO before the first async
+operation, Future::IO will auto-select an implementation. This can lead
+to unexpected behavior if different parts of your application assume
+different backends.
+
+To avoid surprises, always configure Future::IO explicitly in your
+application's entry point.
+
+=head2 Checking the Current Implementation
+
+To see which Future::IO implementation is active:
+
+    use Future::IO;
+    print "Using: $Future::IO::IMPL\n";
 
 =head1 OBSERVABILITY
 
