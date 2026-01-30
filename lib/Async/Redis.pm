@@ -8,8 +8,7 @@ our $VERSION = '0.001003';
 
 use Future;
 use Future::AsyncAwait;
-use Future::IO 0.19;  # Need load_best_impl
-Future::IO->load_best_impl;
+use Future::IO 0.19;
 use Socket qw(pack_sockaddr_in inet_aton AF_INET SOCK_STREAM);
 use IO::Socket::INET;
 use Time::HiRes ();
