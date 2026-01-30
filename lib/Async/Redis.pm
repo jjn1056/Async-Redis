@@ -100,8 +100,6 @@ sub new {
 
         # Timeout settings
         connect_timeout         => $args{connect_timeout} // 10,
-        read_timeout            => $args{read_timeout} // 30,
-        write_timeout           => $args{write_timeout} // 30,
         request_timeout         => $args{request_timeout} // 5,
         blocking_timeout_buffer => $args{blocking_timeout_buffer} // 2,
 
@@ -1827,13 +1825,18 @@ Enable TLS/SSL connection. Can be a boolean or hashref with options:
 
 Connection timeout. Default: 10
 
-=item read_timeout => $seconds
-
-Read timeout. Default: 30
-
 =item request_timeout => $seconds
 
-Per-request timeout. Default: 5
+Per-request timeout for commands. Default: 5
+
+Blocking commands (BLPOP, BRPOP, etc.) automatically extend this timeout
+based on their server-side timeout plus C<blocking_timeout_buffer>.
+
+=item blocking_timeout_buffer => $seconds
+
+Extra time added to blocking command timeouts. Default: 2
+
+For example, C<BLPOP key 30> gets a deadline of 30 + 2 = 32 seconds.
 
 =item reconnect => $bool
 
