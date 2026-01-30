@@ -293,6 +293,10 @@ async sub connect {
 async sub _redis_handshake {
     my ($self) = @_;
 
+    # Use connect_timeout for the entire handshake (AUTH, SELECT, CLIENT SETNAME)
+    # This ensures the handshake can't block forever if Redis hangs
+    my $deadline = Time::HiRes::time() + $self->{connect_timeout};
+
     # AUTH (password or username+password for ACL)
     if ($self->{password}) {
         my @auth_args = ('AUTH');
@@ -302,7 +306,7 @@ async sub _redis_handshake {
         my $cmd = $self->_build_command(@auth_args);
         await $self->_send($cmd);
 
-        my $response = await $self->_read_response();
+        my $response = await $self->_read_response_with_deadline($deadline, ['AUTH']);
         my $result = $self->_decode_response($response);
 
         # AUTH returns OK on success, throws on failure
@@ -319,7 +323,7 @@ async sub _redis_handshake {
         my $cmd = $self->_build_command('SELECT', $self->{database});
         await $self->_send($cmd);
 
-        my $response = await $self->_read_response();
+        my $response = await $self->_read_response_with_deadline($deadline, ['SELECT', $self->{database}]);
         my $result = $self->_decode_response($response);
 
         unless ($result && $result eq 'OK') {
@@ -335,7 +339,7 @@ async sub _redis_handshake {
         my $cmd = $self->_build_command('CLIENT', 'SETNAME', $self->{client_name});
         await $self->_send($cmd);
 
-        my $response = await $self->_read_response();
+        my $response = await $self->_read_response_with_deadline($deadline, ['CLIENT', 'SETNAME']);
         # Ignore result - SETNAME failing shouldn't prevent connection
     }
 }
