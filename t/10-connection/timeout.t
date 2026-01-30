@@ -21,15 +21,11 @@ subtest 'constructor accepts timeout parameters' => sub {
     my $redis = Async::Redis->new(
         host                    => 'localhost',
         connect_timeout         => 5,
-        read_timeout            => 10,
-        write_timeout           => 10,
         request_timeout         => 3,
         blocking_timeout_buffer => 2,
     );
 
     is($redis->{connect_timeout}, 5, 'connect_timeout');
-    is($redis->{read_timeout}, 10, 'read_timeout');
-    is($redis->{write_timeout}, 10, 'write_timeout');
     is($redis->{request_timeout}, 3, 'request_timeout');
     is($redis->{blocking_timeout_buffer}, 2, 'blocking_timeout_buffer');
 };
@@ -38,7 +34,6 @@ subtest 'default timeout values' => sub {
     my $redis = Async::Redis->new(host => 'localhost');
 
     is($redis->{connect_timeout}, 10, 'default connect_timeout');
-    is($redis->{read_timeout}, 30, 'default read_timeout');
     is($redis->{request_timeout}, 5, 'default request_timeout');
     is($redis->{blocking_timeout_buffer}, 2, 'default blocking_timeout_buffer');
 };
