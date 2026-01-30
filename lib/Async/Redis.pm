@@ -155,6 +155,9 @@ sub new {
         # Script registry
         _scripts => {},
 
+        # Current read future for clean disconnect cancellation
+        _current_read_future => undef,
+
         # Telemetry options
         debug              => $args{debug},
         otel_tracer        => $args{otel_tracer},
@@ -260,6 +263,7 @@ async sub connect {
     $self->{inflight} = [];
     $self->{_reading_responses} = 0;
     $self->{_pid} = $$;  # Track PID for fork safety
+    $self->{_current_read_future} = undef;
 
     # Run Redis protocol handshake (AUTH, SELECT, CLIENT SETNAME)
     await $self->_redis_handshake;
@@ -351,6 +355,13 @@ sub disconnect {
 
     my $was_connected = $self->{connected};
 
+    # Cancel any active read future BEFORE closing socket
+    # This ensures Future::IO unregisters its watcher while fileno is still valid
+    if ($self->{_current_read_future} && !$self->{_current_read_future}->is_ready) {
+        $self->{_current_read_future}->cancel;
+        $self->{_current_read_future} = undef;
+    }
+
     # Cancel any pending inflight operations before closing socket
     if (my $inflight = $self->{inflight}) {
         for my $entry (@$inflight) {
@@ -425,12 +436,15 @@ sub _check_fork {
 
     if ($self->{_pid} && $self->{_pid} != $$) {
         # Fork detected - invalidate connection (parent owns the socket)
+        # Don't cancel futures - they belong to the parent's event loop
+        # Just clear references so we don't try to use them
         $self->{connected} = 0;
         $self->{socket} = undef;
         $self->{parser} = undef;
         $self->{inflight} = [];
         $self->{_reading_responses} = 0;
-    
+        $self->{_current_read_future} = undef;  # Clear stale reference
+
         my $old_pid = $self->{_pid};
         $self->{_pid} = $$;
 
@@ -859,12 +873,26 @@ async sub _read_response_with_deadline {
 
         # Use wait_any for timeout
         my $read_f = Future::IO->read($self->{socket}, 65536);
+
+        # Store reference so disconnect() can cancel it
+        $self->{_current_read_future} = $read_f;
+
         my $timeout_f = Future::IO->sleep($remaining)->then(sub {
             return Future->fail('read_timeout');
         });
 
         my $wait_f = Future->wait_any($read_f, $timeout_f);
         await $wait_f;
+
+        # Clear stored reference after await completes
+        $self->{_current_read_future} = undef;
+
+        # Check if read was cancelled (by disconnect)
+        if ($read_f->is_cancelled) {
+            die Async::Redis::Error::Disconnected->new(
+                message => "Disconnected during read",
+            );
+        }
 
         if ($wait_f->is_failed) {
             my ($error) = $wait_f->failure;
@@ -908,6 +936,13 @@ sub _reset_connection {
     $reason //= 'timeout';
 
     my $was_connected = $self->{connected};
+
+    # Cancel any active read future BEFORE closing socket
+    # This ensures Future::IO unregisters its watcher while fileno is still valid
+    if ($self->{_current_read_future} && !$self->{_current_read_future}->is_ready) {
+        $self->{_current_read_future}->cancel;
+        $self->{_current_read_future} = undef;
+    }
 
     # Cancel any pending inflight operations before closing socket
     if (my $inflight = $self->{inflight}) {
