@@ -30,3 +30,4 @@ Async-Redis-*/
 CLAUDE.md
 TODO*.md
 .claude/
+.private-journal/
