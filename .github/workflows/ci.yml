@@ -1,0 +1,36 @@
+name: CI
+on:
+    push:
+    pull_request:
+    workflow_dispatch:
+    #schedule:
+    #    - cron: '42 5 * * 0'
+jobs:
+  perl-job:
+    runs-on: ubuntu-latest
+    name: Perl ${{ matrix.perl-version }}
+    steps:
+      - uses: actions/checkout@v4
+        
+      - name: Start Redis Services
+        run: docker compose -f t/docker-compose.yml up -d
+
+      - name: Setup Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.42'
+      
+      - name: Prepare for release tests
+        run: |
+            cpanm --installdep --notest .
+            cpanm --notest Test::CheckManifest Test::Pod::Coverage Pod::Coverage Test::Pod
+            
+      - name: Release tests
+        env:
+          RELEASE_TESTING: 1
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+          
+          REDIS_CLUSTER_NODES: 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
+        
+        run: prove -Ilib -r t
