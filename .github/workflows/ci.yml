@@ -8,7 +8,7 @@ on:
 jobs:
   perl-job:
     runs-on: ubuntu-latest
-    name: Perl ${{ matrix.perl-version }}
+    name: Perl 5.42
     steps:
       - uses: actions/checkout@v4
         
