@@ -8,6 +8,7 @@ use Test::Lib;
 use Test::Async::Redis qw(run);
 use Test2::V0;
 use Async::Redis;
+use IO::Socket::UNIX;
 
 # --- Unit tests (no Redis needed) ---
 
@@ -59,8 +60,9 @@ subtest 'connect attempts AF_UNIX for path' => sub {
 SKIP: {
     my $socket_path = $ENV{REDIS_SOCKET} // '/tmp/redis-test-unix/redis.sock';
 
-    skip 'Redis unix socket not available (start docker-compose or set REDIS_SOCKET)', 3
-        unless -S $socket_path;
+    skip 'Redis unix socket not connectable (start docker-compose or set REDIS_SOCKET)', 3
+        unless -S $socket_path
+        && IO::Socket::UNIX->new(Peer => $socket_path, Type => IO::Socket::UNIX::SOCK_STREAM());
 
     subtest 'connect and PING via unix socket' => sub {
         my $redis = Async::Redis->new(
