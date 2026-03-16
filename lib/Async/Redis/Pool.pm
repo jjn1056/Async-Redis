@@ -15,27 +15,28 @@ our $VERSION = '0.001';
 sub new {
     my ($class, %args) = @_;
 
+    # Separate pool-specific args from connection args.
+    # Everything not pool-specific is passed through to Async::Redis->new().
+    my %pool_args;
+    for my $key (qw(min max acquire_timeout idle_timeout cleanup_timeout on_dirty)) {
+        $pool_args{$key} = delete $args{$key} if exists $args{$key};
+    }
+
     my $self = bless {
-        # Connection params (passed to Async::Redis->new)
-        host     => $args{host} // 'localhost',
-        port     => $args{port} // 6379,
-        password => $args{password},
-        database => $args{database},
-        tls      => $args{tls},
-        uri      => $args{uri},
+        # Connection params (passed through to Async::Redis->new)
+        _conn_args => \%args,
 
         # Pool sizing
-        min => $args{min} // 1,
-        max => $args{max} // 10,
+        min => $pool_args{min} // 1,
+        max => $pool_args{max} // 10,
 
         # Timeouts
-        acquire_timeout  => $args{acquire_timeout} // 5,
-        idle_timeout     => $args{idle_timeout} // 60,
-        connect_timeout  => $args{connect_timeout} // 10,
-        cleanup_timeout  => $args{cleanup_timeout} // 5,
+        acquire_timeout  => $pool_args{acquire_timeout} // 5,
+        idle_timeout     => $pool_args{idle_timeout} // 60,
+        cleanup_timeout  => $pool_args{cleanup_timeout} // 5,
 
         # Dirty handling
-        on_dirty => $args{on_dirty} // 'destroy',
+        on_dirty => $pool_args{on_dirty} // 'destroy',
 
         # Pool state
         _idle    => [],   # Available connections
@@ -221,18 +222,7 @@ sub _return_to_pool {
 async sub _create_connection {
     my ($self) = @_;
 
-    my %conn_args = (
-        host            => $self->{host},
-        port            => $self->{port},
-        connect_timeout => $self->{connect_timeout},
-    );
-
-    $conn_args{password} = $self->{password} if defined $self->{password};
-    $conn_args{database} = $self->{database} if defined $self->{database};
-    $conn_args{tls}      = $self->{tls}      if $self->{tls};
-    $conn_args{uri}      = $self->{uri}      if $self->{uri};
-
-    my $conn = Async::Redis->new(%conn_args);
+    my $conn = Async::Redis->new(%{$self->{_conn_args}});
     await $conn->connect;
 
     $self->{_total_created}++;
