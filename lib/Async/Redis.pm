@@ -1036,7 +1036,7 @@ sub _decode_response {
     }
     # Error (-)
     elsif ($type eq '-') {
-        die "Redis error: $data";
+        die Async::Redis::Error::Redis->from_message($data);
     }
     # Integer (:)
     elsif ($type eq ':') {
@@ -1695,9 +1695,8 @@ async sub _execute_pipeline {
                 $result = $self->_decode_response($msg);
             };
             if ($@) {
-                # Capture the error as a string in the results
+                # Capture the error object inline in the results
                 $result = $@;
-                chomp $result if defined $result;
             }
             push @responses, $result;
         }
