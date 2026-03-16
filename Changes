@@ -1,5 +1,18 @@
 Revision history for Future-IO-Redis
 
+0.001005  2026-03-15
+    - Feature: Unix domain socket connections
+        - Connect via path parameter or redis+unix:// URI scheme
+        - Constructor stores path and skips host/port for unix sockets
+        - Added docker-compose redis-unix service for testing
+    - Feature: PubSub auto-resubscribe on reconnect
+        - Subscriptions automatically re-established after connection drop
+        - on_reconnect callback on Subscription object for notification
+        - _read_pubsub_frame checks connected state to fail fast
+        - _reset_connection now clears in_pubsub flag
+    - Bug Fix: _reset_connection left in_pubsub=1 after disconnect
+        - Prevented reconnection because AUTH/SELECT blocked by pubsub guard
+
 0.001004  2026-02-02
     - Bug Fix: Socket close ordering
         - Fixed Future::IO corruption when disconnect() called with active watchers
