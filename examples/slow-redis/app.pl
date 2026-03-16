@@ -23,8 +23,8 @@ use warnings;
 use Future::AsyncAwait;
 use Future::IO;
 
-# PAGI uses IO::Async - load the impl directly (bypasses Future::IO 0.22+ poll check)
-require Future::IO::Impl::IOAsync;
+# Note: pagi-server (v0.001016+) auto-configures Future::IO for IO::Async,
+# so no explicit configuration needed when running under pagi-server.
 
 use File::Basename qw(dirname);
 use lib dirname(__FILE__) . '/../../lib';  # For Async::Redis
