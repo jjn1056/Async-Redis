@@ -775,8 +775,13 @@ async sub _reconnect_pubsub {
 
     my @replay = $sub->get_replay_commands;
 
-    # _reset_connection already cleared in_pubsub,
-    # so _reconnect can do a normal TCP reconnect + handshake
+    # Ensure connection state is fully cleaned up before reconnecting.
+    # _reset_connection may have already been called by _read_response,
+    # but if the socket was closed externally, we need to clean up
+    # stale IO watchers and state here. It is safe to call twice —
+    # the on_disconnect callback is guarded by $was_connected.
+    $self->_reset_connection('pubsub_reconnect');
+
     await $self->_reconnect;
 
     # Replay all subscription commands
@@ -1613,6 +1618,10 @@ async sub ssubscribe {
 # Read pubsub frame (subscription confirmation or message)
 async sub _read_pubsub_frame {
     my ($self) = @_;
+
+    die Async::Redis::Error::Disconnected->new(
+        message => "Not connected",
+    ) unless $self->{connected};
 
     my $msg = await $self->_read_response();
     return $self->_decode_response($msg);

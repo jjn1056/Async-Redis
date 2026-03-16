@@ -82,7 +82,33 @@ async sub next {
     my $redis = $self->{redis};
 
     while (1) {
-        my $frame = await $redis->_read_pubsub_frame();
+        my $frame;
+        eval {
+            $frame = await $redis->_read_pubsub_frame();
+        };
+
+        if (my $error = $@) {
+            # Connection error — attempt reconnect if enabled
+            if ($redis->{reconnect} && $self->channel_count > 0) {
+                eval {
+                    await $redis->_reconnect_pubsub();
+                };
+                if ($@) {
+                    # Reconnect failed — propagate the original error
+                    die $error;
+                }
+
+                # Deliver synthetic reconnected notification
+                return {
+                    type     => 'reconnected',
+                    channels => [$self->channels],
+                    patterns => [$self->patterns],
+                };
+            }
+
+            # No reconnect — propagate error
+            die $error;
+        }
 
         last unless $frame && ref $frame eq 'ARRAY';
 
