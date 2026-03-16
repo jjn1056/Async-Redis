@@ -19,8 +19,16 @@ sub new {
         sharded_channels => {},      # channel => 1 (for ssubscribe)
         _message_queue   => [],      # Buffer for messages
         _waiters         => [],      # Futures waiting for messages
+        _on_reconnect    => undef,   # Callback for reconnect notification
         _closed          => 0,
     }, $class;
+}
+
+# Set/get reconnect callback
+sub on_reconnect {
+    my ($self, $cb) = @_;
+    $self->{_on_reconnect} = $cb if @_ > 1;
+    return $self->{_on_reconnect};
 }
 
 # Track a channel subscription
@@ -98,12 +106,14 @@ async sub next {
                     die $error;
                 }
 
-                # Deliver synthetic reconnected notification
-                return {
-                    type     => 'reconnected',
-                    channels => [$self->channels],
-                    patterns => [$self->patterns],
-                };
+                # Fire reconnect callback if registered
+                if ($self->{_on_reconnect}) {
+                    $self->{_on_reconnect}->($self);
+                }
+
+                # Continue reading — next iteration will read
+                # from the new connection
+                next;
             }
 
             # No reconnect — propagate error
@@ -352,7 +362,6 @@ Manages Redis PubSub subscriptions with async iterator pattern.
 
 =head1 MESSAGE STRUCTURE
 
-    # Regular messages
     {
         type    => 'message',      # or 'pmessage', 'smessage'
         channel => 'channel_name',
@@ -360,15 +369,20 @@ Manages Redis PubSub subscriptions with async iterator pattern.
         data    => 'payload',
     }
 
-    # Reconnection notification (delivered after auto-reconnect)
-    {
-        type     => 'reconnected',
-        channels => ['chan1', 'chan2'],   # re-subscribed channels
-        patterns => ['pat:*'],           # re-subscribed patterns
-    }
+C<next()> always returns real pub/sub messages. Reconnection is transparent.
+
+=head1 RECONNECTION
+
+When C<reconnect> is enabled on the Redis connection, subscriptions are
+automatically re-established after a connection drop. To be notified:
+
+    $sub->on_reconnect(sub {
+        my ($sub) = @_;
+        warn "Reconnected, may have lost messages";
+        # re-poll state, log, etc.
+    });
 
 Messages published while the connection was down are lost (Redis pub/sub
-has no persistence). The C<reconnected> notification lets the application
-re-fetch any state it needs.
+has no persistence).
 
 =cut

@@ -1792,9 +1792,9 @@ Key features:
 =item * PubSub with automatic subscription replay on reconnect
 
 When a connection drops during pub/sub mode and C<reconnect> is enabled,
-all subscriptions are automatically re-established. A synthetic message
-with C<< type => 'reconnected' >> is delivered to signal that messages
-may have been lost during the outage.
+all subscriptions are automatically re-established. Use
+C<< $subscription->on_reconnect(sub { ... }) >> to be notified when this
+happens (e.g., to re-poll state that may have changed during the outage).
 
 =item * Transaction support (MULTI/EXEC/WATCH)
 

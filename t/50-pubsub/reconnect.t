@@ -19,7 +19,6 @@ subtest 'get_replay_commands returns correct commands' => sub {
     my $redis = Async::Redis->new(host => 'localhost');
     my $sub = Async::Redis::Subscription->new(redis => $redis);
 
-    # Track some subscriptions
     $sub->_add_channel('chan:a');
     $sub->_add_channel('chan:b');
     $sub->_add_pattern('events.*');
@@ -28,7 +27,6 @@ subtest 'get_replay_commands returns correct commands' => sub {
 
     is(scalar @commands, 2, 'two replay commands (SUBSCRIBE + PSUBSCRIBE)');
 
-    # Find the SUBSCRIBE command
     my ($sub_cmd) = grep { $_->[0] eq 'SUBSCRIBE' } @commands;
     ok($sub_cmd, 'has SUBSCRIBE command');
     is(scalar @$sub_cmd, 3, 'SUBSCRIBE has 2 channels');
@@ -37,7 +35,6 @@ subtest 'get_replay_commands returns correct commands' => sub {
         'SUBSCRIBE includes both channels'
     );
 
-    # Find the PSUBSCRIBE command
     my ($psub_cmd) = grep { $_->[0] eq 'PSUBSCRIBE' } @commands;
     ok($psub_cmd, 'has PSUBSCRIBE command');
     is($psub_cmd->[1], 'events.*', 'PSUBSCRIBE has correct pattern');
@@ -46,14 +43,24 @@ subtest 'get_replay_commands returns correct commands' => sub {
 subtest '_reset_connection clears in_pubsub flag' => sub {
     my $redis = Async::Redis->new(host => 'localhost');
 
-    # Simulate being in pubsub mode
     $redis->{in_pubsub} = 1;
     $redis->{connected} = 1;
-    $redis->{socket} = undef;  # no real socket
+    $redis->{socket} = undef;
 
     $redis->_reset_connection('test');
 
     is($redis->{in_pubsub}, 0, 'in_pubsub cleared after reset');
+};
+
+subtest 'on_reconnect accessor' => sub {
+    my $redis = Async::Redis->new(host => 'localhost');
+    my $sub = Async::Redis::Subscription->new(redis => $redis);
+
+    is($sub->on_reconnect, undef, 'no callback by default');
+
+    my $cb = sub { 1 };
+    $sub->on_reconnect($cb);
+    is($sub->on_reconnect, $cb, 'callback stored');
 };
 
 # --- Integration tests (require Redis) ---
@@ -67,21 +74,17 @@ SKIP: {
         run { $r->connect };
         $r;
     };
-    skip "Redis not available: $@", 5 unless $test_redis;
+    skip "Redis not available: $@", 6 unless $test_redis;
     $test_redis->disconnect;
 
-    # Timeout for each integration subtest — prevents hangs when
-    # reconnection isn't implemented yet
     my $TEST_TIMEOUT = 5;
 
-    subtest 'subscriber reconnects and resubscribes after connection drop' => sub {
-        # Publisher — separate connection
+    subtest 'subscriber reconnects and receives messages after drop' => sub {
         my $pub = Async::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
         run { $pub->connect };
 
-        # Subscriber — with reconnect enabled
         my $sub_redis = Async::Redis->new(
             host      => $ENV{REDIS_HOST} // 'localhost',
             reconnect => 1,
@@ -89,65 +92,45 @@ SKIP: {
         );
         run { $sub_redis->connect };
 
-        # Subscribe to a channel
         my $subscription = run { $sub_redis->subscribe('reconnect:test') };
         ok($subscription, 'subscribed');
-        is([$subscription->channels], ['reconnect:test'], 'tracking channel');
 
-        # Verify it works before disconnect
-        my $pre_msg_future = (async sub {
+        # Verify pre-disconnect message works
+        my $pre_future = (async sub {
             await Future::IO->sleep(0.1);
-            await $pub->publish('reconnect:test', 'before_disconnect');
+            await $pub->publish('reconnect:test', 'before');
         })->();
 
         my $msg1 = run { $subscription->next };
-        is($msg1->{data}, 'before_disconnect', 'received message before disconnect');
-        run { $pre_msg_future };
+        is($msg1->{data}, 'before', 'received message before disconnect');
+        run { $pre_future };
 
-        # Force disconnect — simulate Redis restart
+        # Force disconnect
         close $sub_redis->{socket};
         $sub_redis->{connected} = 0;
 
-        # Publish a message after disconnect (this one will be lost — expected)
-        run { $pub->publish('reconnect:test', 'during_disconnect') };
-
-        # Now try to read — this should trigger reconnect + resubscribe
-        my $post_msg_future = (async sub {
-            await Future::IO->sleep(0.3);  # give time for reconnect
-            await $pub->publish('reconnect:test', 'after_reconnect');
+        # Publish after reconnect window
+        my $post_future = (async sub {
+            await Future::IO->sleep(0.3);
+            await $pub->publish('reconnect:test', 'after');
         })->();
 
-        # First next() returns the reconnected notification
+        # next() should reconnect transparently and return real message
         my $next_f = $subscription->next;
         my $timeout_f = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
-            Future->fail("Timed out waiting for reconnect notification");
+            Future->fail("Timed out waiting for message after reconnect");
         });
-        my $notify = eval { $loop->await(Future->wait_any($next_f, $timeout_f)); $next_f->get };
-        my $error = $@;
+        my $msg2 = eval { $loop->await(Future->wait_any($next_f, $timeout_f)); $next_f->get };
 
-        if ($error) {
-            fail("got reconnected notification: $error");
+        if ($@) {
+            fail("received message after reconnect: $@");
         } else {
-            is($notify->{type}, 'reconnected', 'got reconnected notification first');
+            is($msg2->{type}, 'message', 'got real message type after reconnect');
+            is($msg2->{data}, 'after', 'correct data after reconnect');
         }
 
-        # Second next() returns the actual message
-        if (!$error) {
-            my $next_f2 = $subscription->next;
-            my $timeout_f2 = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
-                Future->fail("Timed out waiting for message after reconnect");
-            });
-            my $msg2 = eval { $loop->await(Future->wait_any($next_f2, $timeout_f2)); $next_f2->get };
-            if ($@) {
-                fail("received message after reconnect: $@");
-            } else {
-                is($msg2->{data}, 'after_reconnect', 'received message after reconnect');
-            }
-        }
+        eval { run { $post_future } };
 
-        eval { run { $post_msg_future } };
-
-        # Verify subscription state is intact
         is([$subscription->channels], ['reconnect:test'], 'still tracking channel');
         ok(!$subscription->is_closed, 'subscription not closed');
 
@@ -155,7 +138,7 @@ SKIP: {
         eval { $sub_redis->disconnect };
     };
 
-    subtest 'reconnect delivers notification message' => sub {
+    subtest 'on_reconnect callback fires on reconnect' => sub {
         my $pub = Async::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
         );
@@ -168,47 +151,44 @@ SKIP: {
         );
         run { $sub_redis->connect };
 
-        my $subscription = run { $sub_redis->subscribe('notify:test') };
+        my $subscription = run { $sub_redis->subscribe('callback:test') };
+
+        # Register callback
+        my @events;
+        $subscription->on_reconnect(sub {
+            my ($sub) = @_;
+            push @events, {
+                channels => [$sub->channels],
+                patterns => [$sub->patterns],
+            };
+        });
 
         # Force disconnect
         close $sub_redis->{socket};
         $sub_redis->{connected} = 0;
 
-        # Schedule a publish so next() eventually returns
         my $publish_future = (async sub {
             await Future::IO->sleep(0.3);
-            await $pub->publish('notify:test', 'after');
+            await $pub->publish('callback:test', 'hello');
         })->();
 
-        # First message after reconnect should be a reconnected notification
+        # next() reconnects, fires callback, returns real message
         my $next_f = $subscription->next;
         my $timeout_f = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
-            Future->fail("Timed out waiting for reconnect notification");
+            Future->fail("Timed out");
         });
         my $msg = eval { $loop->await(Future->wait_any($next_f, $timeout_f)); $next_f->get };
-        my $error = $@;
 
-        if ($error) {
-            fail("got reconnected notification: $error");
+        if ($@) {
+            fail("got message after reconnect: $@");
         } else {
-            is($msg->{type}, 'reconnected', 'got reconnected notification');
-            ok($msg->{channels}, 'notification includes channels');
+            is($msg->{type}, 'message', 'next() returns real message');
+            is($msg->{data}, 'hello', 'correct data');
         }
 
-        # Next message is the actual published message
-        if (!$error) {
-            my $next_f2 = $subscription->next;
-            my $timeout_f2 = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
-                Future->fail("Timed out waiting for message after reconnect");
-            });
-            my $msg2 = eval { $loop->await(Future->wait_any($next_f2, $timeout_f2)); $next_f2->get };
-            if ($@) {
-                fail("got real message: $@");
-            } else {
-                is($msg2->{type}, 'message', 'then got real message');
-                is($msg2->{data}, 'after', 'correct data');
-            }
-        }
+        # Verify callback fired
+        is(scalar @events, 1, 'on_reconnect callback fired once');
+        is($events[0]{channels}, ['callback:test'], 'callback received correct channels');
 
         eval { run { $publish_future } };
         eval { $pub->disconnect };
@@ -229,7 +209,9 @@ SKIP: {
         run { $sub_redis->connect };
 
         my $subscription = run { $sub_redis->psubscribe('precon:*') };
-        is([$subscription->patterns], ['precon:*'], 'tracking pattern');
+
+        my @events;
+        $subscription->on_reconnect(sub { push @events, 'reconnected' });
 
         # Force disconnect
         close $sub_redis->{socket};
@@ -240,35 +222,21 @@ SKIP: {
             await $pub->publish('precon:chan1', 'pattern_msg');
         })->();
 
-        # Should get reconnected notification first
         my $next_f = $subscription->next;
         my $timeout_f = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
-            Future->fail("Timed out waiting for reconnect notification (pattern)");
+            Future->fail("Timed out");
         });
-        my $msg1 = eval { $loop->await(Future->wait_any($next_f, $timeout_f)); $next_f->get };
-        my $error = $@;
+        my $msg = eval { $loop->await(Future->wait_any($next_f, $timeout_f)); $next_f->get };
 
-        if ($error) {
-            fail("got reconnected notification for pattern: $error");
+        if ($@) {
+            fail("got pmessage after reconnect: $@");
         } else {
-            is($msg1->{type}, 'reconnected', 'got reconnected notification for pattern');
+            is($msg->{type}, 'pmessage', 'got pmessage after reconnect');
+            is($msg->{data}, 'pattern_msg', 'correct data');
+            is($msg->{pattern}, 'precon:*', 'correct pattern');
         }
 
-        # Then the actual pattern-matched message
-        if (!$error) {
-            my $next_f2 = $subscription->next;
-            my $timeout_f2 = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
-                Future->fail("Timed out waiting for pmessage after reconnect");
-            });
-            my $msg2 = eval { $loop->await(Future->wait_any($next_f2, $timeout_f2)); $next_f2->get };
-            if ($@) {
-                fail("got pmessage after reconnect: $@");
-            } else {
-                is($msg2->{type}, 'pmessage', 'got pmessage after reconnect');
-                is($msg2->{data}, 'pattern_msg', 'correct pattern message data');
-                is($msg2->{pattern}, 'precon:*', 'correct pattern');
-            }
-        }
+        is(scalar @events, 1, 'on_reconnect fired for pattern sub');
 
         eval { run { $publish_future } };
         eval { $pub->disconnect };
@@ -288,7 +256,6 @@ SKIP: {
         );
         run { $sub_redis->connect };
 
-        # Subscribe to multiple channels
         my $subscription = run { $sub_redis->subscribe('multi:a', 'multi:b', 'multi:c') };
         is(scalar $subscription->channel_count, 3, 'subscribed to 3 channels');
 
@@ -303,36 +270,69 @@ SKIP: {
             await $pub->publish('multi:c', 'msg_c');
         })->();
 
-        # Reconnected notification
-        my $next_f = $subscription->next;
-        my $timeout_f = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
-            Future->fail("Timed out waiting for reconnect notification (multi)");
-        });
-        my $notify = eval { $loop->await(Future->wait_any($next_f, $timeout_f)); $next_f->get };
-        my $error = $@;
-
-        if ($error) {
-            fail("got reconnected notification: $error");
-        } else {
-            is($notify->{type}, 'reconnected', 'got reconnected notification');
+        # Read 3 messages — all should be real messages
+        my %received;
+        my $error;
+        for my $i (1..3) {
+            my $next_fi = $subscription->next;
+            my $timeout_fi = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
+                Future->fail("Timed out waiting for message $i");
+            });
+            my $msg = eval { $loop->await(Future->wait_any($next_fi, $timeout_fi)); $next_fi->get };
+            if ($@) { $error = $@; last }
+            $received{$msg->{channel}} = $msg->{data};
         }
 
-        # Should receive from all three channels
-        if (!$error) {
-            my %received;
-            for my $i (1..3) {
-                my $next_fi = $subscription->next;
-                my $timeout_fi = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
-                    Future->fail("Timed out waiting for message $i");
-                });
-                my $msg = eval { $loop->await(Future->wait_any($next_fi, $timeout_fi)); $next_fi->get };
-                last if $@;
-                $received{$msg->{channel}} = $msg->{data};
-            }
-
+        if ($error) {
+            fail("received all messages: $error");
+        } else {
             is($received{'multi:a'}, 'msg_a', 'received from channel a');
             is($received{'multi:b'}, 'msg_b', 'received from channel b');
             is($received{'multi:c'}, 'msg_c', 'received from channel c');
+        }
+
+        eval { run { $publish_future } };
+        eval { $pub->disconnect };
+        eval { $sub_redis->disconnect };
+    };
+
+    subtest 'no reconnect callback without registration' => sub {
+        my $pub = Async::Redis->new(
+            host => $ENV{REDIS_HOST} // 'localhost',
+        );
+        run { $pub->connect };
+
+        my $sub_redis = Async::Redis->new(
+            host      => $ENV{REDIS_HOST} // 'localhost',
+            reconnect => 1,
+            reconnect_delay => 0.1,
+        );
+        run { $sub_redis->connect };
+
+        my $subscription = run { $sub_redis->subscribe('nocb:test') };
+        # No on_reconnect callback registered
+
+        # Force disconnect
+        close $sub_redis->{socket};
+        $sub_redis->{connected} = 0;
+
+        my $publish_future = (async sub {
+            await Future::IO->sleep(0.3);
+            await $pub->publish('nocb:test', 'silent');
+        })->();
+
+        # Should still work — just no callback
+        my $next_f = $subscription->next;
+        my $timeout_f = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
+            Future->fail("Timed out");
+        });
+        my $msg = eval { $loop->await(Future->wait_any($next_f, $timeout_f)); $next_f->get };
+
+        if ($@) {
+            fail("reconnect without callback: $@");
+        } else {
+            is($msg->{type}, 'message', 'reconnect works without callback');
+            is($msg->{data}, 'silent', 'correct data');
         }
 
         eval { run { $publish_future } };
@@ -353,7 +353,6 @@ SKIP: {
         close $sub_redis->{socket};
         $sub_redis->{connected} = 0;
 
-        # next() should throw, not reconnect
         my $next_f = $subscription->next;
         my $timeout_f = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
             Future->fail("Timed out — next() should have thrown immediately");
