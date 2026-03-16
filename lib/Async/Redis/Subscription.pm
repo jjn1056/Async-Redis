@@ -352,11 +352,23 @@ Manages Redis PubSub subscriptions with async iterator pattern.
 
 =head1 MESSAGE STRUCTURE
 
+    # Regular messages
     {
         type    => 'message',      # or 'pmessage', 'smessage'
         channel => 'channel_name',
         pattern => 'pattern',      # only for pmessage
         data    => 'payload',
     }
+
+    # Reconnection notification (delivered after auto-reconnect)
+    {
+        type     => 'reconnected',
+        channels => ['chan1', 'chan2'],   # re-subscribed channels
+        patterns => ['pat:*'],           # re-subscribed patterns
+    }
+
+Messages published while the connection was down are lost (Redis pub/sub
+has no persistence). The C<reconnected> notification lets the application
+re-fetch any state it needs.
 
 =cut

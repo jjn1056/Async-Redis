@@ -1791,6 +1791,11 @@ Key features:
 
 =item * PubSub with automatic subscription replay on reconnect
 
+When a connection drops during pub/sub mode and C<reconnect> is enabled,
+all subscriptions are automatically re-established. A synthetic message
+with C<< type => 'reconnected' >> is delivered to signal that messages
+may have been lost during the outage.
+
 =item * Transaction support (MULTI/EXEC/WATCH)
 
 =item * TLS/SSL connections
