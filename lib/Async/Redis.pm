@@ -764,6 +764,37 @@ async sub _reconnect {
     }
 }
 
+# Reconnect and replay pubsub subscriptions
+async sub _reconnect_pubsub {
+    my ($self) = @_;
+
+    my $sub = $self->{_subscription}
+        or die Async::Redis::Error::Disconnected->new(
+            message => "No subscription to replay",
+        );
+
+    my @replay = $sub->get_replay_commands;
+
+    # _reset_connection already cleared in_pubsub,
+    # so _reconnect can do a normal TCP reconnect + handshake
+    await $self->_reconnect;
+
+    # Replay all subscription commands
+    for my $cmd (@replay) {
+        my ($command, @args) = @$cmd;
+
+        await $self->_send_command($command, @args);
+
+        # Read and discard subscription confirmations
+        for my $arg (@args) {
+            await $self->_read_pubsub_frame();
+        }
+    }
+
+    # Re-enter pubsub mode
+    $self->{in_pubsub} = 1;
+}
+
 # Execute a Redis command
 async sub command {
     my ($self, $cmd, @args) = @_;
