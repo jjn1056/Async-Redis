@@ -64,7 +64,7 @@ sub run (&) {
 
     # If it's a Future, await it
     if (ref($result) && $result->isa('Future')) {
-        return $result->get;
+        return _pump_until_ready($result);
     }
 
     # Otherwise return as-is
@@ -75,6 +75,18 @@ sub run (&) {
 # Usage: my $result = await_f($redis->get('key'));
 sub await_f {
     my ($f) = @_;
+    return _pump_until_ready($f);
+}
+
+# Drive the Future::IO event loop until a future resolves.
+# Handles both Future::IO futures (which have _await_once) and
+# plain Future->new objects (e.g. from AutoPipeline) that need
+# the event loop pumped externally.
+sub _pump_until_ready {
+    my ($f) = @_;
+    until ($f->is_ready) {
+        Future::IO->sleep(0)->get;
+    }
     return $f->get;
 }
 
