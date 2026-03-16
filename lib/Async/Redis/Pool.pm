@@ -42,7 +42,8 @@ sub new {
         _idle    => [],   # Available connections
         _active  => {},   # Connections in use (conn => 1)
         _waiters => [],   # Futures waiting for connection
-        _pending => [],   # Background futures (creation, cleanup)
+        _pending         => [],   # Background futures (creation, cleanup)
+        _creating        => 0,    # Connections currently being created
         _total_created   => 0,
         _total_destroyed => 0,
 
@@ -100,8 +101,9 @@ sub _clear_all_connections {
     }
     $self->{_waiters} = [];
 
-    # Clear pending futures
+    # Clear pending futures and creation counter
     $self->{_pending} = [];
+    $self->{_creating} = 0;
 }
 
 # Acquire a connection from the pool
@@ -127,10 +129,24 @@ async sub acquire {
     }
 
     # No idle connections - can we create a new one?
-    my $current_total = (scalar keys %{$self->{_active}}) + (scalar @{$self->{_idle}});
+    # Include _creating count to prevent concurrent acquires from exceeding max
+    my $current_total = (scalar keys %{$self->{_active}})
+                      + (scalar @{$self->{_idle}})
+                      + $self->{_creating};
 
     if ($current_total < $self->{max}) {
-        my $conn = await $self->_create_connection;
+        $self->{_creating}++;
+        my $conn;
+        eval {
+            $conn = await $self->_create_connection;
+        };
+        my $error = $@;
+        $self->{_creating}--;
+
+        if ($error) {
+            die $error;
+        }
+
         $self->{_active}{"$conn"} = $conn;
         return $conn;
     }
@@ -242,15 +258,20 @@ sub _destroy_connection {
 sub _maybe_create_replacement {
     my ($self) = @_;
 
-    my $current_total = (scalar keys %{$self->{_active}}) + (scalar @{$self->{_idle}});
+    my $current_total = (scalar keys %{$self->{_active}})
+                      + (scalar @{$self->{_idle}})
+                      + $self->{_creating};
 
     if ($current_total < $self->{min}) {
         # Create replacement asynchronously
+        $self->{_creating}++;
         $self->_track_pending(
             $self->_create_connection->on_done(sub {
                 my ($conn) = @_;
+                $self->{_creating}--;
                 $self->_return_to_pool($conn);
             })->on_fail(sub {
+                $self->{_creating}--;
                 # Failed to create replacement - log and continue
                 warn "Failed to create replacement connection: @_";
             })
