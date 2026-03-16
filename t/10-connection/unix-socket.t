@@ -5,11 +5,9 @@
 use strict;
 use warnings;
 use Test::Lib;
-use Test::Async::Redis qw(init_loop run);
+use Test::Async::Redis qw(run);
 use Test2::V0;
 use Async::Redis;
-
-my $loop = init_loop();
 
 # --- Unit tests (no Redis needed) ---
 

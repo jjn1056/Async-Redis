@@ -5,13 +5,11 @@
 use strict;
 use warnings;
 use Test::Lib;
-use Test::Async::Redis qw(init_loop run skip_without_redis);
+use Test::Async::Redis qw(run skip_without_redis await_f);
 use Future::AsyncAwait;
 use Test2::V0;
 use Async::Redis;
 use Future;
-
-my $loop = init_loop();
 
 # --- Unit tests (no Redis needed) ---
 
@@ -120,7 +118,7 @@ SKIP: {
         my $timeout_f = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
             Future->fail("Timed out waiting for message after reconnect");
         });
-        my $msg2 = eval { $loop->await(Future->wait_any($next_f, $timeout_f)); $next_f->get };
+        my $msg2 = eval { await_f(Future->wait_any($next_f, $timeout_f)); $next_f->get };
 
         if ($@) {
             fail("received message after reconnect: $@");
@@ -177,7 +175,7 @@ SKIP: {
         my $timeout_f = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
             Future->fail("Timed out");
         });
-        my $msg = eval { $loop->await(Future->wait_any($next_f, $timeout_f)); $next_f->get };
+        my $msg = eval { await_f(Future->wait_any($next_f, $timeout_f)); $next_f->get };
 
         if ($@) {
             fail("got message after reconnect: $@");
@@ -226,7 +224,7 @@ SKIP: {
         my $timeout_f = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
             Future->fail("Timed out");
         });
-        my $msg = eval { $loop->await(Future->wait_any($next_f, $timeout_f)); $next_f->get };
+        my $msg = eval { await_f(Future->wait_any($next_f, $timeout_f)); $next_f->get };
 
         if ($@) {
             fail("got pmessage after reconnect: $@");
@@ -278,7 +276,7 @@ SKIP: {
             my $timeout_fi = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
                 Future->fail("Timed out waiting for message $i");
             });
-            my $msg = eval { $loop->await(Future->wait_any($next_fi, $timeout_fi)); $next_fi->get };
+            my $msg = eval { await_f(Future->wait_any($next_fi, $timeout_fi)); $next_fi->get };
             if ($@) { $error = $@; last }
             $received{$msg->{channel}} = $msg->{data};
         }
@@ -326,7 +324,7 @@ SKIP: {
         my $timeout_f = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
             Future->fail("Timed out");
         });
-        my $msg = eval { $loop->await(Future->wait_any($next_f, $timeout_f)); $next_f->get };
+        my $msg = eval { await_f(Future->wait_any($next_f, $timeout_f)); $next_f->get };
 
         if ($@) {
             fail("reconnect without callback: $@");
@@ -358,7 +356,7 @@ SKIP: {
             Future->fail("Timed out — next() should have thrown immediately");
         });
         my $error;
-        eval { $loop->await(Future->wait_any($next_f, $timeout_f)); $next_f->get };
+        eval { await_f(Future->wait_any($next_f, $timeout_f)); $next_f->get };
         $error = $@;
 
         ok($error, 'error thrown when reconnect disabled');
