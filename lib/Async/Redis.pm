@@ -9,7 +9,8 @@ our $VERSION = '0.001004';
 use Future;
 use Future::AsyncAwait;
 use Future::IO 0.19;
-use Socket qw(pack_sockaddr_in inet_aton AF_INET SOCK_STREAM);
+use Socket qw(pack_sockaddr_in pack_sockaddr_un inet_aton AF_INET AF_UNIX SOCK_STREAM);
+use IO::Handle ();
 use IO::Socket::INET;
 use Time::HiRes ();
 
@@ -91,8 +92,9 @@ sub new {
     }
 
     my $self = bless {
-        host     => $args{host} // 'localhost',
-        port     => $args{port} // 6379,
+        path     => $args{path},
+        host     => $args{path} ? undef : ($args{host} // 'localhost'),
+        port     => $args{path} ? undef : ($args{port} // 6379),
         socket   => undef,
         parser   => undef,
         connected => 0,
@@ -186,24 +188,37 @@ async sub connect {
 
     return $self if $self->{connected};
 
-    # Create socket
-    my $socket = IO::Socket::INET->new(
-        Proto    => 'tcp',
-        Blocking => 0,
-    ) or die Async::Redis::Error::Connection->new(
-        message => "Cannot create socket: $!",
-        host    => $self->{host},
-        port    => $self->{port},
-    );
+    # Create socket — AF_UNIX for path, AF_INET for host:port
+    my ($socket, $sockaddr);
 
-    # Build sockaddr
-    my $addr = inet_aton($self->{host})
-        or die Async::Redis::Error::Connection->new(
-            message => "Cannot resolve host: $self->{host}",
+    if ($self->{path}) {
+        socket($socket, AF_UNIX, SOCK_STREAM, 0)
+            or die Async::Redis::Error::Connection->new(
+                message => "Cannot create unix socket: $!",
+                host    => $self->{path},
+                port    => 0,
+            );
+        IO::Handle::blocking($socket, 0);
+        $sockaddr = pack_sockaddr_un($self->{path});
+    } else {
+        $socket = IO::Socket::INET->new(
+            Proto    => 'tcp',
+            Blocking => 0,
+        ) or die Async::Redis::Error::Connection->new(
+            message => "Cannot create socket: $!",
             host    => $self->{host},
             port    => $self->{port},
         );
-    my $sockaddr = pack_sockaddr_in($self->{port}, $addr);
+
+        # Build sockaddr
+        my $addr = inet_aton($self->{host})
+            or die Async::Redis::Error::Connection->new(
+                message => "Cannot resolve host: $self->{host}",
+                host    => $self->{host},
+                port    => $self->{port},
+            );
+        $sockaddr = pack_sockaddr_in($self->{port}, $addr);
+    }
 
     # Connect with timeout using Future->wait_any
     my $connect_f = Future::IO->connect($socket, $sockaddr);
@@ -237,8 +252,8 @@ async sub connect {
         }
         die Async::Redis::Error::Connection->new(
             message => "$error",
-            host    => $self->{host},
-            port    => $self->{port},
+            host    => $self->{path} // $self->{host},
+            port    => $self->{port} // 0,
         );
     }
 
@@ -282,7 +297,8 @@ async sub connect {
     # Telemetry: record connection
     if ($self->{_telemetry}) {
         $self->{_telemetry}->record_connection(1);
-        $self->{_telemetry}->log_event('connected', "$self->{host}:$self->{port}");
+        $self->{_telemetry}->log_event('connected',
+            $self->{path} // "$self->{host}:$self->{port}");
     }
 
     return $self;
