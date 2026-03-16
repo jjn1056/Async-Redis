@@ -978,6 +978,7 @@ sub _reset_connection {
     $self->{connected} = 0;
     $self->{parser} = undef;
     $self->{_reading_responses} = 0;
+    $self->{in_pubsub} = 0;
 
     if ($was_connected && $self->{on_disconnect}) {
         $self->{on_disconnect}->($self, $reason);
