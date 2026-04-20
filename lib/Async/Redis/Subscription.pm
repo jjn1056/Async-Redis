@@ -4,6 +4,7 @@ use strict;
 use warnings;
 use 5.018;
 
+use Carp ();
 use Future;
 use Future::AsyncAwait;
 
@@ -81,6 +82,13 @@ async sub next {
     # Check if subscription is closed
     return undef if $self->{_closed};
 
+    # Exclusivity check: callback mode disables iterator mode.
+    # (The _on_message slot will be added in a later task; this check
+    # is inert until then.)
+    if ($self->{_on_message}) {
+        die "Cannot call next() on a callback-driven subscription\n";
+    }
+
     # Return buffered message if available
     if (@{$self->{_message_queue}}) {
         return shift @{$self->{_message_queue}};
@@ -122,40 +130,53 @@ async sub next {
 
         last unless $frame && ref $frame eq 'ARRAY';
 
-        my $type = $frame->[0] // '';
-
-        if ($type eq 'message') {
-            return {
-                type    => 'message',
-                channel => $frame->[1],
-                data    => $frame->[2],
-            };
-        }
-        elsif ($type eq 'pmessage') {
-            return {
-                type    => 'pmessage',
-                pattern => $frame->[1],
-                channel => $frame->[2],
-                data    => $frame->[3],
-            };
-        }
-        elsif ($type eq 'smessage') {
-            return {
-                type    => 'smessage',
-                channel => $frame->[1],
-                data    => $frame->[2],
-            };
-        }
-        elsif ($type =~ /^(un)?p?s?subscribe$/) {
-            # Subscription confirmation - continue reading
-            next;
-        }
-        else {
-            # Unknown - continue
-            next;
-        }
+        # _dispatch_frame returns a message hashref or undef for
+        # non-message frames (subscribe confirmations, etc.).
+        my $msg = $self->_dispatch_frame($frame);
+        return $msg if defined $msg;
+        # non-message frame; loop for another
     }
 
+    return undef;
+}
+
+# Convert a raw RESP pub/sub frame into a public message hashref,
+# or undef for non-message frames (subscribe confirmations, etc.).
+# Always emits `pattern => undef` on non-pmessage so consumers do
+# not need `exists $msg->{pattern}` checks.
+# Shared with the callback driver loop added in a later task.
+sub _dispatch_frame {
+    my ($self, $frame) = @_;
+    return unless $frame && ref $frame eq 'ARRAY';
+
+    my $type = $frame->[0] // '';
+
+    if ($type eq 'message') {
+        return {
+            type    => 'message',
+            channel => $frame->[1],
+            pattern => undef,
+            data    => $frame->[2],
+        };
+    }
+    elsif ($type eq 'pmessage') {
+        return {
+            type    => 'pmessage',
+            pattern => $frame->[1],
+            channel => $frame->[2],
+            data    => $frame->[3],
+        };
+    }
+    elsif ($type eq 'smessage') {
+        return {
+            type    => 'smessage',
+            channel => $frame->[1],
+            pattern => undef,
+            data    => $frame->[2],
+        };
+    }
+
+    # Subscription confirmations, unknown types — not user-visible.
     return undef;
 }
 
