@@ -22,6 +22,7 @@ sub new {
         _waiters         => [],      # Futures waiting for messages
         _on_reconnect    => undef,   # Callback for reconnect notification
         _on_message      => undef,   # Message-arrived callback (Task 3)
+        _on_error        => undef,   # Fatal-error callback (Task 3)
         _closed          => 0,
     }, $class;
 }
@@ -31,6 +32,28 @@ sub on_reconnect {
     my ($self, $cb) = @_;
     $self->{_on_reconnect} = $cb if @_ > 1;
     return $self->{_on_reconnect};
+}
+
+# Set/get message-arrived callback. Once set, next() croaks — the
+# subscription is in callback mode for the rest of its lifetime.
+# $cb->($sub, $msg) receives the Subscription and the message hashref.
+sub on_message {
+    my ($self, $cb) = @_;
+    if (@_ > 1) {
+        $self->{_on_message} = $cb;
+    }
+    return $self->{_on_message};
+}
+
+# Set/get fatal-error callback. Fires once per fatal error; default
+# (when unset) is to die so silent death is impossible.
+# $cb->($sub, $err) receives the Subscription and the error.
+sub on_error {
+    my ($self, $cb) = @_;
+    if (@_ > 1) {
+        $self->{_on_error} = $cb;
+    }
+    return $self->{_on_error};
 }
 
 # Track a channel subscription
