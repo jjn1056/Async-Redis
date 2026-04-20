@@ -21,6 +21,7 @@ sub new {
         _message_queue   => [],      # Buffer for messages
         _waiters         => [],      # Futures waiting for messages
         _on_reconnect    => undef,   # Callback for reconnect notification
+        _on_message      => undef,   # Message-arrived callback (Task 3)
         _closed          => 0,
     }, $class;
 }
@@ -83,10 +84,9 @@ async sub next {
     return undef if $self->{_closed};
 
     # Exclusivity check: callback mode disables iterator mode.
-    # (The _on_message slot will be added in a later task; this check
-    # is inert until then.)
+    # (The _on_message slot is initialized in new(); inert until Task 3.)
     if ($self->{_on_message}) {
-        die "Cannot call next() on a callback-driven subscription\n";
+        Carp::croak("Cannot call next() on a callback-driven subscription");
     }
 
     # Return buffered message if available
@@ -386,9 +386,14 @@ Manages Redis PubSub subscriptions with async iterator pattern.
     {
         type    => 'message',      # or 'pmessage', 'smessage'
         channel => 'channel_name',
-        pattern => 'pattern',      # only for pmessage
+        pattern => 'pattern',      # defined for pmessage, undef otherwise
         data    => 'payload',
     }
+
+The C<pattern> key is always present. It is defined for C<pmessage>
+frames (the matching glob pattern) and C<undef> for C<message> and
+C<smessage> frames. Consumers do not need C<exists $msg-E<gt>{pattern}>
+checks.
 
 C<next()> always returns real pub/sub messages. Reconnection is transparent.
 
