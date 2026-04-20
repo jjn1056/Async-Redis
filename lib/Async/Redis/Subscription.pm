@@ -80,7 +80,6 @@ sub channel_count {
 async sub next {
     my ($self) = @_;
 
-    # Check if subscription is closed
     return undef if $self->{_closed};
 
     # Exclusivity check: callback mode disables iterator mode.
@@ -89,55 +88,60 @@ async sub next {
         Carp::croak("Cannot call next() on a callback-driven subscription");
     }
 
-    # Return buffered message if available
     if (@{$self->{_message_queue}}) {
         return shift @{$self->{_message_queue}};
     }
 
-    # Read directly from redis
-    my $redis = $self->{redis};
-
     while (1) {
-        my $frame;
-        eval {
-            $frame = await $redis->_read_pubsub_frame();
-        };
-
-        if (my $error = $@) {
-            # Connection error — attempt reconnect if enabled
-            if ($redis->{reconnect} && $self->channel_count > 0) {
-                eval {
-                    await $redis->_reconnect_pubsub();
-                };
-                if ($@) {
-                    # Reconnect failed — propagate the original error
-                    die $error;
-                }
-
-                # Fire reconnect callback if registered
-                if ($self->{_on_reconnect}) {
-                    $self->{_on_reconnect}->($self);
-                }
-
-                # Continue reading — next iteration will read
-                # from the new connection
-                next;
-            }
-
-            # No reconnect — propagate error
-            die $error;
-        }
-
-        last unless $frame && ref $frame eq 'ARRAY';
-
-        # _dispatch_frame returns a message hashref or undef for
-        # non-message frames (subscribe confirmations, etc.).
+        my $frame = await $self->_read_frame_with_reconnect;
+        last unless $frame;
         my $msg = $self->_dispatch_frame($frame);
         return $msg if defined $msg;
         # non-message frame; loop for another
     }
 
     return undef;
+}
+
+# Read one pub/sub frame from the underlying connection. On transient
+# read error, attempt reconnect if enabled and fire on_reconnect on
+# success; on unrecoverable failure, propagate the error.
+# Returns a Future resolving to the raw frame (arrayref) or undef if
+# the connection is gone and no more frames are available.
+# Shared by next() and the callback driver loop added in a later task.
+async sub _read_frame_with_reconnect {
+    my ($self) = @_;
+    my $redis = $self->{redis};
+
+    while (1) {
+        my $frame;
+        my $ok = eval {
+            $frame = await $redis->_read_pubsub_frame;
+            1;
+        };
+
+        unless ($ok) {
+            my $error = $@;
+            if ($redis->{reconnect} && $self->channel_count > 0) {
+                my $reconnect_ok = eval {
+                    await $redis->_reconnect_pubsub;
+                    1;
+                };
+                unless ($reconnect_ok) {
+                    die $error;
+                }
+
+                if ($self->{_on_reconnect}) {
+                    $self->{_on_reconnect}->($self);
+                }
+
+                next;
+            }
+            die $error;
+        }
+
+        return $frame;
+    }
 }
 
 # Convert a raw RESP pub/sub frame into a public message hashref,
