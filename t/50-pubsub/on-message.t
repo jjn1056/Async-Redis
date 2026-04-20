@@ -96,4 +96,34 @@ subtest '_handle_fatal_error fires on_error with subscription as first arg' => s
     like($args_seen[1], qr/oops/, 'second arg is error');
 };
 
+subtest '_dispatch_frame routes to on_message when set' => sub {
+    my $redis = Async::Redis->new(host => 'localhost');
+    my $sub = Async::Redis::Subscription->new(redis => $redis);
+
+    my $seen;
+    $sub->on_message(sub { $seen = $_[1]; 'cb-return' });
+
+    my $frame = [ 'message', 'chan', 'payload' ];
+    my $result = $sub->_dispatch_frame($frame);
+
+    is($seen->{type},    'message', 'callback received type');
+    is($seen->{channel}, 'chan',    'callback received channel');
+    is($seen->{data},    'payload', 'callback received data');
+    is($seen->{pattern}, undef,     'pattern is undef on non-pmessage');
+    is($result,          'cb-return', 'dispatch returns callback result');
+};
+
+subtest '_dispatch_frame falls through to _deliver_message when no callback' => sub {
+    my $redis = Async::Redis->new(host => 'localhost');
+    my $sub = Async::Redis::Subscription->new(redis => $redis);
+
+    my $frame = [ 'message', 'chan', 'payload' ];
+    my $result = $sub->_dispatch_frame($frame);
+
+    # With no callback, the message is buffered for next() consumers
+    is(scalar @{$sub->{_message_queue}}, 1, 'message buffered in queue');
+    is($sub->{_message_queue}[0]{data}, 'payload', 'buffered message data');
+    is($result, undef, 'dispatch returns undef on fallthrough');
+};
+
 done_testing;

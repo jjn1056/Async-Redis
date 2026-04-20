@@ -156,9 +156,14 @@ async sub next {
     while (1) {
         my $frame = await $self->_read_frame_with_reconnect;
         last unless $frame;
-        my $msg = $self->_dispatch_frame($frame);
-        return $msg if defined $msg;
-        # non-message frame; loop for another
+        $self->_dispatch_frame($frame);
+        # _dispatch_frame buffers the message into _message_queue (when
+        # on_message is unset — which it must be in this branch since
+        # the exclusivity check above throws otherwise). Pull from queue.
+        if (@{$self->{_message_queue}}) {
+            return shift @{$self->{_message_queue}};
+        }
+        # Otherwise it was a non-message frame; loop for another.
     }
 
     return undef;
@@ -205,19 +210,23 @@ async sub _read_frame_with_reconnect {
     }
 }
 
-# Convert a raw RESP pub/sub frame into a public message hashref,
-# or undef for non-message frames (subscribe confirmations, etc.).
-# Always emits `pattern => undef` on non-pmessage so consumers do
-# not need `exists $msg->{pattern}` checks.
-# Shared with the callback driver loop added in a later task.
+# Convert a raw RESP pub/sub frame into a message hashref and deliver it.
+# When on_message is set (callback mode), invoke the callback via
+# _invoke_user_callback and return its result (which may be a Future
+# for consumer-side backpressure). Otherwise buffer the message via
+# _deliver_message for next()/iterator consumers and return undef.
+#
+# Non-message frames (subscribe confirmations, etc.) return undef and
+# take no action — the caller's loop will read another frame.
 sub _dispatch_frame {
     my ($self, $frame) = @_;
     return unless $frame && ref $frame eq 'ARRAY';
 
     my $type = $frame->[0] // '';
+    my $msg;
 
     if ($type eq 'message') {
-        return {
+        $msg = {
             type    => 'message',
             channel => $frame->[1],
             pattern => undef,
@@ -225,7 +234,7 @@ sub _dispatch_frame {
         };
     }
     elsif ($type eq 'pmessage') {
-        return {
+        $msg = {
             type    => 'pmessage',
             pattern => $frame->[1],
             channel => $frame->[2],
@@ -233,15 +242,22 @@ sub _dispatch_frame {
         };
     }
     elsif ($type eq 'smessage') {
-        return {
+        $msg = {
             type    => 'smessage',
             channel => $frame->[1],
             pattern => undef,
             data    => $frame->[2],
         };
     }
+    else {
+        return undef;   # non-message frame
+    }
 
-    # Subscription confirmations, unknown types — not user-visible.
+    if (my $cb = $self->{_on_message}) {
+        return $self->_invoke_user_callback($cb, $msg);
+    }
+
+    $self->_deliver_message($msg);
     return undef;
 }
 
