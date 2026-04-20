@@ -7,6 +7,27 @@ use Future::AsyncAwait;
 use Test2::V0;
 use Async::Redis;
 
+sub _with_redis (&) {
+    my ($code) = @_;
+    my $publisher = eval {
+        my $r = Async::Redis->new(
+            host => $ENV{REDIS_HOST} // 'localhost',
+            connect_timeout => 2,
+        );
+        run { $r->connect };
+        $r;
+    };
+    unless ($publisher) {
+        skip "Redis not available: $@", 1;
+        return;
+    }
+    my $subscriber = Async::Redis->new(host => $ENV{REDIS_HOST} // 'localhost');
+    run { $subscriber->connect };
+    $code->($publisher, $subscriber);
+    $subscriber->disconnect;
+    $publisher->disconnect;
+}
+
 # --- Unit tests (no Redis needed) ---
 
 subtest 'on_message accessor — set and get' => sub {
@@ -125,5 +146,41 @@ subtest '_dispatch_frame falls through to _deliver_message when no callback' => 
     is($sub->{_message_queue}[0]{data}, 'payload', 'buffered message data');
     is($result, undef, 'dispatch returns undef on fallthrough');
 };
+
+# --- Integration tests (need Redis) ---
+
+SKIP: {
+    _with_redis {
+        my ($publisher, $subscriber) = @_;
+
+        subtest 'on_message receives messages published to subscribed channels' => sub {
+            my @received;
+            my $sub = run { $subscriber->subscribe('test:onmsg:basic') };
+            $sub->on_message(sub {
+                my ($s, $msg) = @_;
+                push @received, $msg;
+            });
+
+            run {
+                (async sub {
+                    await Future::IO->sleep(0.1);
+                    for my $i (1..3) {
+                        await $publisher->publish('test:onmsg:basic', "msg-$i");
+                    }
+                    await Future::IO->sleep(0.3);
+                })->();
+            };
+
+            is(scalar @received, 3, 'received all 3 messages');
+            is($received[0]{type},    'message',          'first msg type');
+            is($received[0]{channel}, 'test:onmsg:basic', 'first msg channel');
+            is($received[0]{data},    'msg-1',            'first msg data');
+            is($received[0]{pattern}, undef,              'pattern undef for message');
+        };
+
+        # Subsequent tasks (7, 8, 9, 10) add more `subtest` blocks here,
+        # inside the same _with_redis { ... } body.
+    };
+}
 
 done_testing;

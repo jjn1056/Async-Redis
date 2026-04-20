@@ -7,8 +7,16 @@ use 5.018;
 use Carp ();
 use Future;
 use Future::AsyncAwait;
+use Future::IO;
+use Scalar::Util ();
 
 our $VERSION = '0.001';
+
+# Synchronous recursion depth for the callback driver loop. See
+# _start_driver. Package-level so local() can scope it dynamically —
+# local() cannot be applied to lexicals.
+our $SYNC_DEPTH = 0;
+use constant MAX_SYNC_DEPTH => 32;
 
 sub new {
     my ($class, %args) = @_;
@@ -23,6 +31,8 @@ sub new {
         _on_reconnect    => undef,   # Callback for reconnect notification
         _on_message      => undef,   # Message-arrived callback (Task 3)
         _on_error        => undef,   # Fatal-error callback (Task 3)
+        _driver_step     => undef,   # Running driver loop closure (callback mode)
+        _current_read    => undef,   # Strong ref to in-flight read Future (F::AA GC pin)
         _closed          => 0,
     }, $class;
 }
@@ -41,6 +51,9 @@ sub on_message {
     my ($self, $cb) = @_;
     if (@_ > 1) {
         $self->{_on_message} = $cb;
+        # If the subscription already has channels and is open, start
+        # the driver. If not, it'll be started when channels are added.
+        $self->_start_driver if $cb;
     }
     return $self->{_on_message};
 }
@@ -98,16 +111,19 @@ sub _handle_fatal_error {
 sub _add_channel {
     my ($self, $channel) = @_;
     $self->{channels}{$channel} = 1;
+    $self->_start_driver;
 }
 
 sub _add_pattern {
     my ($self, $pattern) = @_;
     $self->{patterns}{$pattern} = 1;
+    $self->_start_driver;
 }
 
 sub _add_sharded_channel {
     my ($self, $channel) = @_;
     $self->{sharded_channels}{$channel} = 1;
+    $self->_start_driver;
 }
 
 sub _remove_channel {
@@ -259,6 +275,64 @@ sub _dispatch_frame {
 
     $self->_deliver_message($msg);
     return undef;
+}
+
+# Start the callback driver loop if not already running. Idempotent.
+# Runs while: on_message is set AND channel_count > 0 AND !_closed.
+# Uses weak refs on $self and $step to break cycles so DESTROY fires
+# promptly when external refs drop. Uses local($SYNC_DEPTH) to bound
+# synchronous recursion depth when on_done fires synchronously (as
+# it does when the underlying read buffer has multiple frames ready);
+# past MAX_SYNC_DEPTH iterations, yields to the loop via Future::IO->later.
+sub _start_driver {
+    my ($self) = @_;
+    return if $self->{_driver_step};
+    return unless $self->{_on_message};
+    return if $self->{_closed};
+    return unless $self->channel_count > 0;
+
+    Scalar::Util::weaken(my $weak = $self);
+
+    my $step;
+    my $weak_step;
+    $step = sub {
+        return unless $weak && !$weak->{_closed};
+
+        # Trampoline: once 32 synchronous iterations deep, yield to the
+        # loop. Prevents stack overflow when a single TCP recv delivers
+        # many buffered frames whose Futures are already ready.
+        if ($SYNC_DEPTH >= MAX_SYNC_DEPTH) {
+            Future::IO->later(sub {
+                $weak_step->() if $weak_step && $weak && !$weak->{_closed};
+            });
+            return;
+        }
+        local $SYNC_DEPTH = $SYNC_DEPTH + 1;
+
+        # Keep a strong ref to the in-flight read Future on the
+        # subscription so the async sub behind _read_frame_with_reconnect
+        # isn't GC'd mid-suspension (F::AA's "lost returning future").
+        my $f = $weak->{_current_read} = $weak->_read_frame_with_reconnect;
+
+        $f->on_done(sub {
+            return unless $weak && !$weak->{_closed};
+            $weak->{_current_read} = undef;
+            $weak->_dispatch_frame($_[0]);
+            $weak_step->() if $weak_step && $weak && !$weak->{_closed};
+        });
+
+        $f->on_fail(sub {
+            return unless $weak;
+            $weak->{_current_read} = undef;
+            $weak->_handle_fatal_error($_[0]);
+        });
+    };
+
+    Scalar::Util::weaken($weak_step = $step);
+
+    $self->{_driver_step} = $step;
+    $step->();
+    return;
 }
 
 # Backward-compatible wrapper
@@ -416,6 +490,11 @@ sub _close {
         $waiter->done(undef) unless $waiter->is_ready;
     }
     $self->{_waiters} = [];
+
+    # Release the driver closure — weak ref cycle is already broken
+    # via weaken, but explicitly clearing frees immediately.
+    $self->{_driver_step} = undef;
+    $self->{_current_read} = undef;
 }
 
 sub is_closed { shift->{_closed} }
