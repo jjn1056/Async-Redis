@@ -56,6 +56,44 @@ sub on_error {
     return $self->{_on_error};
 }
 
+# Invoke a user-supplied callback with the standard exception-handling
+# policy: save/restore $@, use eval-and-check-boolean idiom to survive
+# DESTROY side effects, and route die to the fatal-error handler.
+# Returns the callback's return value (which may be a Future — used
+# for consumer-side backpressure in the driver loop added later).
+sub _invoke_user_callback {
+    my ($self, $cb, $msg) = @_;
+    local $@;
+    my $result;
+    my $ok = eval {
+        $result = $cb->($self, $msg);
+        1;
+    };
+    unless ($ok) {
+        my $err = $@ // 'unknown error';
+        $self->_handle_fatal_error("on_message callback died: $err");
+        return undef;
+    }
+    return $result;
+}
+
+# Single chokepoint for fatal errors from either the read loop or the
+# callback path. Closes the subscription, fires on_error if registered,
+# and dies loudly if not. Loud-by-default prevents silent zombies.
+sub _handle_fatal_error {
+    my ($self, $err) = @_;
+    $self->_close;
+    if (my $cb = $self->{_on_error}) {
+        local $@;
+        my $ok = eval { $cb->($self, $err); 1 };
+        unless ($ok) {
+            Carp::carp("on_error callback died: " . ($@ // 'unknown error'));
+        }
+        return;
+    }
+    die $err;
+}
+
 # Track a channel subscription
 sub _add_channel {
     my ($self, $channel) = @_;
