@@ -324,6 +324,97 @@ SKIP: {
 
             $subscriber->disconnect;
         };
+
+        subtest 'psubscribe delivers pmessage with pattern populated' => sub {
+            my $subscriber = _make_subscriber();
+            my @received;
+            my $sub = $subscriber->psubscribe('test:onmsg:pat:*')->get;
+            $sub->on_message(sub {
+                my ($s, $msg) = @_;
+                push @received, $msg;
+            });
+
+            $publisher->publish('test:onmsg:pat:alpha', 'a')->get;
+            $publisher->publish('test:onmsg:pat:beta',  'b')->get;
+            Future::IO->sleep(0.3)->get;
+
+            is(scalar @received, 2, 'received both pattern-matched messages');
+            is($received[0]{type},    'pmessage',              'type is pmessage');
+            is($received[0]{pattern}, 'test:onmsg:pat:*',      'pattern is populated');
+            is($received[0]{channel}, 'test:onmsg:pat:alpha',  'channel is the matched one');
+            is($received[0]{data},    'a',                     'data correct');
+
+            $subscriber->disconnect;
+        };
+
+        subtest 'on_reconnect fires before post-reconnect on_message' => sub {
+            # Reconnect-enabled subscriber
+            my $subscriber = Async::Redis->new(
+                host      => $ENV{REDIS_HOST} // 'localhost',
+                reconnect => 1,
+            );
+            $subscriber->connect->get;
+            my $sub = $subscriber->subscribe('test:onmsg:reconn')->get;
+
+            my @events;
+            $sub->on_reconnect(sub { push @events, 'reconnect' });
+            $sub->on_message(sub {
+                my ($s, $msg) = @_;
+                push @events, "message:$msg->{data}";
+            });
+
+            # Pre-reconnect message
+            $publisher->publish('test:onmsg:reconn', 'before')->get;
+            Future::IO->sleep(0.2)->get;
+
+            # Force a disconnect. CLIENT KILL TYPE pubsub disconnects the
+            # subscriber side; the reconnect logic in _read_frame_with_reconnect
+            # will re-establish and replay subscriptions.
+            eval { $publisher->client('KILL', 'TYPE', 'pubsub')->get };
+            Future::IO->sleep(0.4)->get;
+
+            # Post-reconnect message
+            $publisher->publish('test:onmsg:reconn', 'after')->get;
+            Future::IO->sleep(0.4)->get;
+
+            # Expect: message:before, reconnect, message:after (order)
+            is($events[0], 'message:before', 'first event is pre-reconnect message');
+            my $reconnect_idx = -1;
+            my $after_idx     = -1;
+            for my $i (0..$#events) {
+                $reconnect_idx = $i if $events[$i] eq 'reconnect';
+                $after_idx     = $i if $events[$i] eq 'message:after';
+            }
+            ok($reconnect_idx >= 0,            'on_reconnect fired at some point');
+            ok($after_idx > $reconnect_idx,    'on_message(after) fired after on_reconnect');
+
+            eval { $subscriber->disconnect };
+        };
+
+        subtest 'fatal error (reconnect disabled) fires on_error and closes subscription' => sub {
+            my $subscriber = Async::Redis->new(
+                host      => $ENV{REDIS_HOST} // 'localhost',
+                reconnect => 0,
+            );
+            $subscriber->connect->get;
+            my $sub = $subscriber->subscribe('test:onmsg:fatal')->get;
+
+            my $err_seen;
+            $sub->on_error(sub {
+                my ($s, $err) = @_;
+                $err_seen = $err;
+            });
+            $sub->on_message(sub { });   # a callback so the driver runs
+
+            # Kill the subscriber's connection
+            eval { $publisher->client('KILL', 'TYPE', 'pubsub')->get };
+            Future::IO->sleep(0.4)->get;
+
+            ok($err_seen,              'on_error fired with an error');
+            ok($sub->is_closed,        'subscription closed after fatal error');
+
+            eval { $subscriber->disconnect };
+        };
     };
 }
 
