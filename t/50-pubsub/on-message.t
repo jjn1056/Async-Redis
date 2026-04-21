@@ -268,8 +268,62 @@ SKIP: {
             $subscriber->disconnect;
         };
 
-        # Subsequent tasks (8, 9, 10) add more `subtest` blocks here,
-        # inside the same _with_redis { ... } body.
+        subtest 'subscribe from inside callback takes effect' => sub {
+            my $subscriber = _make_subscriber();
+            my @received;
+            my $sub = $subscriber->subscribe('test:onmsg:reent:primary')->get;
+            $sub->on_message(sub {
+                my ($s, $msg) = @_;
+                push @received, $msg;
+                # First message triggers a subscribe to a second channel.
+                if ($msg->{channel} eq 'test:onmsg:reent:primary' && @received == 1) {
+                    $s->{redis}->subscribe('test:onmsg:reent:secondary')->retain;
+                }
+            });
+
+            $publisher->publish('test:onmsg:reent:primary', 'p-1')->get;
+            Future::IO->sleep(0.2)->get;
+            $publisher->publish('test:onmsg:reent:secondary', 's-1')->get;
+            Future::IO->sleep(0.3)->get;
+
+            ok(scalar @received >= 2, 'received at least 2 messages');
+            ok((grep { $_->{channel} eq 'test:onmsg:reent:secondary' } @received),
+                'received message from channel subscribed inside callback');
+
+            $subscriber->disconnect;
+        };
+
+        subtest 'handler swap inside callback uses new handler for next frame' => sub {
+            my $subscriber = _make_subscriber();
+            my @received_by_a;
+            my @received_by_b;
+            my $sub = $subscriber->subscribe('test:onmsg:swap')->get;
+
+            my $handler_b = sub {
+                my ($s, $msg) = @_;
+                push @received_by_b, $msg->{data};
+            };
+            my $handler_a = sub {
+                my ($s, $msg) = @_;
+                push @received_by_a, $msg->{data};
+                # Swap handler mid-stream
+                $s->on_message($handler_b);
+            };
+            $sub->on_message($handler_a);
+
+            for my $i (1..3) {
+                $publisher->publish('test:onmsg:swap', "m-$i")->get;
+            }
+            Future::IO->sleep(0.3)->get;
+
+            is(scalar @received_by_a, 1, 'handler A received exactly one message');
+            is($received_by_a[0], 'm-1', 'handler A got first message');
+            is(scalar @received_by_b, 2, 'handler B received the next two');
+            is($received_by_b[0], 'm-2', 'handler B got second message');
+            is($received_by_b[1], 'm-3', 'handler B got third message');
+
+            $subscriber->disconnect;
+        };
     };
 }
 
