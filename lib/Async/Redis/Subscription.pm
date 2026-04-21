@@ -324,8 +324,25 @@ sub _start_driver {
         $f->on_done(sub {
             return unless $weak && !$weak->{_closed};
             $weak->{_current_read} = undef;
-            $weak->_dispatch_frame($_[0]);
-            $weak_step->() if $weak_step && $weak && !$weak->{_closed};
+            my $cb_result = $weak->_dispatch_frame($_[0]);
+            if (Scalar::Util::blessed($cb_result) && $cb_result->isa('Future')) {
+                # Consumer-opted backpressure: wait for their Future
+                # before reading the next frame. Failures route to
+                # on_error (same path as a raised callback exception).
+                $cb_result->on_ready(sub {
+                    return unless $weak && !$weak->{_closed};
+                    my $res = shift;
+                    if ($res->is_failed) {
+                        $weak->_handle_fatal_error(
+                            "on_message callback Future failed: " . $res->failure
+                        );
+                        return;
+                    }
+                    $weak_step->() if $weak_step && $weak && !$weak->{_closed};
+                });
+            } else {
+                $weak_step->() if $weak_step && $weak && !$weak->{_closed};
+            }
         });
 
         $f->on_fail(sub {
