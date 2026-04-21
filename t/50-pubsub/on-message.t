@@ -207,6 +207,31 @@ SKIP: {
             $subscriber->disconnect;
         };
 
+        subtest 'no F::AA "lost its returning future" warning from fire-and-forget use' => sub {
+            # Placed BEFORE the CLIENT KILL subtests so Redis's client
+            # state is still clean.
+            my @warnings;
+            local $SIG{__WARN__} = sub { push @warnings, @_ };
+
+            {
+                my $subscriber = _make_subscriber();
+                my $sub = $subscriber->subscribe('test:onmsg:no-warn')->get;
+                $sub->on_message(sub { });
+
+                $publisher->publish('test:onmsg:no-warn', 'x')->get;
+                Future::IO->sleep(0.3)->get;
+
+                $subscriber->disconnect;
+            }
+            # Give deferred GC/event-loop callbacks a chance to fire.
+            Future::IO->sleep(0.1)->get;
+
+            my @faa_warnings = grep { /lost.+returning future/i } @warnings;
+            is(scalar @faa_warnings, 0,
+                'no "lost its returning future" warnings from on_message path')
+                or note("warnings captured: @warnings");
+        };
+
         # Full end-to-end backpressure timing is flaky in this test
         # harness because the synchronous-callback path is extremely
         # tight — messages are dispatched as soon as frames arrive,
@@ -415,6 +440,7 @@ SKIP: {
 
             eval { $subscriber->disconnect };
         };
+
     };
 }
 
