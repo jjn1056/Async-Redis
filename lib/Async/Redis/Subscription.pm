@@ -50,6 +50,12 @@ sub on_reconnect {
 sub on_message {
     my ($self, $cb) = @_;
     if (@_ > 1) {
+        if (!$cb && $self->{_on_message}) {
+            Carp::croak(
+                "on_message is sticky; cannot clear once set "
+              . "(construct a new Subscription for iterator mode)"
+            );
+        }
         $self->{_on_message} = $cb;
         # If the subscription already has channels and is open, start
         # the driver. If not, it'll be started when channels are added.
@@ -72,8 +78,9 @@ sub on_error {
 # Invoke a user-supplied callback with the standard exception-handling
 # policy: save/restore $@, use eval-and-check-boolean idiom to survive
 # DESTROY side effects, and route die to the fatal-error handler.
-# Returns the callback's return value (which may be a Future — used
-# for consumer-side backpressure in the driver loop added later).
+# Returns the callback's return value. Task 7 wires backpressure: if
+# the return is a Future the driver will await it before the next
+# read. Task 6's driver does not yet consume the return value.
 sub _invoke_user_callback {
     my ($self, $cb, $msg) = @_;
     local $@;
@@ -491,10 +498,13 @@ sub _close {
     }
     $self->{_waiters} = [];
 
-    # Release the driver closure — weak ref cycle is already broken
-    # via weaken, but explicitly clearing frees immediately.
+    # Release the driver closure; weak refs already broke the cycle,
+    # so this is hygienic rather than required for GC.
+    # Do NOT clear _current_read — the in-flight read Future must stay
+    # pinned until it resolves, or F::AA will warn "lost its returning
+    # future". on_done/on_fail will clear it when the read completes
+    # and will see _closed first so they won't re-enter the driver.
     $self->{_driver_step} = undef;
-    $self->{_current_read} = undef;
 }
 
 sub is_closed { shift->{_closed} }
