@@ -379,6 +379,13 @@ SKIP: {
                 reconnect => 1,
             );
             $subscriber->connect->get;
+
+            # Capture the subscriber's client ID BEFORE subscribing —
+            # CLIENT commands are not allowed once the connection is
+            # in pub/sub mode. We'll use the ID later for a targeted
+            # kill from the publisher.
+            my $sub_client_id = $subscriber->client('ID')->get;
+
             my $sub = $subscriber->subscribe('test:onmsg:reconn')->get;
 
             my @events;
@@ -392,10 +399,10 @@ SKIP: {
             $publisher->publish('test:onmsg:reconn', 'before')->get;
             Future::IO->sleep(0.2)->get;
 
-            # Force a disconnect. CLIENT KILL TYPE pubsub disconnects the
-            # subscriber side; the reconnect logic in _read_frame_with_reconnect
-            # will re-establish and replay subscriptions.
-            eval { $publisher->client('KILL', 'TYPE', 'pubsub')->get };
+            # Force a targeted disconnect via the captured client ID.
+            # The reconnect logic in _read_frame_with_reconnect will
+            # re-establish and replay subscriptions.
+            eval { $publisher->client('KILL', 'ID', $sub_client_id)->get };
             Future::IO->sleep(0.4)->get;
 
             # Post-reconnect message
@@ -422,6 +429,11 @@ SKIP: {
                 reconnect => 0,
             );
             $subscriber->connect->get;
+
+            # Capture the client ID BEFORE subscribing — CLIENT commands
+            # are not allowed once the connection is in pub/sub mode.
+            my $sub_client_id = $subscriber->client('ID')->get;
+
             my $sub = $subscriber->subscribe('test:onmsg:fatal')->get;
 
             my $err_seen;
@@ -431,8 +443,10 @@ SKIP: {
             });
             $sub->on_message(sub { });   # a callback so the driver runs
 
-            # Kill the subscriber's connection
-            eval { $publisher->client('KILL', 'TYPE', 'pubsub')->get };
+            # Kill only the subscriber's own connection by ID (not all
+            # pubsub clients globally — that would collateral-damage
+            # parallel tests sharing the Redis instance).
+            eval { $publisher->client('KILL', 'ID', $sub_client_id)->get };
             Future::IO->sleep(0.4)->get;
 
             ok($err_seen,              'on_error fired with an error');
