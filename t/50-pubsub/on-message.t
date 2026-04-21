@@ -178,24 +178,25 @@ SKIP: {
     _with_redis {
         my ($publisher) = @_;
 
+        # Integration tests bypass the run{} helper's busy-poll pump
+        # because it interacts badly with the driver's on_done
+        # callbacks (pumping via Future::IO->sleep(0)->get corrupts
+        # internal state when the driver fires a failed-Future →
+        # on_error → _close sequence). Direct ->get works reliably.
+
         subtest 'on_message receives messages published to subscribed channels' => sub {
             my $subscriber = _make_subscriber();
             my @received;
-            my $sub = run { $subscriber->subscribe('test:onmsg:basic') };
+            my $sub = $subscriber->subscribe('test:onmsg:basic')->get;
             $sub->on_message(sub {
                 my ($s, $msg) = @_;
                 push @received, $msg;
             });
 
-            run {
-                (async sub {
-                    await Future::IO->sleep(0.1);
-                    for my $i (1..3) {
-                        await $publisher->publish('test:onmsg:basic', "msg-$i");
-                    }
-                    await Future::IO->sleep(0.3);
-                })->();
-            };
+            for my $i (1..3) {
+                $publisher->publish('test:onmsg:basic', "msg-$i")->get;
+            }
+            Future::IO->sleep(0.3)->get;
 
             is(scalar @received, 3, 'received all 3 messages');
             is($received[0]{type},    'message',          'first msg type');
@@ -215,14 +216,57 @@ SKIP: {
         # integration test. The end-to-end timing test is documented
         # as a known gap pending a deterministic sync primitive.
 
-        # Failed-Future → on_error integration test pending investigation.
-        # The backpressure routing logic is covered by the unit test
-        # "_dispatch_frame returns Future when callback returns Future"
-        # above. An end-to-end integration test currently hits "Connection
-        # closed by server" against live Redis in this harness — the
-        # exact cause is not yet isolated (may be test-ordering
-        # state pollution between the driver's fatal-close path and the
-        # next publish). Tracked as follow-up.
+        subtest 'callback returning a failed Future routes to on_error' => sub {
+            # Fresh publisher too — the shared one can linger in a
+            # state that interacts oddly with the fatal-close sequence.
+            my $pub = _make_publisher();
+            my $subscriber = _make_subscriber();
+            my $err_seen;
+            my $sub = $subscriber->subscribe('test:onmsg:future-fail')->get;
+            $sub->on_error(sub {
+                my ($s, $err) = @_;
+                $err_seen = $err;
+            });
+            $sub->on_message(sub {
+                return Future->fail("callback-future-boom");
+            });
+
+            $pub->publish('test:onmsg:future-fail', 'x')->get;
+            Future::IO->sleep(0.3)->get;
+
+            like($err_seen, qr/callback-future-boom/, 'on_error fired with callback Future failure');
+            ok($sub->is_closed, 'subscription closed after fatal error');
+            eval { $subscriber->disconnect };
+            eval { $pub->disconnect };
+        };
+
+        subtest 'callback returning a Future delays next read until it resolves' => sub {
+            my $subscriber = _make_subscriber();
+            my @received;
+            my $gate = Future->new;
+            my $sub = $subscriber->subscribe('test:onmsg:backpressure')->get;
+            $sub->on_message(sub {
+                my ($s, $msg) = @_;
+                push @received, $msg->{data};
+                # First message blocks on the gate; subsequent return
+                # undef so the driver can drain.
+                return @received == 1 ? $gate : undef;
+            });
+
+            for my $i (1..3) {
+                $publisher->publish('test:onmsg:backpressure', "msg-$i")->get;
+            }
+            Future::IO->sleep(0.3)->get;
+
+            is(scalar @received, 1, 'driver delivered 1 message then blocked on Future');
+            is($received[0], 'msg-1', 'first message delivered');
+
+            $gate->done;
+            Future::IO->sleep(0.3)->get;
+            is(scalar @received, 3, 'remaining messages delivered after gate released');
+
+            $subscriber->disconnect;
+        };
 
         # Subsequent tasks (8, 9, 10) add more `subtest` blocks here,
         # inside the same _with_redis { ... } body.

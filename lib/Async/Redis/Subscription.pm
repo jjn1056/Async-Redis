@@ -348,6 +348,11 @@ sub _start_driver {
         $f->on_fail(sub {
             return unless $weak;
             $weak->{_current_read} = undef;
+            # If the user closed the subscription (or the underlying
+            # client disconnected) while a read was in flight, a
+            # "Connection closed by server" failure is expected, not
+            # fatal. Short-circuit so we don't die through _handle_fatal_error.
+            return if $weak->{_closed};
             $weak->_handle_fatal_error($_[0]);
         });
     };

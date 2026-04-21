@@ -372,6 +372,13 @@ sub disconnect {
 
     my $was_connected = $self->{connected};
 
+    # Notify any active pub/sub subscription that we're disconnecting
+    # cleanly, so its driver's on_fail on the in-flight read treats the
+    # EOF as expected rather than firing on_error / dying.
+    if ($self->{_subscription} && !$self->{_subscription}->is_closed) {
+        $self->{_subscription}->_close;
+    }
+
     # Cancel any active read future BEFORE closing socket
     # This ensures Future::IO unregisters its watcher while fileno is still valid
     if ($self->{_current_read_future} && !$self->{_current_read_future}->is_ready) {
