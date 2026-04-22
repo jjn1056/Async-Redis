@@ -1102,6 +1102,72 @@ sub _reset_connection {
     }
 }
 
+# Async write lock. The lock is a Future that resolves when the current
+# holder releases. Waiters chain onto it; each waiter replaces the slot
+# with its own Future before returning to the caller.
+async sub _acquire_write_lock {
+    my ($self) = @_;
+
+    # Wait out any in-progress fatal. _reader_fatal is synchronous so this
+    # is typically immediate, but a callback inside fatal could yield.
+    # NOTE: this is a poll loop (sleep(0) per tick). Acceptable because
+    # _reader_fatal's transition is synchronous; if teardown ever becomes
+    # async, replace with a one-shot Future waiters can await on.
+    while ($self->{_fatal_in_progress}) {
+        await Future::IO->sleep(0);
+    }
+
+    # Chain onto the existing lock Future if any.
+    while (my $prev = $self->{_write_lock}) {
+        await $prev;
+    }
+
+    # We are the owner now. Install our own Future so the next caller
+    # waits on us.
+    $self->{_write_lock} = Future->new;
+    return;
+}
+
+sub _release_write_lock {
+    my ($self) = @_;
+    my $f = delete $self->{_write_lock};
+    $f->done if $f && !$f->is_ready;
+}
+
+# Wrap a body in gate acquire/release with guaranteed release even if the
+# body dies. On body failure, calls _reader_fatal with a transport error.
+async sub _with_write_gate {
+    my ($self, $body) = @_;
+    await $self->_acquire_write_lock;
+    my $ok = eval { await $body->(); 1 };
+    my $err = $@;
+    $self->_release_write_lock;
+    if (!$ok) {
+        # Convert to a typed transport error if not already.
+        my $typed = (ref $err && eval { $err->isa('Async::Redis::Error') })
+            ? $err
+            : Async::Redis::Error::Connection->new(
+                message => "Write failed: $err",
+                host    => $self->{host},
+                port    => $self->{port},
+            );
+        $self->_reader_fatal($typed);
+        die $typed;
+    }
+    return;
+}
+
+# Temporary shim until Task 5 installs the full detach-first helper.
+# Calls the existing _reset_connection; this does NOT preserve typed
+# errors (inflight futures get cancelled, losing the typed error), but
+# that's fine for now because no code calls _reader_fatal yet except
+# _with_write_gate's error path, which immediately rethrows the typed
+# error to the caller.
+sub _reader_fatal {
+    my ($self, $typed_error) = @_;   # $typed_error unused in shim; Task 5 installs the full helper
+    $self->_reset_connection('fatal');
+}
+
 # Decode Protocol::Redis response to Perl value
 sub _decode_response {
     my ($self, $msg) = @_;
