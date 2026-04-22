@@ -9,6 +9,7 @@ our $VERSION = '0.001008';
 use Future;
 use Future::AsyncAwait;
 use Future::IO 0.19;
+use Scalar::Util qw(blessed);
 use Socket qw(pack_sockaddr_in pack_sockaddr_un inet_aton AF_INET AF_UNIX SOCK_STREAM);
 use IO::Handle ();
 use IO::Socket::INET;
@@ -554,15 +555,19 @@ async sub _send {
     return length($data);
 }
 
-# Add command to inflight queue - returns queue depth
+# Add command to inflight queue - returns queue depth.
+# redis_error_policy: 'fail' (default) fails the future on -ERR frames;
+# 'capture' calls ->done($err_obj) so callers can inspect per-slot errors
+# (used by pipelining in Task N+).
 sub _add_inflight {
-    my ($self, $future, $cmd, $args, $deadline) = @_;
+    my ($self, $future, $cmd, $args, $deadline, $redis_error_policy) = @_;
     push @{$self->{inflight}}, {
-        future   => $future,
-        cmd      => $cmd,
-        args     => $args,
-        deadline => $deadline,
-        sent_at  => Time::HiRes::time(),
+        future      => $future,
+        cmd         => $cmd,
+        args        => $args,
+        deadline    => $deadline,
+        redis_error => $redis_error_policy // 'fail',
+        sent_at     => Time::HiRes::time(),
     };
     return scalar @{$self->{inflight}};
 }
@@ -583,60 +588,143 @@ sub _fail_all_inflight {
     }
 }
 
-# Ensure response reader is running - the core response queue mechanism
-# Only one reader should be active at a time, processing responses in FIFO order
-async sub _ensure_response_reader {
+# The single socket reader. Runs while there is work (inflight or pubsub).
+# Calls _reader_fatal on any stream-alignment failure. _reader_future is
+# cleared on every exit path so _ensure_reader can restart it on the next
+# submission.
+async sub _run_reader {
     my ($self) = @_;
 
-    # Already reading - don't start another reader
-    return if $self->{_reading_responses};
+    while (1) {
+        # Exit conditions.
+        return unless $self->{_socket_live};
+        last if !$self->{in_pubsub} && !@{$self->{inflight}};
+        last if $self->{in_pubsub} && !$self->{_subscription};
 
-    $self->{_reading_responses} = 1;
+        my $head = $self->{inflight}[0];
+        my $deadline = $head ? $head->{deadline} : undef;
 
-    while (@{$self->{inflight}} && $self->{connected}) {
-        my $entry = $self->{inflight}[0];
+        # Set up read future; track so _reader_fatal can cancel it.
+        my $read_f = Future::IO->read($self->{socket}, 65536);
+        $self->{_current_read_future} = $read_f;
 
-        # Read response with deadline from the entry
-        my $response;
-        my $read_ok = eval {
-            $response = await $self->_read_response_with_deadline(
-                $entry->{deadline},
-                $entry->{args}
+        my ($returned_f, $timed_out) = await _await_with_deadline($read_f, $deadline);
+
+        # Clear slot on success path; fatal clears it on timeout/cancel.
+        $self->{_current_read_future} = undef
+            if !$timed_out && $returned_f->is_ready && !$returned_f->is_failed;
+
+        if ($timed_out) {
+            my $err = Async::Redis::Error::Timeout->new(
+                message        => "Request timed out",
+                command        => $head ? $head->{args} : undef,
+                timeout        => $self->{request_timeout},
+                maybe_executed => 1,
             );
-            1;
-        };
-
-        if (!$read_ok) {
-            my $read_error = $@;
-            # Connection/timeout error - fail all inflight and abort
-            $self->_fail_all_inflight($read_error);
-            $self->{_reading_responses} = 0;
+            $self->_reader_fatal($err);
             return;
         }
 
-        # Remove this entry from the queue now that we have its response
-        $self->_shift_inflight;
+        if ($returned_f->is_failed) {
+            my ($rerr) = $returned_f->failure;
+            my $err = Async::Redis::Error::Connection->new(
+                message => "Socket read failed: $rerr",
+                host    => $self->{host},
+                port    => $self->{port},
+            );
+            $self->_reader_fatal($err);
+            return;
+        }
 
-        # Decode response (sync operation, eval works fine here)
-        my $result;
-        my $decode_ok = eval {
-            $result = $self->_decode_response($response);
-            1;
-        };
+        my $buf = $returned_f->get;
+        if (!defined $buf || length($buf) == 0) {
+            my $err = Async::Redis::Error::Connection->new(
+                message => "Connection closed by peer",
+                host    => $self->{host},
+                port    => $self->{port},
+            );
+            $self->_reader_fatal($err);
+            return;
+        }
 
-        # Complete the future
-        if (!$decode_ok) {
-            my $decode_error = $@;
-            # Redis error (like WRONGTYPE) - fail just this future
-            $entry->{future}->fail($decode_error) unless $entry->{future}->is_ready;
-        } else {
-            # Success - complete the future with result
-            $entry->{future}->done($result) unless $entry->{future}->is_ready;
+        $self->{parser}->parse($buf);
+
+        # Drain all complete messages the parser has.
+        while (my $msg = $self->{parser}->get_message) {
+            my ($kind, $value) = $self->_decode_response_result($msg);
+
+            if ($kind eq 'protocol_error') {
+                $self->_reader_fatal($value);
+                return;
+            }
+
+            my $is_pubsub_message = 0;
+            if ($self->{in_pubsub} && $kind eq 'ok' && ref($value) eq 'ARRAY') {
+                my $frame_name = $value->[0] // '';
+                $is_pubsub_message = 1
+                    if $frame_name eq 'message'
+                    || $frame_name eq 'pmessage'
+                    || $frame_name eq 'smessage';
+            }
+
+            if ($is_pubsub_message) {
+                my $sub = $self->{_subscription};
+                if (!$sub) {
+                    # No active subscription but got a message frame: strict desync.
+                    $self->_reader_fatal(
+                        Async::Redis::Error::Protocol->new(
+                            message => "message frame but no active subscription",
+                        )
+                    );
+                    return;
+                }
+                # _dispatch_frame is sync today (returns undef) and will become
+                # async in Task 15 (returning a Future for backpressure). Await
+                # only if we got a Future back.
+                my $dispatch_result = $sub->_dispatch_frame($value);
+                if (blessed($dispatch_result) && $dispatch_result->isa('Future')) {
+                    await $dispatch_result;
+                }
+                next;
+            }
+
+            if (!@{$self->{inflight}}) {
+                # Strict: unexpected frame with empty inflight = desync.
+                $self->_reader_fatal(
+                    Async::Redis::Error::Protocol->new(
+                        message => "unexpected frame (kind=$kind) with empty inflight",
+                    )
+                );
+                return;
+            }
+
+            my $entry = shift @{$self->{inflight}};
+            if ($kind eq 'redis_error') {
+                if (($entry->{redis_error} // 'fail') eq 'capture') {
+                    $entry->{future}->done($value) unless $entry->{future}->is_ready;
+                } else {
+                    $entry->{future}->fail($value) unless $entry->{future}->is_ready;
+                }
+            } else {
+                $entry->{future}->done($value) unless $entry->{future}->is_ready;
+            }
         }
     }
-
-    $self->{_reading_responses} = 0;
 }
+
+# Start the reader if not already running. Idempotent.
+sub _ensure_reader {
+    my ($self) = @_;
+    return if $self->{_reader_future} && !$self->{_reader_future}->is_ready;
+    my $f = $self->_run_reader;
+    $f->on_ready(sub { $self->{_reader_future} = undef });
+    $self->{_reader_future} = $f;
+    $f->retain;
+    return;
+}
+
+# Shim for the old name. Remove in Task 9 after all callers migrate.
+sub _ensure_response_reader { $_[0]->_ensure_reader; Future->done }
 
 # Read and parse one response
 async sub _read_response {
