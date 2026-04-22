@@ -137,7 +137,12 @@ sub new {
         port     => $args{path} ? undef : ($args{port} // 6379),
         socket   => undef,
         parser   => undef,
-        connected => 0,
+        connected          => 0,
+        _socket_live       => 0,
+        _fatal_in_progress => 0,
+        _reader_future     => undef,
+        _write_lock        => undef,     # will be a Future used as a lock, populated lazily
+        _reconnect_future  => undef,
 
         # Timeout settings
         connect_timeout         => $args{connect_timeout} // 10,
@@ -312,7 +317,8 @@ async sub connect {
 
     $self->{socket} = $socket;
     $self->{parser} = _parser_class()->new(api => 1);
-    $self->{connected} = 1;
+    $self->{_socket_live} = 1;   # write gate and reader can now submit
+    $self->{connected}    = 1;
     $self->{inflight} = [];
     $self->{_reading_responses} = 0;
     $self->{_pid} = $$;  # Track PID for fork safety
@@ -440,8 +446,12 @@ sub disconnect {
     if ($self->{socket}) {
         $self->_close_socket;
     }
-    $self->{connected} = 0;
-    $self->{parser} = undef;
+    $self->{_socket_live}       = 0;
+    $self->{_fatal_in_progress} = 0;
+    $self->{_reader_future}     = undef;
+    $self->{_reconnect_future}  = undef;
+    $self->{connected}          = 0;
+    $self->{parser}             = undef;
     $self->{_reading_responses} = 0;
 
     if ($was_connected && $self->{on_disconnect}) {
@@ -1078,10 +1088,14 @@ sub _reset_connection {
         $self->_close_socket;
     }
 
-    $self->{connected} = 0;
-    $self->{parser} = undef;
-    $self->{_reading_responses} = 0;
-    $self->{in_pubsub} = 0;
+    $self->{_socket_live}       = 0;
+    $self->{_fatal_in_progress} = 0;
+    $self->{_reader_future}     = undef;
+    $self->{_reconnect_future}  = undef;
+    $self->{connected}          = 0;
+    $self->{parser}             = undef;
+    $self->{_reading_responses} = 0;   # still here for now; deleted in Task 9
+    $self->{in_pubsub}          = 0;
 
     if ($was_connected && $self->{on_disconnect}) {
         $self->{on_disconnect}->($self, $reason);
