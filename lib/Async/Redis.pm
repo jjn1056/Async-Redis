@@ -76,6 +76,46 @@ sub _calculate_backoff {
     return $delay;
 }
 
+# Free function, not a method. Call as _await_with_deadline($f, $deadline).
+# Race a read future against a deadline. Returns a Future resolving to
+# ($read_future, $timed_out_bool). The caller inspects $timed_out and
+# $read_future->is_failed explicitly; we never throw from here.
+#
+# On timeout win: $read_future is left pending. _reader_fatal is the sole
+# owner of its cancellation (it must happen before _close_socket so
+# Future::IO unregisters while fileno is still valid).
+# On read win: the internal timeout timer is cancelled here for hygiene.
+sub _await_with_deadline {
+    my ($read_f, $deadline) = @_;
+
+    if (!defined $deadline) {
+        return $read_f->followed_by(sub { Future->done($read_f, 0) });
+    }
+
+    my $remaining = $deadline - Time::HiRes::time();
+    if ($remaining <= 0) {
+        return Future->done($read_f, 1);
+    }
+
+    my $timeout_f = Future::IO->sleep($remaining)
+        ->then(sub { Future->fail('__deadline__') });
+
+    # Use without_cancel so that if timeout wins, wait_any's cancel of the
+    # losing future does not propagate to $read_f (caller owns its lifecycle).
+    return Future->wait_any($read_f->without_cancel, $timeout_f)
+        ->followed_by(sub {
+            my ($f) = @_;
+            my $timed_out = $f->is_failed
+                && (($f->failure)[0] // '') eq '__deadline__' ? 1 : 0;
+
+            if (!$timed_out && !$timeout_f->is_ready) {
+                $timeout_f->cancel;
+            }
+
+            return Future->done($read_f, $timed_out);
+        });
+}
+
 sub new {
     my ($class, %args) = @_;
 
