@@ -1,5 +1,23 @@
 Revision history for Future-IO-Redis
 
+0.001008  2026-04-22
+    - Bug Fix: _reconnect no longer spins forever on permanent failure
+        - New reconnect_max_attempts constructor option (default 10;
+          0 = unlimited). Once exceeded, _reconnect dies with an
+          Async::Redis::Error::Disconnected; the failure propagates
+          through _reconnect_pubsub to the Subscription's read loop,
+          where it routes to on_fail / on_error per existing contract.
+        - Previously, an unreachable Redis would cause _reconnect to
+          loop with exponential backoff (capped at reconnect_delay_max
+          = 60s) indefinitely, with no way for a consumer to tell
+          "reconnecting" from "broken".
+    - Bug Fix: _reconnect_attempt resets to 0 on successful reconnect
+        - Previously the counter only incremented, so cumulative
+          reconnects across a long-running process caused subsequent
+          backoff delays to start from an ever-larger base
+          (0.1 * 2^N where N was total historical reconnects). Now
+          each successful reconnect resets the counter to 0.
+
 0.001007  2026-04-21
     - Feature: Callback-driven Subscription delivery
         - New on_message($cb) and on_error($cb) setters on

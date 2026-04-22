@@ -73,6 +73,44 @@ subtest '_read_frame_with_reconnect is defined and returns a Future' => sub {
     $f->on_fail(sub { });
 };
 
+subtest '_reconnect_attempt resets to 0 after successful reconnect' => sub {
+    my $redis = Async::Redis->new(host => 'localhost');
+    # Simulate prior failed attempts having bumped the counter.
+    $redis->{_reconnect_attempt} = 5;
+
+    # Stub connect to succeed immediately (set connected and return).
+    no warnings 'redefine';
+    local *Async::Redis::connect = async sub { $_[0]->{connected} = 1; return $_[0] };
+
+    $redis->_reconnect->get;
+
+    is($redis->{_reconnect_attempt}, 0,
+        '_reconnect_attempt reset to 0 after loop exit');
+};
+
+subtest '_reconnect honors reconnect_max_attempts cap' => sub {
+    my $redis = Async::Redis->new(
+        host                   => 'localhost',
+        reconnect_max_attempts => 3,
+        reconnect_delay        => 0.001,   # tiny so the test is fast
+        reconnect_delay_max    => 0.001,
+        reconnect_jitter       => 0,
+    );
+
+    # Stub connect to always fail.
+    no warnings 'redefine';
+    local *Async::Redis::connect = async sub {
+        die Async::Redis::Error::Disconnected->new(message => 'simulated');
+    };
+
+    my $err = dies { $redis->_reconnect->get };
+    ok($err, '_reconnect dies after max attempts exhausted');
+    like("$err", qr/gave up after 3 attempts/,
+        'error message names the attempt cap');
+    is($redis->{_reconnect_attempt}, 4,
+        'attempt counter reached 4 (one past the cap, where the die fires)');
+};
+
 # --- Integration tests (require Redis) ---
 
 SKIP: {

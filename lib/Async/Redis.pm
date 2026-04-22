@@ -4,7 +4,7 @@ use strict;
 use warnings;
 use 5.018;
 
-our $VERSION = '0.001007';
+our $VERSION = '0.001008';
 
 use Future;
 use Future::AsyncAwait;
@@ -112,11 +112,12 @@ sub new {
         _reading_responses => 0,
 
         # Reconnection settings
-        reconnect           => $args{reconnect} // 0,
-        reconnect_delay     => $args{reconnect_delay} // 0.1,
-        reconnect_delay_max => $args{reconnect_delay_max} // 60,
-        reconnect_jitter    => $args{reconnect_jitter} // 0.25,
-        _reconnect_attempt  => 0,
+        reconnect              => $args{reconnect} // 0,
+        reconnect_delay        => $args{reconnect_delay} // 0.1,
+        reconnect_delay_max    => $args{reconnect_delay_max} // 60,
+        reconnect_jitter       => $args{reconnect_jitter} // 0.25,
+        reconnect_max_attempts => $args{reconnect_max_attempts} // 10,  # 0 = unlimited
+        _reconnect_attempt     => 0,
 
         # Callbacks
         on_connect    => $args{on_connect},
@@ -749,8 +750,19 @@ async sub _tls_upgrade {
 async sub _reconnect {
     my ($self) = @_;
 
+    my $max = $self->{reconnect_max_attempts};
+
     while (!$self->{connected}) {
         $self->{_reconnect_attempt}++;
+
+        # Honor reconnect_max_attempts cap so an unreachable Redis
+        # doesn't spin forever. 0 means unlimited (back-compat default).
+        if ($max && $self->{_reconnect_attempt} > $max) {
+            die Async::Redis::Error::Disconnected->new(
+                message => "Reconnect gave up after $max attempts",
+            );
+        }
+
         my $delay = $self->_calculate_backoff($self->{_reconnect_attempt});
 
         eval {
@@ -769,6 +781,10 @@ async sub _reconnect {
             await Future::IO->sleep($delay);
         }
     }
+
+    # Reset attempt counter on success so subsequent reconnects
+    # start fresh instead of inheriting cumulative backoff.
+    $self->{_reconnect_attempt} = 0;
 }
 
 # Reconnect and replay pubsub subscriptions
@@ -1930,6 +1946,20 @@ Maximum reconnect delay. Default: 60
 =item reconnect_jitter => $ratio
 
 Jitter ratio for reconnect delays. Default: 0.25
+
+=item reconnect_max_attempts => $int
+
+Maximum number of reconnect attempts before C<_reconnect> gives up
+and dies with an L<Async::Redis::Error::Disconnected>. Default: 10.
+Set to C<0> for unlimited retries (not recommended in production:
+an unreachable Redis will loop with exponential backoff forever,
+giving consumers no way to distinguish "reconnecting" from "broken").
+
+When the cap is exceeded, the failure propagates through
+C<_reconnect_pubsub> to any active L<Async::Redis::Subscription>'s
+read loop, where it routes to C<on_error> (or C<die>s loudly if
+no C<on_error> is registered) per the existing Subscription
+fatal-error contract.
 
 =item on_connect => $coderef
 
