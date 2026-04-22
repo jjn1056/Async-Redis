@@ -212,12 +212,14 @@ async sub _read_frame_with_reconnect {
         unless ($ok) {
             my $error = $@;
             if ($redis->{reconnect} && $self->channel_count > 0) {
+                my $reconnect_error;
                 my $reconnect_ok = eval {
                     await $redis->_reconnect_pubsub;
                     1;
                 };
+                $reconnect_error = $@ unless $reconnect_ok;
                 unless ($reconnect_ok) {
-                    die $error;
+                    die $reconnect_error;
                 }
 
                 if ($self->{_on_reconnect}) {

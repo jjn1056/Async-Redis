@@ -751,39 +751,43 @@ async sub _reconnect {
     my ($self) = @_;
 
     my $max = $self->{reconnect_max_attempts};
+    my $attempt = 0;
 
     while (!$self->{connected}) {
-        $self->{_reconnect_attempt}++;
+        $attempt++;
+        $self->{_reconnect_attempt} = $attempt;
+
+        my $ok = eval {
+            await $self->connect;
+            1;
+        };
+
+        if ($ok) {
+            $self->{_reconnect_attempt} = 0;
+            last;
+        }
+
+        my $error = $@;
+
+        # Fire on_error callback
+        if ($self->{on_error}) {
+            $self->{on_error}->($self, $error);
+        }
 
         # Honor reconnect_max_attempts cap so an unreachable Redis
-        # doesn't spin forever. 0 means unlimited (back-compat default).
-        if ($max && $self->{_reconnect_attempt} > $max) {
+        # doesn't spin forever. 0 means unlimited.
+        if ($max && $attempt >= $max) {
+            $self->{_reconnect_attempt} = 0;
             die Async::Redis::Error::Disconnected->new(
                 message => "Reconnect gave up after $max attempts",
             );
         }
 
-        my $delay = $self->_calculate_backoff($self->{_reconnect_attempt});
-
-        eval {
-            await $self->connect;
-        };
-
-        if ($@) {
-            my $error = $@;
-
-            # Fire on_error callback
-            if ($self->{on_error}) {
-                $self->{on_error}->($self, $error);
-            }
-
-            # Wait before next attempt
-            await Future::IO->sleep($delay);
-        }
+        my $delay = $self->_calculate_backoff($attempt);
+        await Future::IO->sleep($delay);
     }
 
-    # Reset attempt counter on success so subsequent reconnects
-    # start fresh instead of inheriting cumulative backoff.
+    # Reset attempt counter on success so subsequent reconnects start fresh.
     $self->{_reconnect_attempt} = 0;
 }
 

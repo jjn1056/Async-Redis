@@ -98,8 +98,10 @@ subtest '_reconnect honors reconnect_max_attempts cap' => sub {
     );
 
     # Stub connect to always fail.
+    my $calls = 0;
     no warnings 'redefine';
     local *Async::Redis::connect = async sub {
+        $calls++;
         die Async::Redis::Error::Disconnected->new(message => 'simulated');
     };
 
@@ -107,8 +109,88 @@ subtest '_reconnect honors reconnect_max_attempts cap' => sub {
     ok($err, '_reconnect dies after max attempts exhausted');
     like("$err", qr/gave up after 3 attempts/,
         'error message names the attempt cap');
-    is($redis->{_reconnect_attempt}, 4,
-        'attempt counter reached 4 (one past the cap, where the die fires)');
+    is($calls, 3, 'connect called exactly 3 times');
+    is($redis->{_reconnect_attempt}, 0,
+        'attempt counter reset to 0 after the cap is exhausted');
+};
+
+subtest '_reconnect cap is per reconnect cycle, not permanent client poison' => sub {
+    my $redis = Async::Redis->new(
+        host                   => 'localhost',
+        reconnect_max_attempts => 2,
+        reconnect_delay        => 0,
+        reconnect_delay_max    => 0,
+        reconnect_jitter       => 0,
+    );
+
+    my $phase = 'fail';
+    my $calls = 0;
+
+    # First cycle: Redis stays unreachable, so _reconnect should try
+    # exactly reconnect_max_attempts times and then give up.
+    # Second cycle: Redis is back, so the same client should be able to
+    # make a fresh reconnect attempt instead of immediately failing
+    # because the previous cycle left _reconnect_attempt above the cap.
+    no warnings 'redefine';
+    local *Async::Redis::connect = async sub {
+        $calls++;
+
+        if ($phase eq 'fail') {
+            die Async::Redis::Error::Disconnected->new(message => 'still down');
+        }
+
+        $_[0]->{connected} = 1;
+        return $_[0];
+    };
+
+    my $first_err = dies { $redis->_reconnect->get };
+    like("$first_err", qr/gave up after 2 attempts/,
+        'first reconnect cycle gives up after the configured cap');
+    is($calls, 2, 'first cycle made exactly 2 connect attempts');
+
+    $phase = 'success';
+
+    my $second_err = dies { $redis->_reconnect->get };
+    is($second_err, undef,
+        'second reconnect cycle can try again and succeed after Redis returns');
+    is($calls, 3, 'second cycle called connect again');
+    is($redis->{_reconnect_attempt}, 0,
+        'attempt counter reset after successful later reconnect');
+};
+
+subtest 'pubsub reports reconnect exhaustion, not the original read error' => sub {
+    my $redis = Async::Redis->new(
+        host                   => 'localhost',
+        reconnect              => 1,
+        reconnect_max_attempts => 1,
+        reconnect_delay        => 0,
+        reconnect_delay_max    => 0,
+        reconnect_jitter       => 0,
+    );
+    my $sub = Async::Redis::Subscription->new(redis => $redis);
+
+    $redis->{_subscription} = $sub;
+    $sub->_add_channel('chan');
+
+    # The read fails first, which is the trigger for pub/sub recovery.
+    # Recovery then exhausts reconnect_max_attempts.  The consumer-facing
+    # error should be the reconnect exhaustion error, because that tells
+    # users recovery was attempted and failed; the original read error is
+    # only the cause that started the recovery path.
+    no warnings 'redefine';
+    local *Async::Redis::_read_pubsub_frame = async sub {
+        die Async::Redis::Error::Disconnected->new(message => 'read failed');
+    };
+    local *Async::Redis::connect = async sub {
+        die Async::Redis::Error::Disconnected->new(message => 'connect failed');
+    };
+
+    my $err = dies { $sub->_read_frame_with_reconnect->get };
+
+    like("$err", qr/Reconnect gave up after 1 attempts/,
+        'subscription sees reconnect exhaustion error');
+    unlike("$err", qr/read failed/,
+        'original read error does not mask reconnect exhaustion');
 };
 
 # --- Integration tests (require Redis) ---
