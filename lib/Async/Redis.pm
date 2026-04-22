@@ -1122,6 +1122,54 @@ sub _decode_response {
     return $data;
 }
 
+# Non-throwing decoder used by the unified reader. Classifies each frame
+# as one of:
+#   ('ok',             $decoded_value)      - normal response
+#   ('redis_error',    $error_object)       - -ERR frame from Redis
+#   ('protocol_error', $error_object)       - fatal desync (malformed)
+sub _decode_response_result {
+    my ($self, $msg) = @_;
+
+    if (!defined $msg) {
+        return ('protocol_error', Async::Redis::Error::Protocol->new(
+            message => 'undef message from parser',
+        ));
+    }
+
+    my $type = $msg->{type} // '';
+    my $data = $msg->{data};
+
+    if ($type eq '+') {
+        return ('ok', $data);
+    }
+    elsif ($type eq '-') {
+        return ('redis_error', Async::Redis::Error::Redis->from_message($data));
+    }
+    elsif ($type eq ':') {
+        return ('ok', 0 + ($data // 0));
+    }
+    elsif ($type eq '$') {
+        return ('ok', $data);
+    }
+    elsif ($type eq '*') {
+        return ('ok', undef) if !defined $data;   # nil array
+        my @out;
+        for my $child (@$data) {
+            my ($k, $v) = $self->_decode_response_result($child);
+            if ($k eq 'protocol_error') {
+                return ($k, $v);   # propagate fatal
+            }
+            push @out, $v;
+        }
+        return ('ok', \@out);
+    }
+    else {
+        return ('protocol_error', Async::Redis::Error::Protocol->new(
+            message => "unknown frame type: $type",
+        ));
+    }
+}
+
 # ============================================================================
 # Convenience Commands
 # ============================================================================
