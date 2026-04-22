@@ -74,6 +74,17 @@ sub _do_flush {
     $self->{_flushing} = 0;
 }
 
+# Detach and return all queued-but-not-yet-flushed commands. Caller is
+# responsible for failing their futures. Called by Async::Redis::_reader_fatal
+# when the connection dies before a scheduled flush.
+sub _detach_queued {
+    my ($self) = @_;
+    my $queued = $self->{_queue} // [];
+    $self->{_queue} = [];
+    $self->{_flush_pending} = 0;
+    return $queued;
+}
+
 sub _send_batch {
     my ($self, $batch) = @_;
 

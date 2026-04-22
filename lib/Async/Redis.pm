@@ -1157,15 +1157,93 @@ async sub _with_write_gate {
     return;
 }
 
-# Temporary shim until Task 5 installs the full detach-first helper.
-# Calls the existing _reset_connection; this does NOT preserve typed
-# errors (inflight futures get cancelled, losing the typed error), but
-# that's fine for now because no code calls _reader_fatal yet except
-# _with_write_gate's error path, which immediately rethrows the typed
-# error to the caller.
+# Is reconnect enabled for this client?
+sub _reconnect_enabled {
+    my ($self) = @_;
+    return !!$self->{reconnect};
+}
+
+# Central "something went wrong with the stream" transition. Detaches
+# inflight BEFORE closing the socket so the typed error is preserved
+# (the old _reset_connection cancels inflight directly, which would
+# overwrite $typed_error with a generic cancellation).
 sub _reader_fatal {
-    my ($self, $typed_error) = @_;   # $typed_error unused in shim; Task 5 installs the full helper
-    $self->_reset_connection('fatal');
+    my ($self, $typed_error) = @_;
+
+    return if $self->{_fatal_in_progress};
+    $self->{_fatal_in_progress} = 1;
+
+    my $ok = eval {
+        # 1. Capture pre-reset state BEFORE any mutation.
+        my $was_connected = $self->{connected};
+        my $was_pubsub    = $self->{in_pubsub};
+        my $subscription  = $self->{_subscription};
+
+        # 2. Detach inflight so the close path cannot cancel them.
+        my $detached_inflight = $self->{inflight};
+        $self->{inflight} = [];
+
+        # 3. Detach auto-pipeline's queued-but-not-registered commands.
+        my $detached_autopipe = [];
+        if (my $ap = $self->{_auto_pipeline}) {
+            $detached_autopipe = $ap->_detach_queued;
+        }
+
+        # 4. Cancel the current read BEFORE closing the socket.
+        if ($self->{_current_read_future}
+            && !$self->{_current_read_future}->is_ready) {
+            $self->{_current_read_future}->cancel;
+        }
+        $self->{_current_read_future} = undef;
+
+        # 5. Close socket, clear internal state.
+        $self->_close_socket if $self->{socket};
+        $self->{_socket_live}   = 0;
+        $self->{connected}      = 0;
+        $self->{parser}         = undef;
+        $self->{in_pubsub}      = 0;
+        $self->{_reader_future} = undef;
+        # _reading_responses intentionally not cleared here; removed in Task 9.
+
+        # 6. Fail all detached futures with the SAME typed error.
+        for my $entry (@$detached_inflight, @$detached_autopipe) {
+            next if $entry->{future}->is_ready;
+            $entry->{future}->fail($typed_error);
+        }
+
+        # 7. Pubsub reconnect handoff. _fail_fatal and _pause_for_reconnect
+        #    land in Phase 2 (Task 14); for now this branch only triggers
+        #    when the subscription API is used, and we call the older
+        #    _close path as a placeholder until Task 14 replaces it.
+        if ($was_pubsub && $subscription) {
+            if ($self->_reconnect_enabled
+                && $subscription->can('_pause_for_reconnect')) {
+                $subscription->_pause_for_reconnect;
+                if ($self->can('_reconnect_async')) {
+                    $self->_reconnect_async($subscription);
+                }
+            }
+            elsif ($subscription->can('_fail_fatal')) {
+                $subscription->_fail_fatal($typed_error);
+            }
+            else {
+                # Pre-Phase-2 fallback: existing _close method.
+                $subscription->_close if $subscription->can('_close');
+            }
+        }
+
+        # 8. on_disconnect: only if we were publicly connected.
+        if ($was_connected && $self->{on_disconnect}) {
+            $self->{on_disconnect}->($self, "$typed_error");
+        }
+
+        1;
+    };
+
+    my $caught = $@;
+    # Always clear the guard, even if a callback died.
+    $self->{_fatal_in_progress} = 0;
+    die $caught if !$ok && $caught;
 }
 
 # Decode Protocol::Redis response to Perl value
