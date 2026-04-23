@@ -288,8 +288,33 @@ sub _dispatch_frame {
         return $self->_invoke_user_callback($cb, $msg);
     }
 
-    # Iterator mode: queue synchronously and signal any blocked next().
+    # Iterator mode: queue respecting message_queue_depth. If the queue is
+    # at capacity, return a Future that resolves once the consumer dequeues
+    # (via next()). The caller (_run_reader or _start_driver) awaits it,
+    # pausing socket reads and restoring TCP backpressure to the publisher.
     return if $self->{_closed};
+
+    my $redis = $self->{redis};
+    my $depth = ($redis && $redis->{message_queue_depth})
+        ? $redis->{message_queue_depth}
+        : 0;  # 0 = unbounded (default)
+
+    if ($depth && scalar(@{$self->{_pending_messages}}) >= $depth) {
+        # Queue full. Return a Future that queues the message once a slot
+        # opens (signalled by next() calling _slot_waiter->done).
+        $self->{_slot_waiter} //= Future->new;
+        my $slot = $self->{_slot_waiter};
+        weaken(my $weak = $self);
+        return $slot->then(sub {
+            return Future->done if !$weak || $weak->{_closed};
+            push @{$weak->{_pending_messages}}, $msg;
+            if (my $w = delete $weak->{_message_waiter}) {
+                $w->done unless $w->is_ready;
+            }
+            Future->done;
+        });
+    }
+
     push @{$self->{_pending_messages}}, $msg;
     if (my $w = delete $self->{_message_waiter}) {
         $w->done unless $w->is_ready;

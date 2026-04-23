@@ -206,4 +206,43 @@ subtest 'concurrent subscribers on separate connections each get their messages'
     $pub_c->disconnect;
 };
 
+subtest '_dispatch_frame: queue bounded by message_queue_depth' => sub {
+    # Unit test for _dispatch_frame depth backpressure.
+    # Simulates the reader dispatching frames into a subscription whose
+    # consumer has not called next() yet.
+    use Async::Redis::Subscription;
+    my $redis_mock = bless { message_queue_depth => 2 }, 'Async::Redis';
+    my $sub = Async::Redis::Subscription->new(redis => $redis_mock);
+
+    # Prime channels so _start_driver guard passes (not needed here, just state)
+    $sub->{channels}{'test-ch'} = 1;
+
+    my $frame1 = ['message', 'test-ch', 'v1'];
+    my $frame2 = ['message', 'test-ch', 'v2'];
+    my $frame3 = ['message', 'test-ch', 'v3'];
+
+    # Dispatch first two — should queue synchronously (depth not exceeded yet)
+    my $r1 = $sub->_dispatch_frame($frame1);
+    my $r2 = $sub->_dispatch_frame($frame2);
+    ok !defined($r1) || !ref($r1), 'first dispatch returns undef (synced)';
+    ok !defined($r2) || !ref($r2), 'second dispatch returns undef (synced)';
+    is scalar(@{$sub->{_pending_messages}}), 2, '2 messages queued';
+
+    # Third dispatch at depth=2 should return a Future
+    my $r3 = $sub->_dispatch_frame($frame3);
+    ok ref($r3) && $r3->isa('Future'), 'third dispatch returns Future (queue full)';
+    is scalar(@{$sub->{_pending_messages}}), 2, 'queue still at depth (third not yet added)';
+
+    # Consume one message — slot opens, pending dispatch completes
+    my $msg1 = shift @{$sub->{_pending_messages}};
+    if (my $w = delete $sub->{_slot_waiter}) {
+        $w->done unless $w->is_ready;
+    }
+    # Pump: r3 is a then-chain, so we need to let it resolve
+    run { $r3 };
+    is scalar(@{$sub->{_pending_messages}}), 2, 'queue back at depth after slot opened';
+    is $sub->{_pending_messages}[0]{data}, 'v2', 'v2 now at head';
+    is $sub->{_pending_messages}[1]{data}, 'v3', 'v3 appended after slot';
+};
+
 done_testing;
