@@ -9,6 +9,7 @@ our $VERSION = '0.002000';
 use Future;
 use Future::AsyncAwait;
 use Future::IO 0.19;
+use Future::Selector 0.05;
 use Scalar::Util qw(blessed weaken);
 use Socket qw(pack_sockaddr_in pack_sockaddr_un inet_aton AF_INET AF_UNIX SOCK_STREAM);
 use IO::Handle ();
@@ -144,6 +145,7 @@ sub new {
         _reader_future     => undef,
         _write_lock        => undef,     # will be a Future used as a lock, populated lazily
         _reconnect_future  => undef,
+        _tasks             => Future::Selector->new,
 
         # Timeout settings
         connect_timeout         => $args{connect_timeout} // 10,
