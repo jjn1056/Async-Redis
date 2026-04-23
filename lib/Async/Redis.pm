@@ -2521,6 +2521,28 @@ OpenTelemetry meter for metrics.
 
 =back
 
+=head2 PREFIX LIMITATIONS
+
+The C<prefix> option is a convenience for namespacing keys; it is not a hard
+security boundary. Key extraction is driven by a hand-maintained map
+covering common Redis commands. As of 0.002000, the following commands have
+incomplete or missing key extraction: BITFIELD, LMPOP, BLMPOP, ZINTERCARD,
+LCS, GEORADIUS_RO, GEORADIUSBYMEMBER_RO. Calls to these commands will not
+have prefixes applied. For multi-tenant isolation, use Redis ACLs or
+separate Redis databases rather than relying on C<prefix>.
+
+=head2 TLS HOSTNAME VERIFICATION
+
+Starting in 0.002000, TLS connections verify the server certificate's
+hostname (or IP SAN) by default when C<verify> is on. If you connect by
+hostname, the certificate must have a matching CN or SAN. If you connect by
+IP literal, the certificate must have a matching IP SAN.
+
+For deployments where the certificate does not match the connected
+hostname/IP (common when connecting to internal IPs with hostname-only
+certs), set C<< tls => { verify_hostname => 0 } >> to skip hostname
+identity while still verifying the CA chain.
+
 =head1 METHODS
 
 =head2 connect
@@ -2926,6 +2948,43 @@ This enables:
 =item * Metrics: command latency, connection counts, errors
 
 =item * Automatic attribute extraction (command, database, etc.)
+
+=back
+
+=head2 OPENTELEMETRY ARGUMENTS
+
+Starting in 0.002000, command arguments are no longer included in spans by
+default. Redis values frequently contain session tokens, user IDs, and
+other PII; exporting them to a tracing backend is a privacy hazard. Pass
+C<< otel_include_args => 1 >> to re-enable, and implement custom redaction
+for your data shapes before doing so.
+
+=head2 MESSAGE QUEUE DEPTH
+
+C<message_queue_depth> limits the number of queued pubsub messages.
+Callback invocation is always serialized. With C<< message_queue_depth => 1 >>
+(the default), one message may be queued while one callback is still
+processing; the reader pauses when that queue slot is full. Higher values
+allow more messages to buffer locally before the reader pauses.
+
+=head1 KNOWN LIMITATIONS
+
+=over
+
+=item * Hostname resolution is synchronous. C<connect()> calls
+C<inet_aton> before the async connect, which blocks during DNS lookup.
+Not covered by C<connect_timeout>.
+
+=item * IPv6 URI hosts are not yet supported.
+
+=item * C<define_command(install =E<gt> 1)> installs a method into the
+C<Async::Redis> package globally, affecting all instances in the process.
+Use C<run_script> for per-instance dispatch if you need isolation.
+
+=item * Some generated wrappers expose mode-changing commands (HELLO,
+CLIENT REPLY, MONITOR, SYNC, PSYNC) that interact poorly with the
+response model. Avoid them unless you understand the protocol
+consequences.
 
 =back
 
