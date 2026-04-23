@@ -4,11 +4,12 @@ use strict;
 use warnings;
 use 5.018;
 
-our $VERSION = '0.001008';
+our $VERSION = '0.002000';
 
 use Future;
 use Future::AsyncAwait;
 use Future::IO 0.19;
+use Scalar::Util qw(blessed weaken);
 use Socket qw(pack_sockaddr_in pack_sockaddr_un inet_aton AF_INET AF_UNIX SOCK_STREAM);
 use IO::Handle ();
 use IO::Socket::INET;
@@ -76,6 +77,46 @@ sub _calculate_backoff {
     return $delay;
 }
 
+# Free function, not a method. Call as _await_with_deadline($f, $deadline).
+# Race a read future against a deadline. Returns a Future resolving to
+# ($read_future, $timed_out_bool). The caller inspects $timed_out and
+# $read_future->is_failed explicitly; we never throw from here.
+#
+# On timeout win: $read_future is left pending. _reader_fatal is the sole
+# owner of its cancellation (it must happen before _close_socket so
+# Future::IO unregisters while fileno is still valid).
+# On read win: the internal timeout timer is cancelled here for hygiene.
+sub _await_with_deadline {
+    my ($read_f, $deadline) = @_;
+
+    if (!defined $deadline) {
+        return $read_f->followed_by(sub { Future->done($read_f, 0) });
+    }
+
+    my $remaining = $deadline - Time::HiRes::time();
+    if ($remaining <= 0) {
+        return Future->done($read_f, 1);
+    }
+
+    my $timeout_f = Future::IO->sleep($remaining)
+        ->then(sub { Future->fail('__deadline__') });
+
+    # Use without_cancel so that if timeout wins, wait_any's cancel of the
+    # losing future does not propagate to $read_f (caller owns its lifecycle).
+    return Future->wait_any($read_f->without_cancel, $timeout_f)
+        ->followed_by(sub {
+            my ($f) = @_;
+            my $timed_out = $f->is_failed
+                && (($f->failure)[0] // '') eq '__deadline__' ? 1 : 0;
+
+            if (!$timed_out && !$timeout_f->is_ready) {
+                $timeout_f->cancel;
+            }
+
+            return Future->done($read_f, $timed_out);
+        });
+}
+
 sub new {
     my ($class, %args) = @_;
 
@@ -97,7 +138,12 @@ sub new {
         port     => $args{path} ? undef : ($args{port} // 6379),
         socket   => undef,
         parser   => undef,
-        connected => 0,
+        connected          => 0,
+        _socket_live       => 0,
+        _fatal_in_progress => 0,
+        _reader_future     => undef,
+        _write_lock        => undef,     # will be a Future used as a lock, populated lazily
+        _reconnect_future  => undef,
 
         # Timeout settings
         connect_timeout         => $args{connect_timeout} // 10,
@@ -107,9 +153,6 @@ sub new {
         # Inflight tracking with deadlines
         # Entry: { future => $f, cmd => $cmd, args => \@args, deadline => $t, sent_at => $t }
         inflight => [],
-
-        # Response reader synchronization
-        _reading_responses => 0,
 
         # Reconnection settings
         reconnect              => $args{reconnect} // 0,
@@ -140,6 +183,13 @@ sub new {
         pipeline_depth => $args{pipeline_depth} // 10000,
         auto_pipeline  => $args{auto_pipeline} // 0,
 
+        # Backpressure: max queued messages before _dispatch_frame's slot wait blocks.
+        message_queue_depth => do {
+            my $d = $args{message_queue_depth} // 1;
+            die "message_queue_depth must be >= 1 (got $d)" if $d < 1;
+            $d;
+        },
+
         # Transaction state
         in_multi => 0,
         watching => 0,
@@ -162,7 +212,7 @@ sub new {
         debug              => $args{debug},
         otel_tracer        => $args{otel_tracer},
         otel_meter         => $args{otel_meter},
-        otel_include_args  => $args{otel_include_args} // 1,
+        otel_include_args  => $args{otel_include_args} // 0,
         otel_redact        => $args{otel_redact} // 1,
     }, $class;
 
@@ -272,14 +322,22 @@ async sub connect {
 
     $self->{socket} = $socket;
     $self->{parser} = _parser_class()->new(api => 1);
-    $self->{connected} = 1;
+    $self->{_socket_live} = 1;   # write gate and reader can now submit
     $self->{inflight} = [];
-    $self->{_reading_responses} = 0;
     $self->{_pid} = $$;  # Track PID for fork safety
     $self->{_current_read_future} = undef;
 
-    # Run Redis protocol handshake (AUTH, SELECT, CLIENT SETNAME)
-    await $self->_redis_handshake;
+    # Run Redis protocol handshake (AUTH, SELECT, CLIENT SETNAME).
+    # connected stays 0 during handshake; set it only on success so
+    # callers never see a half-initialised object.
+    my $handshake_ok = eval { await $self->_redis_handshake; 1 };
+    unless ($handshake_ok) {
+        my $err = $@;
+        $self->_reset_connection('handshake_failure');
+        die $err;
+    }
+
+    $self->{connected} = 1;
 
     # Initialize auto-pipeline if enabled
     if ($self->{auto_pipeline}) {
@@ -314,9 +372,9 @@ async sub _redis_handshake {
     my $deadline = Time::HiRes::time() + $self->{connect_timeout};
 
     # AUTH (password or username+password for ACL)
-    if ($self->{password}) {
+    if (defined $self->{password}) {
         my @auth_args = ('AUTH');
-        push @auth_args, $self->{username} if $self->{username};
+        push @auth_args, $self->{username} if defined $self->{username};
         push @auth_args, $self->{password};
 
         my $cmd = $self->_build_command(@auth_args);
@@ -351,7 +409,7 @@ async sub _redis_handshake {
     }
 
     # CLIENT SETNAME
-    if ($self->{client_name}) {
+    if (defined $self->{client_name} && length $self->{client_name}) {
         my $cmd = $self->_build_command('CLIENT', 'SETNAME', $self->{client_name});
         await $self->_send($cmd);
 
@@ -366,52 +424,65 @@ sub is_connected {
     return $self->{connected} ? 1 : 0;
 }
 
-# Disconnect from Redis
+# Disconnect from Redis — user-initiated path.
+# Distinct from _reader_fatal: no reconnect handoff, inflight fails
+# (not cancels) with Disconnected, subscription gets _close (not _fail).
 sub disconnect {
-    my ($self, $reason) = @_;
-    $reason //= 'client_disconnect';
+    my ($self) = @_;
+    return $self unless $self->{_socket_live} || $self->{connected};
 
     my $was_connected = $self->{connected};
 
-    # Notify any active pub/sub subscription that we're disconnecting
-    # cleanly, so its driver's on_fail on the in-flight read treats the
-    # EOF as expected rather than firing on_error / dying.
-    if ($self->{_subscription} && !$self->{_subscription}->is_closed) {
-        $self->{_subscription}->_close;
+    # Close subscription cleanly — iterator next() gets undef, no on_error.
+    if (my $sub = $self->{_subscription}) {
+        $sub->_close unless $sub->is_closed;
     }
 
-    # Cancel any active read future BEFORE closing socket
-    # This ensures Future::IO unregisters its watcher while fileno is still valid
-    if ($self->{_current_read_future} && !$self->{_current_read_future}->is_ready) {
+    # Detach inflight + auto-pipeline queue before socket close so
+    # _close_socket doesn't cancel them — we will fail them explicitly.
+    my $detached_inflight = $self->{inflight};
+    $self->{inflight} = [];
+    my $detached_autopipe = [];
+    if (my $ap = $self->{_auto_pipeline}) {
+        $detached_autopipe = $ap->_detach_queued;
+    }
+
+    # Cancel current read BEFORE closing socket so Future::IO can
+    # unregister its watcher while fileno is still valid.
+    if ($self->{_current_read_future}
+        && !$self->{_current_read_future}->is_ready) {
         $self->{_current_read_future}->cancel;
-        $self->{_current_read_future} = undef;
+    }
+    $self->{_current_read_future} = undef;
+
+    $self->_close_socket if $self->{socket};
+    $self->{_socket_live}       = 0;
+    $self->{_fatal_in_progress} = 0;
+    $self->{_reader_future}     = undef;
+    $self->{_reconnect_future}  = undef;
+    $self->{connected}          = 0;
+    $self->{parser}             = undef;
+    $self->{in_pubsub}          = 0;
+
+    # Fail detached futures — typed error so callers can distinguish.
+    my $err = Async::Redis::Error::Disconnected->new(
+        message => "Client disconnect",
+    );
+    for my $entry (@$detached_inflight, @$detached_autopipe) {
+        next if $entry->{future}->is_ready;
+        $entry->{future}->fail($err);
     }
 
-    # Cancel any pending inflight operations before closing socket
-    if (my $inflight = $self->{inflight}) {
-        for my $entry (@$inflight) {
-            if ($entry->{future} && !$entry->{future}->is_ready) {
-                $entry->{future}->cancel;
-            }
-        }
-        $self->{inflight} = [];
-    }
-
-    if ($self->{socket}) {
-        $self->_close_socket;
-    }
-    $self->{connected} = 0;
-    $self->{parser} = undef;
-    $self->{_reading_responses} = 0;
+    # No reconnect handoff — intentional disconnect means stay down.
 
     if ($was_connected && $self->{on_disconnect}) {
-        $self->{on_disconnect}->($self, $reason);
+        $self->{on_disconnect}->($self, 'client disconnect');
     }
 
     # Telemetry: record disconnection
     if ($was_connected && $self->{_telemetry}) {
         $self->{_telemetry}->record_connection(-1);
-        $self->{_telemetry}->log_event('disconnected', $reason);
+        $self->{_telemetry}->log_event('disconnected', 'client disconnect');
     }
 
     return $self;
@@ -463,11 +534,11 @@ sub _check_fork {
         # Fork detected - invalidate connection (parent owns the socket)
         # Don't cancel futures - they belong to the parent's event loop
         # Just clear references so we don't try to use them
-        $self->{connected} = 0;
+        $self->{connected}    = 0;
+        $self->{_socket_live} = 0;
         $self->{socket} = undef;
         $self->{parser} = undef;
         $self->{inflight} = [];
-        $self->{_reading_responses} = 0;
         $self->{_current_read_future} = undef;  # Clear stale reference
 
         my $old_pid = $self->{_pid};
@@ -504,15 +575,19 @@ async sub _send {
     return length($data);
 }
 
-# Add command to inflight queue - returns queue depth
+# Add command to inflight queue - returns queue depth.
+# redis_error_policy: 'fail' (default) fails the future on -ERR frames;
+# 'capture' calls ->done($err_obj) so callers can inspect per-slot errors
+# (used by pipelining in Task N+).
 sub _add_inflight {
-    my ($self, $future, $cmd, $args, $deadline) = @_;
+    my ($self, $future, $cmd, $args, $deadline, $redis_error_policy) = @_;
     push @{$self->{inflight}}, {
-        future   => $future,
-        cmd      => $cmd,
-        args     => $args,
-        deadline => $deadline,
-        sent_at  => Time::HiRes::time(),
+        future      => $future,
+        cmd         => $cmd,
+        args        => $args,
+        deadline    => $deadline,
+        redis_error => $redis_error_policy // 'fail',
+        sent_at     => Time::HiRes::time(),
     };
     return scalar @{$self->{inflight}};
 }
@@ -533,59 +608,139 @@ sub _fail_all_inflight {
     }
 }
 
-# Ensure response reader is running - the core response queue mechanism
-# Only one reader should be active at a time, processing responses in FIFO order
-async sub _ensure_response_reader {
+# The single socket reader. Runs while there is work (inflight or pubsub).
+# Calls _reader_fatal on any stream-alignment failure. _reader_future is
+# cleared on every exit path so _ensure_reader can restart it on the next
+# submission.
+async sub _run_reader {
     my ($self) = @_;
 
-    # Already reading - don't start another reader
-    return if $self->{_reading_responses};
+    while (1) {
+        # Exit conditions.
+        return unless $self->{_socket_live};
+        last if !$self->{in_pubsub} && !@{$self->{inflight}};
+        last if $self->{in_pubsub} && !$self->{_subscription};
 
-    $self->{_reading_responses} = 1;
+        my $head = $self->{inflight}[0];
+        my $deadline = $head ? $head->{deadline} : undef;
 
-    while (@{$self->{inflight}} && $self->{connected}) {
-        my $entry = $self->{inflight}[0];
+        # Set up read future; track so _reader_fatal can cancel it.
+        my $read_f = Future::IO->read($self->{socket}, 65536);
+        $self->{_current_read_future} = $read_f;
 
-        # Read response with deadline from the entry
-        my $response;
-        my $read_ok = eval {
-            $response = await $self->_read_response_with_deadline(
-                $entry->{deadline},
-                $entry->{args}
+        my ($returned_f, $timed_out) = await _await_with_deadline($read_f, $deadline);
+
+        # Clear slot on success path; fatal clears it on timeout/cancel.
+        $self->{_current_read_future} = undef
+            if !$timed_out && $returned_f->is_ready && !$returned_f->is_failed;
+
+        if ($timed_out) {
+            my $err = Async::Redis::Error::Timeout->new(
+                message        => "Request timed out",
+                command        => $head ? $head->{args} : undef,
+                timeout        => $self->{request_timeout},
+                maybe_executed => 1,
             );
-            1;
-        };
-
-        if (!$read_ok) {
-            my $read_error = $@;
-            # Connection/timeout error - fail all inflight and abort
-            $self->_fail_all_inflight($read_error);
-            $self->{_reading_responses} = 0;
+            $self->_reader_fatal($err);
             return;
         }
 
-        # Remove this entry from the queue now that we have its response
-        $self->_shift_inflight;
+        if ($returned_f->is_failed) {
+            my ($rerr) = $returned_f->failure;
+            my $err = Async::Redis::Error::Connection->new(
+                message => "Connection read error: $rerr",
+                host    => $self->{host},
+                port    => $self->{port},
+            );
+            $self->_reader_fatal($err);
+            return;
+        }
 
-        # Decode response (sync operation, eval works fine here)
-        my $result;
-        my $decode_ok = eval {
-            $result = $self->_decode_response($response);
-            1;
-        };
+        my $buf = $returned_f->get;
+        if (!defined $buf || length($buf) == 0) {
+            my $err = Async::Redis::Error::Connection->new(
+                message => "Connection closed by peer",
+                host    => $self->{host},
+                port    => $self->{port},
+            );
+            $self->_reader_fatal($err);
+            return;
+        }
 
-        # Complete the future
-        if (!$decode_ok) {
-            my $decode_error = $@;
-            # Redis error (like WRONGTYPE) - fail just this future
-            $entry->{future}->fail($decode_error) unless $entry->{future}->is_ready;
-        } else {
-            # Success - complete the future with result
-            $entry->{future}->done($result) unless $entry->{future}->is_ready;
+        $self->{parser}->parse($buf);
+
+        # Drain all complete messages the parser has.
+        while (my $msg = $self->{parser}->get_message) {
+            my ($kind, $value) = $self->_decode_response_result($msg);
+
+            if ($kind eq 'protocol_error') {
+                $self->_reader_fatal($value);
+                return;
+            }
+
+            my $is_pubsub_message = 0;
+            if ($self->{in_pubsub} && $kind eq 'ok' && ref($value) eq 'ARRAY') {
+                my $frame_name = $value->[0] // '';
+                $is_pubsub_message = 1
+                    if $frame_name eq 'message'
+                    || $frame_name eq 'pmessage'
+                    || $frame_name eq 'smessage';
+            }
+
+            if ($is_pubsub_message) {
+                my $sub = $self->{_subscription};
+                if (!$sub) {
+                    # No active subscription but got a message frame: strict desync.
+                    $self->_reader_fatal(
+                        Async::Redis::Error::Protocol->new(
+                            message => "message frame but no active subscription",
+                        )
+                    );
+                    return;
+                }
+                # _dispatch_frame is sync today (returns undef) and will become
+                # async in Task 15 (returning a Future for backpressure). Await
+                # only if we got a Future back.
+                my $dispatch_result = $sub->_dispatch_frame($value);
+                if (blessed($dispatch_result) && $dispatch_result->isa('Future')) {
+                    await $dispatch_result;
+                }
+                next;
+            }
+
+            if (!@{$self->{inflight}}) {
+                # Strict: unexpected frame with empty inflight = desync.
+                $self->_reader_fatal(
+                    Async::Redis::Error::Protocol->new(
+                        message => "unexpected frame (kind=$kind) with empty inflight",
+                    )
+                );
+                return;
+            }
+
+            my $entry = shift @{$self->{inflight}};
+            if ($kind eq 'redis_error') {
+                if (($entry->{redis_error} // 'fail') eq 'capture') {
+                    $entry->{future}->done($value) unless $entry->{future}->is_ready;
+                } else {
+                    $entry->{future}->fail($value) unless $entry->{future}->is_ready;
+                }
+            } else {
+                $entry->{future}->done($value) unless $entry->{future}->is_ready;
+            }
         }
     }
+}
 
-    $self->{_reading_responses} = 0;
+# Start the reader if not already running. Idempotent.
+sub _ensure_reader {
+    my ($self) = @_;
+    return if $self->{_reader_future} && !$self->{_reader_future}->is_ready;
+    my $f = $self->_run_reader;
+    $f->on_ready(sub { $self->{_reader_future} = undef });
+    $self->{_reader_future} = $f;
+    $f->retain;
+    return;
 }
 
 # Read and parse one response
@@ -615,31 +770,115 @@ async sub _read_response {
     }
 }
 
+# Dispatch table mapping each blocking command to how its timeout is encoded.
+# position: 'last'         => final argument (seconds)
+# position: N (integer)    => argument at index N (seconds, unless unit=>'ms')
+# position: 'block_option' => scan for BLOCK keyword, next arg is timeout (ms)
+# unit: 'ms'               => divide raw value by 1000 to get seconds
+# A timeout of zero means "block indefinitely" — no client-side deadline.
+my %BLOCKING_TIMEOUT = (
+    BLPOP      => { position => 'last' },
+    BRPOP      => { position => 'last' },
+    BRPOPLPUSH => { position => 'last' },
+    BLMOVE     => { position => 'last' },
+    BZPOPMIN   => { position => 'last' },
+    BZPOPMAX   => { position => 'last' },
+    BLMPOP     => { position => 0 },
+    BZMPOP     => { position => 0 },
+    XREAD      => { position => 'block_option', unit => 'ms' },
+    XREADGROUP => { position => 'block_option', unit => 'ms' },
+    WAIT       => { position => 'last', unit => 'ms' },
+    WAITAOF    => { position => 'last', unit => 'ms' },
+);
+
 # Calculate deadline based on command type
 sub _calculate_deadline {
     my ($self, $cmd, @args) = @_;
-
     $cmd = uc($cmd // '');
 
-    # Blocking commands get extended deadline
-    if ($cmd =~ /^(BLPOP|BRPOP|BLMOVE|BRPOPLPUSH|BLMPOP|BZPOPMIN|BZPOPMAX|BZMPOP)$/) {
-        # Last arg is the timeout for these commands
-        my $server_timeout = $args[-1] // 0;
-        return Time::HiRes::time() + $server_timeout + $self->{blocking_timeout_buffer};
+    my $spec = $BLOCKING_TIMEOUT{$cmd};
+    if (!$spec) {
+        return Time::HiRes::time() + $self->{request_timeout};
     }
 
-    if ($cmd =~ /^(XREAD|XREADGROUP)$/) {
-        # XREAD/XREADGROUP have BLOCK option
+    my $raw;
+    my $pos = $spec->{position};
+
+    if ($pos eq 'last') {
+        $raw = $args[-1];
+    }
+    elsif ($pos eq 'block_option') {
         for my $i (0 .. $#args - 1) {
-            if (uc($args[$i]) eq 'BLOCK') {
-                my $block_ms = $args[$i + 1] // 0;
-                return Time::HiRes::time() + ($block_ms / 1000) + $self->{blocking_timeout_buffer};
+            if (uc($args[$i] // '') eq 'BLOCK') {
+                $raw = $args[$i + 1];
+                last;
             }
         }
+        # No BLOCK option found — non-blocking variant; use request_timeout
+        return Time::HiRes::time() + $self->{request_timeout}
+            unless defined $raw;
+    }
+    else {
+        # Numeric index into @args
+        $raw = $args[$pos];
     }
 
-    # Normal commands use request_timeout
-    return Time::HiRes::time() + $self->{request_timeout};
+    if (!defined $raw || $raw !~ /^-?\d+(?:\.\d+)?$/) {
+        warn "_calculate_deadline: non-numeric timeout for $cmd; falling back to request_timeout\n";
+        return Time::HiRes::time() + $self->{request_timeout};
+    }
+
+    my $seconds = ($spec->{unit} // 'seconds') eq 'ms'
+        ? $raw / 1000
+        : $raw + 0;
+
+    # Zero means block indefinitely — no client-side deadline
+    return undef if $seconds == 0;
+
+    return Time::HiRes::time() + $seconds + $self->{blocking_timeout_buffer};
+}
+
+sub _ssl_verify_peer {
+    require IO::Socket::SSL;
+    return IO::Socket::SSL::SSL_VERIFY_PEER();
+}
+
+sub _ssl_verify_none {
+    require IO::Socket::SSL;
+    return IO::Socket::SSL::SSL_VERIFY_NONE();
+}
+
+# Build the IO::Socket::SSL option hash for the current connection.
+# Handles chain verification, SNI, hostname identity checking, and
+# client cert/key/CA forwarding. Called by _tls_upgrade and directly
+# by unit tests.
+sub _build_tls_options {
+    my ($self) = @_;
+    my %ssl_opts = (SSL_startHandshake => 0);
+
+    my $tls      = $self->{tls};
+    my $tls_hash = ref $tls eq 'HASH' ? $tls : {};
+
+    my $verify          = exists $tls_hash->{verify}          ? !!$tls_hash->{verify}          : 1;
+    my $verify_hostname = exists $tls_hash->{verify_hostname} ? !!$tls_hash->{verify_hostname} : 1;
+
+    $ssl_opts{SSL_ca_file}   = $tls_hash->{ca_file}   if $tls_hash->{ca_file};
+    $ssl_opts{SSL_cert_file} = $tls_hash->{cert_file} if $tls_hash->{cert_file};
+    $ssl_opts{SSL_key_file}  = $tls_hash->{key_file}  if $tls_hash->{key_file};
+
+    if ($verify) {
+        $ssl_opts{SSL_verify_mode} = $self->_ssl_verify_peer;
+        $ssl_opts{SSL_hostname}    = $self->{host};
+
+        if ($verify_hostname) {
+            $ssl_opts{SSL_verifycn_name}   = $self->{host};
+            $ssl_opts{SSL_verifycn_scheme} = 'default';
+        }
+    } else {
+        $ssl_opts{SSL_verify_mode} = $self->_ssl_verify_none;
+    }
+
+    return %ssl_opts;
 }
 
 # Non-blocking TLS upgrade
@@ -648,26 +887,7 @@ async sub _tls_upgrade {
 
     require IO::Socket::SSL;
 
-    # Build SSL options
-    my %ssl_opts = (
-        SSL_startHandshake => 0,  # Don't block during start_SSL!
-    );
-
-    if (ref $self->{tls} eq 'HASH') {
-        $ssl_opts{SSL_ca_file}    = $self->{tls}{ca_file} if $self->{tls}{ca_file};
-        $ssl_opts{SSL_cert_file}  = $self->{tls}{cert_file} if $self->{tls}{cert_file};
-        $ssl_opts{SSL_key_file}   = $self->{tls}{key_file} if $self->{tls}{key_file};
-
-        if (exists $self->{tls}{verify}) {
-            $ssl_opts{SSL_verify_mode} = $self->{tls}{verify}
-                ? IO::Socket::SSL::SSL_VERIFY_PEER()
-                : IO::Socket::SSL::SSL_VERIFY_NONE();
-        } else {
-            $ssl_opts{SSL_verify_mode} = IO::Socket::SSL::SSL_VERIFY_PEER();
-        }
-    } else {
-        $ssl_opts{SSL_verify_mode} = IO::Socket::SSL::SSL_VERIFY_PEER();
-    }
+    my %ssl_opts = $self->_build_tls_options;
 
     # Start SSL (does not block because SSL_startHandshake => 0)
     IO::Socket::SSL->start_SSL($socket, %ssl_opts)
@@ -791,6 +1011,25 @@ async sub _reconnect {
     $self->{_reconnect_attempt} = 0;
 }
 
+# Ensure the socket is live, reconnecting if configured.
+# Deduplicates concurrent reconnect requests via _reconnect_future.
+# NOTE: the dedupe is race-safe only when called from inside the write
+# gate (which serialises callers). Outside the gate, a failed reconnect
+# could be observed after on_ready clears the slot, allowing a second
+# reconnect to start before state converges.
+async sub _ensure_connected {
+    my ($self) = @_;
+    return if $self->{_socket_live};
+    if (my $f = $self->{_reconnect_future}) {
+        await $f;
+        return;
+    }
+    my $f = $self->_reconnect;
+    $self->{_reconnect_future} = $f;
+    $f->on_ready(sub { $self->{_reconnect_future} = undef });
+    await $f;
+}
+
 # Reconnect and replay pubsub subscriptions
 async sub _reconnect_pubsub {
     my ($self) = @_;
@@ -811,20 +1050,63 @@ async sub _reconnect_pubsub {
 
     await $self->_reconnect;
 
-    # Replay all subscription commands
+    # Re-enter pubsub mode before replaying so the unified reader
+    # classifies incoming message frames correctly during replay.
+    $self->{in_pubsub} = 1;
+
+    # Replay all subscription commands through the write gate and unified
+    # reader. Each channel/pattern gets its own command so confirmations
+    # are matched one-to-one via the inflight queue.
     for my $cmd (@replay) {
         my ($command, @args) = @$cmd;
-
-        await $self->_send_command($command, @args);
-
-        # Read and discard subscription confirmations
         for my $arg (@args) {
-            await $self->_read_pubsub_frame();
+            await $self->_pubsub_command($command, $arg);
         }
     }
+}
 
-    # Re-enter pubsub mode
-    $self->{in_pubsub} = 1;
+# Asynchronously reconnect after a pubsub connection drop. Called by
+# _reader_fatal when reconnect is enabled and a subscription is active.
+# Fires _resume_after_reconnect on the subscription on success, or
+# _fail_fatal on unrecoverable reconnect failure.
+sub _reconnect_async {
+    my ($self, $sub) = @_;
+
+    weaken(my $weak_self = $self);
+    weaken(my $weak_sub  = $sub);
+
+    my $f = (async sub {
+        my @replay = $weak_sub ? $weak_sub->get_replay_commands : ();
+
+        # Reconnect loop — mirrors _ensure_connected.
+        await $weak_self->_reconnect;
+
+        # Replay subscriptions via the unified reader.
+        $weak_self->{in_pubsub} = 1;
+        for my $cmd (@replay) {
+            my ($command, @args) = @$cmd;
+            for my $arg (@args) {
+                await $weak_self->_pubsub_command($command, $arg);
+            }
+        }
+
+        if ($weak_sub) {
+            if (my $cb = $weak_sub->{_on_reconnect}) {
+                $cb->($weak_sub);
+            }
+            # Restart the driver in whichever mode the subscription is in.
+            $weak_sub->_start_driver($weak_sub->{_on_message} ? 0 : 1);
+        }
+    })->();
+
+    $f->on_fail(sub {
+        my $err = shift;
+        return unless $weak_sub;
+        $weak_sub->_fail_fatal($err);
+    });
+
+    $f->retain;
+    return;
 }
 
 # Execute a Redis command
@@ -856,15 +1138,6 @@ async sub command {
         return await $self->{_auto_pipeline}->command($cmd, @args);
     }
 
-    # If disconnected and reconnect enabled, try to reconnect
-    if (!$self->{connected} && $self->{reconnect}) {
-        await $self->_reconnect;
-    }
-
-    die Async::Redis::Error::Disconnected->new(
-        message => "Not connected",
-    ) unless $self->{connected};
-
     # Telemetry: start span and log send
     my $span_context;
     my $start_time = Time::HiRes::time();
@@ -873,43 +1146,41 @@ async sub command {
         $self->{_telemetry}->log_send($cmd, @args);
     }
 
-    my $raw_cmd = $self->_build_command($cmd, @args);
-
-    # Calculate deadline based on command type
+    my $raw_cmd  = $self->_build_command($cmd, @args);
     my $deadline = $self->_calculate_deadline($cmd, @args);
-
-    # Create response future and register in inflight queue BEFORE sending
-    # This ensures responses are matched in order
-    my $response_future = Future->new;
-    $self->_add_inflight($response_future, $cmd, \@args, $deadline);
+    my $response = Future->new;
 
     my $result;
     my $error;
 
-    my $send_ok = eval {
-        # Send command
-        await $self->_send($raw_cmd);
+    my $submit_ok = eval {
+        await $self->_with_write_gate(sub {
+            return (async sub {
+                # Ensure the socket is live. Reconnect if enabled, else fail.
+                if (!$self->{_socket_live}) {
+                    if ($self->_reconnect_enabled) {
+                        await $self->_ensure_connected;
+                    } else {
+                        die Async::Redis::Error::Disconnected->new(
+                            message => "Not connected",
+                        );
+                    }
+                }
+                # Register inflight BEFORE writing so order matches the wire.
+                $self->_add_inflight($response, $cmd, \@args, $deadline, 'fail');
+                await $self->_send($raw_cmd);
+            })->();
+        });
         1;
     };
 
-    if (!$send_ok) {
+    if (!$submit_ok) {
         $error = $@;
-        # Send failed - remove from inflight and fail
-        $self->_shift_inflight;  # Remove the entry we just added
-        $response_future->fail($error) unless $response_future->is_ready;
+        # _with_write_gate already called _reader_fatal on write failure.
     } else {
-        # Trigger the response reader (fire and forget - it runs in background)
-        $self->_ensure_response_reader->retain;
-
-        # Wait for our response future to be completed by the reader
-        my $await_ok = eval {
-            $result = await $response_future;
-            1;
-        };
-
-        if (!$await_ok) {
-            $error = $@;
-        }
+        $self->_ensure_reader;
+        my $await_ok = eval { $result = await $response; 1 };
+        if (!$await_ok) { $error = $@ }
     }
 
     # Telemetry: log result and end span
@@ -1038,14 +1309,160 @@ sub _reset_connection {
         $self->_close_socket;
     }
 
-    $self->{connected} = 0;
-    $self->{parser} = undef;
-    $self->{_reading_responses} = 0;
-    $self->{in_pubsub} = 0;
+    $self->{_socket_live}       = 0;
+    $self->{_fatal_in_progress} = 0;
+    $self->{_reader_future}     = undef;
+    $self->{_reconnect_future}  = undef;
+    $self->{connected}          = 0;
+    $self->{parser}             = undef;
+    $self->{in_pubsub}          = 0;
 
     if ($was_connected && $self->{on_disconnect}) {
         $self->{on_disconnect}->($self, $reason);
     }
+}
+
+# Async write lock. The lock is a Future that resolves when the current
+# holder releases. Waiters chain onto it; each waiter replaces the slot
+# with its own Future before returning to the caller.
+async sub _acquire_write_lock {
+    my ($self) = @_;
+
+    # Wait out any in-progress fatal. _reader_fatal is synchronous so this
+    # is typically immediate, but a callback inside fatal could yield.
+    # NOTE: this is a poll loop (sleep(0) per tick). Acceptable because
+    # _reader_fatal's transition is synchronous; if teardown ever becomes
+    # async, replace with a one-shot Future waiters can await on.
+    while ($self->{_fatal_in_progress}) {
+        await Future::IO->sleep(0);
+    }
+
+    # Chain onto the existing lock Future if any.
+    while (my $prev = $self->{_write_lock}) {
+        await $prev;
+    }
+
+    # We are the owner now. Install our own Future so the next caller
+    # waits on us.
+    $self->{_write_lock} = Future->new;
+    return;
+}
+
+sub _release_write_lock {
+    my ($self) = @_;
+    my $f = delete $self->{_write_lock};
+    $f->done if $f && !$f->is_ready;
+}
+
+# Wrap a body in gate acquire/release with guaranteed release even if the
+# body dies. On body failure, calls _reader_fatal with a transport error.
+async sub _with_write_gate {
+    my ($self, $body) = @_;
+    await $self->_acquire_write_lock;
+    my $ok = eval { await $body->(); 1 };
+    my $err = $@;
+    $self->_release_write_lock;
+    if (!$ok) {
+        # Convert to a typed transport error if not already.
+        my $typed = (ref $err && eval { $err->isa('Async::Redis::Error') })
+            ? $err
+            : Async::Redis::Error::Connection->new(
+                message => "Write failed: $err",
+                host    => $self->{host},
+                port    => $self->{port},
+            );
+        $self->_reader_fatal($typed);
+        die $typed;
+    }
+    return;
+}
+
+# Is reconnect enabled for this client?
+sub _reconnect_enabled {
+    my ($self) = @_;
+    return !!$self->{reconnect};
+}
+
+# Central "something went wrong with the stream" transition. Detaches
+# inflight BEFORE closing the socket so the typed error is preserved
+# (the old _reset_connection cancels inflight directly, which would
+# overwrite $typed_error with a generic cancellation).
+sub _reader_fatal {
+    my ($self, $typed_error) = @_;
+
+    return if $self->{_fatal_in_progress};
+    $self->{_fatal_in_progress} = 1;
+
+    my $ok = eval {
+        # 1. Capture pre-reset state BEFORE any mutation.
+        my $was_connected = $self->{connected};
+        my $was_pubsub    = $self->{in_pubsub};
+        my $subscription  = $self->{_subscription};
+
+        # 2. Detach inflight so the close path cannot cancel them.
+        my $detached_inflight = $self->{inflight};
+        $self->{inflight} = [];
+
+        # 3. Detach auto-pipeline's queued-but-not-registered commands.
+        my $detached_autopipe = [];
+        if (my $ap = $self->{_auto_pipeline}) {
+            $detached_autopipe = $ap->_detach_queued;
+        }
+
+        # 4. Cancel the current read BEFORE closing the socket.
+        if ($self->{_current_read_future}
+            && !$self->{_current_read_future}->is_ready) {
+            $self->{_current_read_future}->cancel;
+        }
+        $self->{_current_read_future} = undef;
+
+        # 5. Close socket, clear internal state.
+        $self->_close_socket if $self->{socket};
+        $self->{_socket_live}   = 0;
+        $self->{connected}      = 0;
+        $self->{parser}         = undef;
+        $self->{in_pubsub}      = 0;
+        $self->{_reader_future} = undef;
+
+        # 6. Fail all detached futures with the SAME typed error.
+        for my $entry (@$detached_inflight, @$detached_autopipe) {
+            next if $entry->{future}->is_ready;
+            $entry->{future}->fail($typed_error);
+        }
+
+        # 7. Pubsub reconnect handoff. _fail_fatal and _pause_for_reconnect
+        #    land in Phase 2 (Task 14); for now this branch only triggers
+        #    when the subscription API is used, and we call the older
+        #    _close path as a placeholder until Task 14 replaces it.
+        if ($was_pubsub && $subscription) {
+            if ($self->_reconnect_enabled
+                && $subscription->can('_pause_for_reconnect')) {
+                $subscription->_pause_for_reconnect;
+                if ($self->can('_reconnect_async')) {
+                    $self->_reconnect_async($subscription);
+                }
+            }
+            elsif ($subscription->can('_fail_fatal')) {
+                $subscription->_fail_fatal($typed_error);
+            }
+            else {
+                # Pre-Phase-2 fallback: existing _close method.
+                $subscription->_close if $subscription->can('_close');
+            }
+        }
+
+        # 8. on_disconnect: only if we were publicly connected.
+        if ($was_connected && $self->{on_disconnect}) {
+            $self->{on_disconnect}->($self, "$typed_error");
+        }
+
+        1;
+    };
+
+    my $caught = $@;
+    # Always clear the guard, even if a callback died.
+    $self->{_fatal_in_progress} = 0;
+    die $caught if !$ok && $caught;
 }
 
 # Decode Protocol::Redis response to Perl value
@@ -1080,6 +1497,54 @@ sub _decode_response {
     }
 
     return $data;
+}
+
+# Non-throwing decoder used by the unified reader. Classifies each frame
+# as one of:
+#   ('ok',             $decoded_value)      - normal response
+#   ('redis_error',    $error_object)       - -ERR frame from Redis
+#   ('protocol_error', $error_object)       - fatal desync (malformed)
+sub _decode_response_result {
+    my ($self, $msg) = @_;
+
+    if (!defined $msg) {
+        return ('protocol_error', Async::Redis::Error::Protocol->new(
+            message => 'undef message from parser',
+        ));
+    }
+
+    my $type = $msg->{type} // '';
+    my $data = $msg->{data};
+
+    if ($type eq '+') {
+        return ('ok', $data);
+    }
+    elsif ($type eq '-') {
+        return ('redis_error', Async::Redis::Error::Redis->from_message($data));
+    }
+    elsif ($type eq ':') {
+        return ('ok', 0 + ($data // 0));
+    }
+    elsif ($type eq '$') {
+        return ('ok', $data);
+    }
+    elsif ($type eq '*') {
+        return ('ok', undef) if !defined $data;   # nil array
+        my @out;
+        for my $child (@$data) {
+            my ($k, $v) = $self->_decode_response_result($child);
+            if ($k eq 'protocol_error') {
+                return ($k, $v);   # propagate fatal
+            }
+            push @out, $v;
+        }
+        return ('ok', \@out);
+    }
+    else {
+        return ('protocol_error', Async::Redis::Error::Protocol->new(
+            message => "unknown frame type: $type",
+        ));
+    }
 }
 
 # ============================================================================
@@ -1574,20 +2039,25 @@ async sub subscribe {
     # Wait for pending commands before entering PubSub mode
     await $self->_wait_for_inflight_drain;
 
+    # Clear a stale closed subscription so we allocate a fresh object.
+    if ($self->{_subscription} && $self->{_subscription}->is_closed) {
+        delete $self->{_subscription};
+    }
+
     # Create or reuse subscription
     my $sub = $self->{_subscription} //= Async::Redis::Subscription->new(redis => $self);
 
-    # Send SUBSCRIBE command
-    await $self->_send_command('SUBSCRIBE', @channels);
+    # Set in_pubsub BEFORE submitting so the unified reader classifies
+    # racing message frames correctly (e.g. published before our
+    # confirmation arrives).
+    $self->{in_pubsub} = 1;
 
-    # Read subscription confirmations
+    # Issue one SUBSCRIBE per channel through the write gate and unified
+    # reader. Each call awaits its matching confirmation frame.
     for my $ch (@channels) {
-        my $msg = await $self->_read_pubsub_frame();
-        # Response: ['subscribe', $channel, $count]
+        await $self->_pubsub_command('SUBSCRIBE', $ch);
         $sub->_add_channel($ch);
     }
-
-    $self->{in_pubsub} = 1;
 
     return $sub;
 }
@@ -1603,16 +2073,19 @@ async sub psubscribe {
     # Wait for pending commands before entering PubSub mode
     await $self->_wait_for_inflight_drain;
 
-    my $sub = $self->{_subscription} //= Async::Redis::Subscription->new(redis => $self);
-
-    await $self->_send_command('PSUBSCRIBE', @patterns);
-
-    for my $p (@patterns) {
-        my $msg = await $self->_read_pubsub_frame();
-        $sub->_add_pattern($p);
+    # Clear a stale closed subscription so we allocate a fresh object.
+    if ($self->{_subscription} && $self->{_subscription}->is_closed) {
+        delete $self->{_subscription};
     }
 
+    my $sub = $self->{_subscription} //= Async::Redis::Subscription->new(redis => $self);
+
     $self->{in_pubsub} = 1;
+
+    for my $p (@patterns) {
+        await $self->_pubsub_command('PSUBSCRIBE', $p);
+        $sub->_add_pattern($p);
+    }
 
     return $sub;
 }
@@ -1628,16 +2101,19 @@ async sub ssubscribe {
     # Wait for pending commands before entering PubSub mode
     await $self->_wait_for_inflight_drain;
 
-    my $sub = $self->{_subscription} //= Async::Redis::Subscription->new(redis => $self);
-
-    await $self->_send_command('SSUBSCRIBE', @channels);
-
-    for my $ch (@channels) {
-        my $msg = await $self->_read_pubsub_frame();
-        $sub->_add_sharded_channel($ch);
+    # Clear a stale closed subscription so we allocate a fresh object.
+    if ($self->{_subscription} && $self->{_subscription}->is_closed) {
+        delete $self->{_subscription};
     }
 
+    my $sub = $self->{_subscription} //= Async::Redis::Subscription->new(redis => $self);
+
     $self->{in_pubsub} = 1;
+
+    for my $ch (@channels) {
+        await $self->_pubsub_command('SSUBSCRIBE', $ch);
+        $sub->_add_sharded_channel($ch);
+    }
 
     return $sub;
 }
@@ -1652,6 +2128,46 @@ async sub _read_pubsub_frame {
 
     my $msg = await $self->_read_response();
     return $self->_decode_response($msg);
+}
+
+# Execute a single pubsub management command (SUBSCRIBE, UNSUBSCRIBE,
+# PSUBSCRIBE, PUNSUBSCRIBE, SSUBSCRIBE, SUNSUBSCRIBE) through the write
+# gate and unified reader. Each call registers one inflight entry and
+# awaits the matching confirmation frame from the reader.
+#
+# Use instead of _send_command + _read_pubsub_frame when in_pubsub=1
+# so that the unified reader (_run_reader) remains the sole socket
+# reader. Does not apply prefix or go through auto-pipeline.
+async sub _pubsub_command {
+    my ($self, $cmd, @args) = @_;
+
+    my $raw_cmd  = $self->_build_command($cmd, @args);
+    my $deadline = $self->_calculate_deadline($cmd, @args);
+    my $response = Future->new;
+
+    my $submit_ok = eval {
+        await $self->_with_write_gate(sub {
+            return (async sub {
+                if (!$self->{_socket_live}) {
+                    die Async::Redis::Error::Disconnected->new(
+                        message => "Not connected",
+                    );
+                }
+                # Register inflight BEFORE writing so order matches the wire.
+                $self->_add_inflight($response, $cmd, \@args, $deadline, 'fail');
+                await $self->_send($raw_cmd);
+            })->();
+        });
+        1;
+    };
+
+    unless ($submit_ok) {
+        my $err = $@;
+        die $err;
+    }
+
+    $self->_ensure_reader;
+    return await $response;
 }
 
 # Send command without reading response (for pubsub)
@@ -1688,64 +2204,70 @@ sub pipeline {
 # Execute multiple commands, return all responses
 async sub _execute_pipeline {
     my ($self, $commands) = @_;
-
-    die "Not connected" unless $self->{connected};
-
     return [] unless @$commands;
 
-    # Wait for any inflight regular commands to complete before pipeline
-    # This prevents interleaving pipeline responses with regular command responses
-    await $self->_wait_for_inflight_drain;
-
-    # Take over reading - prevent response reader from running
-    $self->{_reading_responses} = 1;
-
     my $start_time = Time::HiRes::time();
-    my @responses;
-    my $count = scalar @$commands;
+    my $count      = scalar @$commands;
 
-    my $ok = eval {
-        # Send all commands
-        my $data = '';
-        for my $cmd (@$commands) {
-            $data .= $self->_build_command(@$cmd);
-        }
-        await $self->_send($data);
-
-        # Read all responses, capturing per-slot Redis errors
-        for my $i (1 .. $count) {
-            my $msg = await $self->_read_response();
-
-            # Capture Redis errors inline rather than dying
-            my $result;
-            eval {
-                $result = $self->_decode_response($msg);
-            };
-            if ($@) {
-                # Capture the error object inline in the results
-                $result = $@;
-            }
-            push @responses, $result;
-        }
-        1;
-    };
-
-    my $error = $@;
-
-    # Release reading lock
-    $self->{_reading_responses} = 0;
-
-    if (!$ok) {
-        die $error;
+    # Build one RESP buffer and one Future per command up front.
+    my $buffer = '';
+    my @futures;
+    my @deadlines;
+    for my $cmd (@$commands) {
+        $buffer .= $self->_build_command(@$cmd);
+        push @futures, Future->new;
+        push @deadlines, $self->_calculate_deadline(@$cmd);
     }
 
-    # Telemetry: record pipeline metrics
+    await $self->_with_write_gate(sub {
+        return (async sub {
+            if (!$self->{_socket_live}) {
+                if ($self->_reconnect_enabled) {
+                    await $self->_ensure_connected;
+                } else {
+                    die Async::Redis::Error::Disconnected->new(
+                        message => "Not connected",
+                    );
+                }
+            }
+            for my $i (0 .. $#$commands) {
+                $self->_add_inflight(
+                    $futures[$i],
+                    $commands->[$i][0],
+                    [ @{$commands->[$i]}[1..$#{$commands->[$i]}] ],
+                    $deadlines[$i],
+                    'capture',
+                );
+            }
+            await $self->_send($buffer);
+        })->();
+    });
+
+    $self->_ensure_reader;
+
+    # Await every future. capture policy means Redis errors come back as
+    # done($error_object); transport failures come back as fail().
+    my @results;
+    for my $i (0 .. $#futures) {
+        my $ok = eval { push @results, await $futures[$i]; 1 };
+        next if $ok;
+        # Transport failure mid-pipeline: the remaining futures already
+        # got _reader_fatal's typed error. Collect them too (as error
+        # values) so the caller sees a full array.
+        push @results, $@;
+        for my $j ($i + 1 .. $#futures) {
+            my $r_ok = eval { push @results, await $futures[$j]; 1 };
+            push @results, $@ unless $r_ok;
+        }
+        last;
+    }
+
     if ($self->{_telemetry}) {
         my $elapsed_ms = (Time::HiRes::time() - $start_time) * 1000;
         $self->{_telemetry}->record_pipeline($count, $elapsed_ms);
     }
 
-    return \@responses;
+    return \@results;
 }
 
 1;
@@ -1998,6 +2520,28 @@ OpenTelemetry tracer for span creation.
 OpenTelemetry meter for metrics.
 
 =back
+
+=head2 PREFIX LIMITATIONS
+
+The C<prefix> option is a convenience for namespacing keys; it is not a hard
+security boundary. Key extraction is driven by a hand-maintained map
+covering common Redis commands. As of 0.002000, the following commands have
+incomplete or missing key extraction: BITFIELD, LMPOP, BLMPOP, ZINTERCARD,
+LCS, GEORADIUS_RO, GEORADIUSBYMEMBER_RO. Calls to these commands will not
+have prefixes applied. For multi-tenant isolation, use Redis ACLs or
+separate Redis databases rather than relying on C<prefix>.
+
+=head2 TLS HOSTNAME VERIFICATION
+
+Starting in 0.002000, TLS connections verify the server certificate's
+hostname (or IP SAN) by default when C<verify> is on. If you connect by
+hostname, the certificate must have a matching CN or SAN. If you connect by
+IP literal, the certificate must have a matching IP SAN.
+
+For deployments where the certificate does not match the connected
+hostname/IP (common when connecting to internal IPs with hostname-only
+certs), set C<< tls => { verify_hostname => 0 } >> to skip hostname
+identity while still verifying the CA chain.
 
 =head1 METHODS
 
@@ -2404,6 +2948,43 @@ This enables:
 =item * Metrics: command latency, connection counts, errors
 
 =item * Automatic attribute extraction (command, database, etc.)
+
+=back
+
+=head2 OPENTELEMETRY ARGUMENTS
+
+Starting in 0.002000, command arguments are no longer included in spans by
+default. Redis values frequently contain session tokens, user IDs, and
+other PII; exporting them to a tracing backend is a privacy hazard. Pass
+C<< otel_include_args => 1 >> to re-enable, and implement custom redaction
+for your data shapes before doing so.
+
+=head2 MESSAGE QUEUE DEPTH
+
+C<message_queue_depth> limits the number of queued pubsub messages.
+Callback invocation is always serialized. With C<< message_queue_depth => 1 >>
+(the default), one message may be queued while one callback is still
+processing; the reader pauses when that queue slot is full. Higher values
+allow more messages to buffer locally before the reader pauses.
+
+=head1 KNOWN LIMITATIONS
+
+=over
+
+=item * Hostname resolution is synchronous. C<connect()> calls
+C<inet_aton> before the async connect, which blocks during DNS lookup.
+Not covered by C<connect_timeout>.
+
+=item * IPv6 URI hosts are not yet supported.
+
+=item * C<define_command(install =E<gt> 1)> installs a method into the
+C<Async::Redis> package globally, affecting all instances in the process.
+Use C<run_script> for per-instance dispatch if you need isolation.
+
+=item * Some generated wrappers expose mode-changing commands (HELLO,
+CLIENT REPLY, MONITOR, SYNC, PSYNC) that interact poorly with the
+response model. Avoid them unless you understand the protocol
+consequences.
 
 =back
 

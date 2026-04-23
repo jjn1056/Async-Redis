@@ -150,7 +150,7 @@ sub new {
         tracer           => $args{tracer},         # OTel tracer
         meter            => $args{meter},          # OTel meter
         debug            => $args{debug},          # Debug logger
-        include_args     => $args{include_args} // 1,
+        include_args     => $args{include_args} // 0,
         redact           => $args{redact} // 1,
         host             => $args{host} // 'localhost',
         port             => $args{port} // 6379,
