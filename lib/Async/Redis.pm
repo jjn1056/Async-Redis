@@ -745,31 +745,72 @@ async sub _read_response {
     }
 }
 
+# Dispatch table mapping each blocking command to how its timeout is encoded.
+# position: 'last'         => final argument (seconds)
+# position: N (integer)    => argument at index N (seconds, unless unit=>'ms')
+# position: 'block_option' => scan for BLOCK keyword, next arg is timeout (ms)
+# unit: 'ms'               => divide raw value by 1000 to get seconds
+# A timeout of zero means "block indefinitely" — no client-side deadline.
+my %BLOCKING_TIMEOUT = (
+    BLPOP      => { position => 'last' },
+    BRPOP      => { position => 'last' },
+    BRPOPLPUSH => { position => 'last' },
+    BLMOVE     => { position => 'last' },
+    BZPOPMIN   => { position => 'last' },
+    BZPOPMAX   => { position => 'last' },
+    BLMPOP     => { position => 0 },
+    BZMPOP     => { position => 0 },
+    XREAD      => { position => 'block_option', unit => 'ms' },
+    XREADGROUP => { position => 'block_option', unit => 'ms' },
+    WAIT       => { position => 'last', unit => 'ms' },
+    WAITAOF    => { position => 'last', unit => 'ms' },
+);
+
 # Calculate deadline based on command type
 sub _calculate_deadline {
     my ($self, $cmd, @args) = @_;
-
     $cmd = uc($cmd // '');
 
-    # Blocking commands get extended deadline
-    if ($cmd =~ /^(BLPOP|BRPOP|BLMOVE|BRPOPLPUSH|BLMPOP|BZPOPMIN|BZPOPMAX|BZMPOP)$/) {
-        # Last arg is the timeout for these commands
-        my $server_timeout = $args[-1] // 0;
-        return Time::HiRes::time() + $server_timeout + $self->{blocking_timeout_buffer};
+    my $spec = $BLOCKING_TIMEOUT{$cmd};
+    if (!$spec) {
+        return Time::HiRes::time() + $self->{request_timeout};
     }
 
-    if ($cmd =~ /^(XREAD|XREADGROUP)$/) {
-        # XREAD/XREADGROUP have BLOCK option
+    my $raw;
+    my $pos = $spec->{position};
+
+    if ($pos eq 'last') {
+        $raw = $args[-1];
+    }
+    elsif ($pos eq 'block_option') {
         for my $i (0 .. $#args - 1) {
-            if (uc($args[$i]) eq 'BLOCK') {
-                my $block_ms = $args[$i + 1] // 0;
-                return Time::HiRes::time() + ($block_ms / 1000) + $self->{blocking_timeout_buffer};
+            if (uc($args[$i] // '') eq 'BLOCK') {
+                $raw = $args[$i + 1];
+                last;
             }
         }
+        # No BLOCK option found — non-blocking variant; use request_timeout
+        return Time::HiRes::time() + $self->{request_timeout}
+            unless defined $raw;
+    }
+    else {
+        # Numeric index into @args
+        $raw = $args[$pos];
     }
 
-    # Normal commands use request_timeout
-    return Time::HiRes::time() + $self->{request_timeout};
+    if (!defined $raw || $raw !~ /^-?\d+(?:\.\d+)?$/) {
+        warn "_calculate_deadline: non-numeric timeout for $cmd; falling back to request_timeout\n";
+        return Time::HiRes::time() + $self->{request_timeout};
+    }
+
+    my $seconds = ($spec->{unit} // 'seconds') eq 'ms'
+        ? $raw / 1000
+        : $raw + 0;
+
+    # Zero means block indefinitely — no client-side deadline
+    return undef if $seconds == 0;
+
+    return Time::HiRes::time() + $seconds + $self->{blocking_timeout_buffer};
 }
 
 # Non-blocking TLS upgrade
