@@ -142,7 +142,7 @@ sub new {
         connected          => 0,
         _socket_live       => 0,
         _fatal_in_progress => 0,
-        _reader_future     => undef,
+        _reader_running    => 0,   # dedup guard; the selector owns the reader Future itself
         _write_lock        => undef,     # will be a Future used as a lock, populated lazily
         _reconnect_future  => undef,
         _tasks             => Future::Selector->new,
@@ -460,7 +460,7 @@ sub disconnect {
     $self->_close_socket if $self->{socket};
     $self->{_socket_live}       = 0;
     $self->{_fatal_in_progress} = 0;
-    $self->{_reader_future}     = undef;
+    $self->{_reader_running}    = 0;
     $self->{_reconnect_future}  = undef;
     $self->{connected}          = 0;
     $self->{parser}             = undef;
@@ -611,9 +611,9 @@ sub _fail_all_inflight {
 }
 
 # The single socket reader. Runs while there is work (inflight or pubsub).
-# Calls _reader_fatal on any stream-alignment failure. _reader_future is
-# cleared on every exit path so _ensure_reader can restart it on the next
-# submission.
+# Calls _reader_fatal on any stream-alignment failure. The selector
+# (_tasks) owns this task; _reader_running is cleared on every exit path
+# via on_ready so _ensure_reader can restart it on the next submission.
 async sub _run_reader {
     my ($self) = @_;
 
@@ -735,13 +735,24 @@ async sub _run_reader {
 }
 
 # Start the reader if not already running. Idempotent.
+#
+# Ownership: the reader Future lives in $self->{_tasks} (a Future::Selector).
+# The selector holds the strong reference and auto-removes the item on
+# completion. $self->{_reader_running} is a boolean dedup guard — it's NOT
+# a second source of truth about ownership, only a "is one already running?"
+# flag that's cheap to check without peeking at selector internals.
+#
+# Failure propagation: because the reader is in the selector, any awaiting
+# caller using $self->{_tasks}->run_until_ready($their_future) will see the
+# reader's failure propagated to them. That's the structured-concurrency
+# guarantee — no hanging callers when the reader dies unhandled.
 sub _ensure_reader {
     my ($self) = @_;
-    return if $self->{_reader_future} && !$self->{_reader_future}->is_ready;
+    return if $self->{_reader_running};
+    $self->{_reader_running} = 1;
     my $f = $self->_run_reader;
-    $f->on_ready(sub { $self->{_reader_future} = undef });
-    $self->{_reader_future} = $f;
-    $f->retain;
+    $f->on_ready(sub { $self->{_reader_running} = 0 });
+    $self->{_tasks}->add(data => 'reader', f => $f);
     return;
 }
 
@@ -1181,7 +1192,14 @@ async sub command {
         # _with_write_gate already called _reader_fatal on write failure.
     } else {
         $self->_ensure_reader;
-        my $await_ok = eval { $result = await $response; 1 };
+        # run_until_ready awaits $response while the selector pumps the
+        # reader (and any other adopted tasks). If any selector task fails
+        # unhandled — in particular, the reader — the failure propagates
+        # here, so callers never hang waiting on a dead reader.
+        my $await_ok = eval {
+            $result = await $self->{_tasks}->run_until_ready($response);
+            1;
+        };
         if (!$await_ok) { $error = $@ }
     }
 
@@ -1313,7 +1331,7 @@ sub _reset_connection {
 
     $self->{_socket_live}       = 0;
     $self->{_fatal_in_progress} = 0;
-    $self->{_reader_future}     = undef;
+    $self->{_reader_running}    = 0;
     $self->{_reconnect_future}  = undef;
     $self->{connected}          = 0;
     $self->{parser}             = undef;
@@ -1424,7 +1442,7 @@ sub _reader_fatal {
         $self->{connected}      = 0;
         $self->{parser}         = undef;
         $self->{in_pubsub}      = 0;
-        $self->{_reader_future} = undef;
+        $self->{_reader_running} = 0;
 
         # 6. Fail all detached futures with the SAME typed error.
         for my $entry (@$detached_inflight, @$detached_autopipe) {
