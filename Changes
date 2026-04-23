@@ -1,5 +1,70 @@
 Revision history for Future-IO-Redis
 
+0.002000  2026-04-22
+    - Architectural: unified single-reader socket ownership model
+        - One reader loop dispatches frames to inflight queue or active
+          subscription by frame type and connection mode
+        - Pipelines, auto-pipeline, and pubsub all participate in the
+          same FIFO via inflight entries; the _reading_responses flag
+          is removed
+        - Every submission goes through a write gate so inflight
+          registration order matches wire-write order
+        - Callback-driven subscriptions consume from an internal message
+          queue rather than reading the socket directly; subscribe /
+          psubscribe / ssubscribe route through _execute_command and
+          the unified reader
+    - Security: TLS identity enforced by default
+        - SSL_hostname and SSL_verifycn_name set when connecting by
+          hostname. IP literals verify against IP SAN by default (fails
+          if the cert has no IP SAN for the connected address). New
+          verify_hostname option for opt-out when connecting by IP to a
+          hostname-only cert.
+    - Security: failed handshake no longer leaves object connected
+        - connect() rolls back (reset + typed error) on AUTH/SELECT
+          failure
+        - Password "0" is now sent correctly (was silently skipped by
+          truthy guard)
+    - Correctness: blocking command deadlines
+        - BLMPOP/BZMPOP read timeout from position 0 (was last)
+        - Server timeout 0 means indefinite (no client-side deadline)
+        - WAIT, WAITAOF, XREAD BLOCK, XREADGROUP BLOCK all covered
+    - Correctness: subscription lifecycle
+        - _close (intentional) distinct from _fail_fatal (unrecoverable);
+          iterator next() returns undef vs typed error accordingly
+        - Reconnect uses _pause_for_reconnect / _resume_after_reconnect
+          verbs that preserve replay state; _resume_after_reconnect
+          sets in_pubsub=1 before replay to mirror initial-subscribe
+          timing
+        - Identity-guarded parent-slot clearing prevents stale _close
+          from wiping a newer subscription
+    - Correctness: pool release and shutdown
+        - Double-release is a loud no-op (was silent double-push into
+          idle)
+        - Shutdown flag rejects further acquires; active releases are
+          destroyed
+        - refaddr-based identity (was stringification)
+        - release(undef) is a silent no-op
+    - Correctness: timeout and reset invariant
+        - _await_with_deadline non-throwing helper replaces the
+          wait_any + throwing await pattern that silently skipped
+          timeout cleanup
+        - _reader_fatal detaches inflight before closing the socket so
+          the typed error is preserved; idempotent via
+          _fatal_in_progress guard under eval+finally
+    - Privacy: OTel command arguments no longer in spans by default
+        - otel_include_args now defaults to 0; pass 1 to re-enable
+    - Added: message_queue_depth constructor option (default 1)
+    - Added: key prefixing for PFADD, PFCOUNT, PFMERGE, GETBIT, SETBIT,
+      BITCOUNT, BITPOS, HSTRLEN, ZMSCORE
+    - Known limitations (documented in POD):
+        - Some commands (BITFIELD, LMPOP/BLMPOP, ZINTERCARD, LCS,
+          GEORADIUS*_RO) do not yet have key extraction
+        - Hostname resolution is synchronous
+        - IPv6 URI hosts not yet supported
+        - Some generated wrappers expose mode-changing commands (HELLO,
+          CLIENT REPLY, MONITOR, SYNC, PSYNC) that interact poorly
+          with the response model
+
 0.001008  2026-04-22
     - Bug Fix: _reconnect no longer spins forever on permanent failure
         - New reconnect_max_attempts constructor option (default 10;
