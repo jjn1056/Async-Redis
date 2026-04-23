@@ -821,32 +821,56 @@ sub _calculate_deadline {
     return Time::HiRes::time() + $seconds + $self->{blocking_timeout_buffer};
 }
 
+sub _ssl_verify_peer {
+    require IO::Socket::SSL;
+    return IO::Socket::SSL::SSL_VERIFY_PEER();
+}
+
+sub _ssl_verify_none {
+    require IO::Socket::SSL;
+    return IO::Socket::SSL::SSL_VERIFY_NONE();
+}
+
+# Build the IO::Socket::SSL option hash for the current connection.
+# Handles chain verification, SNI, hostname identity checking, and
+# client cert/key/CA forwarding. Called by _tls_upgrade and directly
+# by unit tests.
+sub _build_tls_options {
+    my ($self) = @_;
+    my %ssl_opts = (SSL_startHandshake => 0);
+
+    my $tls      = $self->{tls};
+    my $tls_hash = ref $tls eq 'HASH' ? $tls : {};
+
+    my $verify          = exists $tls_hash->{verify}          ? !!$tls_hash->{verify}          : 1;
+    my $verify_hostname = exists $tls_hash->{verify_hostname} ? !!$tls_hash->{verify_hostname} : 1;
+
+    $ssl_opts{SSL_ca_file}   = $tls_hash->{ca_file}   if $tls_hash->{ca_file};
+    $ssl_opts{SSL_cert_file} = $tls_hash->{cert_file} if $tls_hash->{cert_file};
+    $ssl_opts{SSL_key_file}  = $tls_hash->{key_file}  if $tls_hash->{key_file};
+
+    if ($verify) {
+        $ssl_opts{SSL_verify_mode} = $self->_ssl_verify_peer;
+        $ssl_opts{SSL_hostname}    = $self->{host};
+
+        if ($verify_hostname) {
+            $ssl_opts{SSL_verifycn_name}   = $self->{host};
+            $ssl_opts{SSL_verifycn_scheme} = 'default';
+        }
+    } else {
+        $ssl_opts{SSL_verify_mode} = $self->_ssl_verify_none;
+    }
+
+    return %ssl_opts;
+}
+
 # Non-blocking TLS upgrade
 async sub _tls_upgrade {
     my ($self, $socket) = @_;
 
     require IO::Socket::SSL;
 
-    # Build SSL options
-    my %ssl_opts = (
-        SSL_startHandshake => 0,  # Don't block during start_SSL!
-    );
-
-    if (ref $self->{tls} eq 'HASH') {
-        $ssl_opts{SSL_ca_file}    = $self->{tls}{ca_file} if $self->{tls}{ca_file};
-        $ssl_opts{SSL_cert_file}  = $self->{tls}{cert_file} if $self->{tls}{cert_file};
-        $ssl_opts{SSL_key_file}   = $self->{tls}{key_file} if $self->{tls}{key_file};
-
-        if (exists $self->{tls}{verify}) {
-            $ssl_opts{SSL_verify_mode} = $self->{tls}{verify}
-                ? IO::Socket::SSL::SSL_VERIFY_PEER()
-                : IO::Socket::SSL::SSL_VERIFY_NONE();
-        } else {
-            $ssl_opts{SSL_verify_mode} = IO::Socket::SSL::SSL_VERIFY_PEER();
-        }
-    } else {
-        $ssl_opts{SSL_verify_mode} = IO::Socket::SSL::SSL_VERIFY_PEER();
-    }
+    my %ssl_opts = $self->_build_tls_options;
 
     # Start SSL (does not block because SSL_startHandshake => 0)
     IO::Socket::SSL->start_SSL($socket, %ssl_opts)
