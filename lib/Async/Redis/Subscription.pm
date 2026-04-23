@@ -324,7 +324,10 @@ sub _start_driver {
         # loop. Prevents stack overflow when a single TCP recv delivers
         # many buffered frames whose Futures are already ready.
         if ($SYNC_DEPTH >= MAX_SYNC_DEPTH) {
-            Future::IO->later(sub {
+            # Yield to the event loop so we don't blow the call stack when
+            # many buffered frames arrive synchronously. Future::IO->sleep(0)
+            # is the correct way to schedule a deferred callback.
+            Future::IO->sleep(0)->on_done(sub {
                 $weak_step->() if $weak_step && $weak && !$weak->{_closed};
             });
             return;
