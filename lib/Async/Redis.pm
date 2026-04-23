@@ -9,7 +9,7 @@ our $VERSION = '0.001008';
 use Future;
 use Future::AsyncAwait;
 use Future::IO 0.19;
-use Scalar::Util qw(blessed);
+use Scalar::Util qw(blessed weaken);
 use Socket qw(pack_sockaddr_in pack_sockaddr_un inet_aton AF_INET AF_UNIX SOCK_STREAM);
 use IO::Handle ();
 use IO::Socket::INET;
@@ -631,7 +631,7 @@ async sub _run_reader {
         if ($returned_f->is_failed) {
             my ($rerr) = $returned_f->failure;
             my $err = Async::Redis::Error::Connection->new(
-                message => "Socket read failed: $rerr",
+                message => "Connection read error: $rerr",
                 host    => $self->{host},
                 port    => $self->{port},
             );
@@ -1033,20 +1033,63 @@ async sub _reconnect_pubsub {
 
     await $self->_reconnect;
 
-    # Replay all subscription commands
+    # Re-enter pubsub mode before replaying so the unified reader
+    # classifies incoming message frames correctly during replay.
+    $self->{in_pubsub} = 1;
+
+    # Replay all subscription commands through the write gate and unified
+    # reader. Each channel/pattern gets its own command so confirmations
+    # are matched one-to-one via the inflight queue.
     for my $cmd (@replay) {
         my ($command, @args) = @$cmd;
-
-        await $self->_send_command($command, @args);
-
-        # Read and discard subscription confirmations
         for my $arg (@args) {
-            await $self->_read_pubsub_frame();
+            await $self->_pubsub_command($command, $arg);
         }
     }
+}
 
-    # Re-enter pubsub mode
-    $self->{in_pubsub} = 1;
+# Asynchronously reconnect after a pubsub connection drop. Called by
+# _reader_fatal when reconnect is enabled and a subscription is active.
+# Fires _resume_after_reconnect on the subscription on success, or
+# _fail_fatal on unrecoverable reconnect failure.
+sub _reconnect_async {
+    my ($self, $sub) = @_;
+
+    weaken(my $weak_self = $self);
+    weaken(my $weak_sub  = $sub);
+
+    my $f = (async sub {
+        my @replay = $weak_sub ? $weak_sub->get_replay_commands : ();
+
+        # Reconnect loop — mirrors _ensure_connected.
+        await $weak_self->_reconnect;
+
+        # Replay subscriptions via the unified reader.
+        $weak_self->{in_pubsub} = 1;
+        for my $cmd (@replay) {
+            my ($command, @args) = @$cmd;
+            for my $arg (@args) {
+                await $weak_self->_pubsub_command($command, $arg);
+            }
+        }
+
+        if ($weak_sub) {
+            if (my $cb = $weak_sub->{_on_reconnect}) {
+                $cb->($weak_sub);
+            }
+            # Restart the driver in whichever mode the subscription is in.
+            $weak_sub->_start_driver($weak_sub->{_on_message} ? 0 : 1);
+        }
+    })->();
+
+    $f->on_fail(sub {
+        my $err = shift;
+        return unless $weak_sub;
+        $weak_sub->_fail_fatal($err);
+    });
+
+    $f->retain;
+    return;
 }
 
 # Execute a Redis command
@@ -1987,17 +2030,17 @@ async sub subscribe {
     # Create or reuse subscription
     my $sub = $self->{_subscription} //= Async::Redis::Subscription->new(redis => $self);
 
-    # Send SUBSCRIBE command
-    await $self->_send_command('SUBSCRIBE', @channels);
+    # Set in_pubsub BEFORE submitting so the unified reader classifies
+    # racing message frames correctly (e.g. published before our
+    # confirmation arrives).
+    $self->{in_pubsub} = 1;
 
-    # Read subscription confirmations
+    # Issue one SUBSCRIBE per channel through the write gate and unified
+    # reader. Each call awaits its matching confirmation frame.
     for my $ch (@channels) {
-        my $msg = await $self->_read_pubsub_frame();
-        # Response: ['subscribe', $channel, $count]
+        await $self->_pubsub_command('SUBSCRIBE', $ch);
         $sub->_add_channel($ch);
     }
-
-    $self->{in_pubsub} = 1;
 
     return $sub;
 }
@@ -2020,14 +2063,12 @@ async sub psubscribe {
 
     my $sub = $self->{_subscription} //= Async::Redis::Subscription->new(redis => $self);
 
-    await $self->_send_command('PSUBSCRIBE', @patterns);
+    $self->{in_pubsub} = 1;
 
     for my $p (@patterns) {
-        my $msg = await $self->_read_pubsub_frame();
+        await $self->_pubsub_command('PSUBSCRIBE', $p);
         $sub->_add_pattern($p);
     }
-
-    $self->{in_pubsub} = 1;
 
     return $sub;
 }
@@ -2050,14 +2091,12 @@ async sub ssubscribe {
 
     my $sub = $self->{_subscription} //= Async::Redis::Subscription->new(redis => $self);
 
-    await $self->_send_command('SSUBSCRIBE', @channels);
+    $self->{in_pubsub} = 1;
 
     for my $ch (@channels) {
-        my $msg = await $self->_read_pubsub_frame();
+        await $self->_pubsub_command('SSUBSCRIBE', $ch);
         $sub->_add_sharded_channel($ch);
     }
-
-    $self->{in_pubsub} = 1;
 
     return $sub;
 }
@@ -2072,6 +2111,46 @@ async sub _read_pubsub_frame {
 
     my $msg = await $self->_read_response();
     return $self->_decode_response($msg);
+}
+
+# Execute a single pubsub management command (SUBSCRIBE, UNSUBSCRIBE,
+# PSUBSCRIBE, PUNSUBSCRIBE, SSUBSCRIBE, SUNSUBSCRIBE) through the write
+# gate and unified reader. Each call registers one inflight entry and
+# awaits the matching confirmation frame from the reader.
+#
+# Use instead of _send_command + _read_pubsub_frame when in_pubsub=1
+# so that the unified reader (_run_reader) remains the sole socket
+# reader. Does not apply prefix or go through auto-pipeline.
+async sub _pubsub_command {
+    my ($self, $cmd, @args) = @_;
+
+    my $raw_cmd  = $self->_build_command($cmd, @args);
+    my $deadline = $self->_calculate_deadline($cmd, @args);
+    my $response = Future->new;
+
+    my $submit_ok = eval {
+        await $self->_with_write_gate(sub {
+            return (async sub {
+                if (!$self->{_socket_live}) {
+                    die Async::Redis::Error::Disconnected->new(
+                        message => "Not connected",
+                    );
+                }
+                # Register inflight BEFORE writing so order matches the wire.
+                $self->_add_inflight($response, $cmd, \@args, $deadline, 'fail');
+                await $self->_send($raw_cmd);
+            })->();
+        });
+        1;
+    };
+
+    unless ($submit_ok) {
+        my $err = $@;
+        die $err;
+    }
+
+    $self->_ensure_reader;
+    return await $response;
 }
 
 # Send command without reading response (for pubsub)

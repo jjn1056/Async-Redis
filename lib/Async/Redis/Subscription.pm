@@ -162,23 +162,12 @@ sub channel_count {
          + scalar(keys %{$self->{sharded_channels}});
 }
 
-# Receive next message (async iterator pattern). Reads from the shared
-# _pending_messages queue populated by the read driver. Waits on
-# _message_waiter when the queue is empty. Returns undef on clean close;
-# dies with the typed error on fatal close.
-async sub next {
+# Internal dequeue: wait for a message from the queue, dequeue it, and
+# signal _slot_waiter so any pending _dispatch_frame can proceed. Used by
+# both next() (iterator mode) and _start_driver (callback mode driver loop).
+# Returns undef on clean close; dies with typed error on fatal close.
+async sub _dequeue {
     my ($self) = @_;
-
-    # Exclusivity check: callback mode disables iterator mode.
-    if ($self->{_on_message}) {
-        Carp::croak("Cannot call next() on a callback-driven subscription");
-    }
-
-    # Ensure the driver is running to fill the queue. Pass force=1 to
-    # bypass the _on_message gate (iterator mode has no callback, but
-    # still needs the driver). We call this after subscribe() has finished
-    # reading all confirmation frames, so there's no race.
-    $self->_start_driver(1);
 
     while (!@{$self->{_pending_messages}}) {
         die $self->{_fatal_error} if $self->{_fatal_error};
@@ -196,6 +185,24 @@ async sub next {
         $w->done unless $w->is_ready;
     }
     return $msg;
+}
+
+# Receive next message (async iterator pattern). Waits on the queue
+# populated by _run_reader via _dispatch_frame. Returns undef on clean
+# close; dies with the typed error on fatal close.
+async sub next {
+    my ($self) = @_;
+
+    # Exclusivity check: callback mode disables iterator mode.
+    if ($self->{_on_message}) {
+        Carp::croak("Cannot call next() on a callback-driven subscription");
+    }
+
+    # In iterator mode the unified reader (_run_reader) feeds the queue.
+    # The reader is already running (started by _pubsub_command during
+    # subscribe). No separate driver start is needed.
+
+    return await $self->_dequeue;
 }
 
 # Read one pub/sub frame from the underlying connection. On transient
@@ -284,14 +291,10 @@ sub _dispatch_frame {
         return undef;   # non-message frame (subscribe confirmation, etc.)
     }
 
-    if (my $cb = $self->{_on_message}) {
-        return $self->_invoke_user_callback($cb, $msg);
-    }
-
-    # Iterator mode: queue respecting message_queue_depth. If the queue is
-    # at capacity, return a Future that resolves once the consumer dequeues
-    # (via next()). The caller (_run_reader or _start_driver) awaits it,
-    # pausing socket reads and restoring TCP backpressure to the publisher.
+    # Queue the message for consumption by next() (iterator mode) or the
+    # callback driver loop (callback mode). The driver invokes _on_message;
+    # _dispatch_frame is intentionally agnostic about the consumption mode.
+    # This keeps backpressure uniform: the depth limit applies to both modes.
     return if $self->{_closed};
 
     my $redis = $self->{redis};
@@ -322,19 +325,22 @@ sub _dispatch_frame {
     return undef;
 }
 
-# Start the read driver loop if not already running. Idempotent.
-# In callback mode (_on_message set), auto-starts when channels are
-# added via _add_channel/_add_pattern/_add_sharded_channel.
-# In iterator mode, started explicitly by next() via _start_driver(1).
+# Start the callback-mode driver loop if not already running. Idempotent.
+# Only starts when _on_message is set (callback mode). Iterator mode
+# consumers call _dequeue directly via next() — no driver loop needed.
+#
+# The driver consumes from _pending_messages (via _dequeue), which is
+# populated by _run_reader's dispatch path. This keeps the driver out of
+# the socket-reading business: _run_reader is the sole socket reader.
+#
 # Uses weak refs on $self and $step to break cycles so DESTROY fires
 # promptly when external refs drop. Uses local($SYNC_DEPTH) to bound
-# synchronous recursion depth when on_done fires synchronously (as
-# it does when the underlying read buffer has multiple frames ready);
-# past MAX_SYNC_DEPTH iterations, yields to the loop via Future::IO->later.
+# synchronous recursion depth when on_done fires synchronously; past
+# MAX_SYNC_DEPTH, yields to the loop via Future::IO->sleep(0).
 sub _start_driver {
     my ($self, $force) = @_;
     return if $self->{_driver_step};
-    return unless $self->{_on_message} || $force;
+    return unless $self->{_on_message};   # only callback mode needs a driver
     return if $self->{_closed};
     return unless $self->channel_count > 0;
 
@@ -345,13 +351,9 @@ sub _start_driver {
     $step = sub {
         return unless $weak && !$weak->{_closed};
 
-        # Trampoline: once 32 synchronous iterations deep, yield to the
-        # loop. Prevents stack overflow when a single TCP recv delivers
-        # many buffered frames whose Futures are already ready.
+        # Trampoline: bound synchronous recursion to prevent stack overflow
+        # when many queued messages resolve on_done synchronously.
         if ($SYNC_DEPTH >= MAX_SYNC_DEPTH) {
-            # Yield to the event loop so we don't blow the call stack when
-            # many buffered frames arrive synchronously. Future::IO->sleep(0)
-            # is the correct way to schedule a deferred callback.
             Future::IO->sleep(0)->on_done(sub {
                 $weak_step->() if $weak_step && $weak && !$weak->{_closed};
             });
@@ -359,42 +361,45 @@ sub _start_driver {
         }
         local $SYNC_DEPTH = $SYNC_DEPTH + 1;
 
-        # Keep a strong ref to the in-flight read Future on the
-        # subscription so the async sub behind _read_frame_with_reconnect
-        # isn't GC'd mid-suspension (F::AA's "lost returning future").
-        my $f = $weak->{_current_read} = $weak->_read_frame_with_reconnect;
+        # Consume the next message from the queue populated by _run_reader.
+        my $f = $weak->{_current_read} = $weak->_dequeue;
 
         $f->on_done(sub {
             return unless $weak && !$weak->{_closed};
             $weak->{_current_read} = undef;
-            my $cb_result = $weak->_dispatch_frame($_[0]);
-            if (blessed($cb_result) && $cb_result->isa('Future')) {
-                # Consumer-opted backpressure: wait for their Future
-                # before reading the next frame. Failures route to
-                # on_error (same path as a raised callback exception).
-                $cb_result->on_ready(sub {
-                    return unless $weak && !$weak->{_closed};
-                    my $res = shift;
-                    if ($res->is_failed) {
-                        $weak->_handle_fatal_error(
-                            "on_message callback Future failed: " . $res->failure
-                        );
-                        return;
-                    }
+            my $msg = $_[0];
+
+            # Clean close: _dequeue returns undef when subscription is closed.
+            return unless defined $msg;
+
+            if (my $cb = $weak->{_on_message}) {
+                my $cb_result = $weak->_invoke_user_callback($cb, $msg);
+                if (blessed($cb_result) && $cb_result->isa('Future')) {
+                    # Consumer-opted backpressure: wait for their Future
+                    # before dequeuing the next message.
+                    $cb_result->on_ready(sub {
+                        return unless $weak && !$weak->{_closed};
+                        my $res = shift;
+                        if ($res->is_failed) {
+                            $weak->_handle_fatal_error(
+                                "on_message callback Future failed: " . $res->failure
+                            );
+                            return;
+                        }
+                        $weak_step->() if $weak_step && $weak && !$weak->{_closed};
+                    });
+                } else {
                     $weak_step->() if $weak_step && $weak && !$weak->{_closed};
-                });
+                }
             } else {
-                $weak_step->() if $weak_step && $weak && !$weak->{_closed};
+                # _on_message was cleared while driver was running; stop.
+                return;
             }
         });
 
         $f->on_fail(sub {
             return unless $weak;
             $weak->{_current_read} = undef;
-            # If the user closed the subscription (or the underlying
-            # client disconnected) while a read was in flight, a
-            # "Connection closed by server" failure is expected, not
-            # fatal. Short-circuit so we don't die through _handle_fatal_error.
             return if $weak->{_closed};
             $weak->_handle_fatal_error($_[0]);
         });
@@ -457,6 +462,7 @@ sub _close {
 # Unrecoverable failure: marks the subscription closed with a typed
 # error. Any blocked next() will die with that error. The error is
 # preserved for callers who call next() after the fact.
+# In callback mode, fires on_error if registered; dies otherwise.
 sub _fail_fatal {
     my ($self, $typed_error) = @_;
     return if $self->{_closed};
@@ -480,6 +486,24 @@ sub _fail_fatal {
     }
 
     $self->{_driver_step} = undef;
+
+    # Notify callback-mode consumers of the fatal error. In iterator mode
+    # the caller detects it via die from next(). Loud-by-default: if
+    # no on_error is registered in callback mode, die so silent death
+    # of a listener is impossible.
+    if (my $cb = $self->{_on_error}) {
+        local $@;
+        my $ok = eval { $cb->($self, $typed_error); 1 };
+        unless ($ok) {
+            Carp::carp("on_error callback died: " . ($@ // 'unknown error'));
+        }
+        return;
+    }
+    # In iterator mode (no callback), callers discover the error via next().
+    # In callback mode with no on_error, die loudly.
+    if ($self->{_on_message}) {
+        die $typed_error;
+    }
 }
 
 # Called before a reconnect attempt. Does NOT mark the subscription
@@ -500,24 +524,20 @@ sub _pause_for_reconnect {
 async sub _resume_after_reconnect {
     my ($self) = @_;
     my $redis = $self->{redis} or return;
+
+    # Set in_pubsub before issuing any commands so the unified reader
+    # classifies incoming message frames correctly (mirrors subscribe timing).
     $redis->{in_pubsub} = 1;
 
     my @channels = keys %{$self->{channels}};
     my @patterns = keys %{$self->{patterns}};
     my @sharded  = keys %{$self->{sharded_channels}};
 
-    if (@channels) {
-        await $redis->_send_command('SUBSCRIBE', @channels);
-        for my $ch (@channels) { await $redis->_read_pubsub_frame }
-    }
-    if (@patterns) {
-        await $redis->_send_command('PSUBSCRIBE', @patterns);
-        for my $p (@patterns) { await $redis->_read_pubsub_frame }
-    }
-    if (@sharded) {
-        await $redis->_send_command('SSUBSCRIBE', @sharded);
-        for my $ch (@sharded) { await $redis->_read_pubsub_frame }
-    }
+    # Route each replay command through the write gate and unified reader
+    # so confirmations are matched via the inflight queue.
+    for my $ch (@channels) { await $redis->_pubsub_command('SUBSCRIBE',  $ch) }
+    for my $p  (@patterns) { await $redis->_pubsub_command('PSUBSCRIBE', $p) }
+    for my $ch (@sharded)  { await $redis->_pubsub_command('SSUBSCRIBE', $ch) }
 
     if (my $cb = $self->{_on_reconnect}) {
         $cb->($self);
@@ -535,29 +555,14 @@ async sub unsubscribe {
 
     my $redis = $self->{redis};
 
-    if (@channels) {
-        # Partial unsubscribe
-        await $redis->_send_command('UNSUBSCRIBE', @channels);
+    # Resolve the list of channels to unsubscribe: explicit list or all.
+    my @to_remove = @channels ? @channels : $self->channels;
 
-        # Read confirmations
-        for my $ch (@channels) {
-            my $msg = await $redis->_read_pubsub_frame();
-            $self->_remove_channel($ch);
-        }
-    }
-    else {
-        # Full unsubscribe - all channels
-        my @all_channels = $self->channels;
-
-        if (@all_channels) {
-            await $redis->_send_command('UNSUBSCRIBE');
-
-            # Read all confirmations
-            for my $ch (@all_channels) {
-                my $msg = await $redis->_read_pubsub_frame();
-                $self->_remove_channel($ch);
-            }
-        }
+    # Issue one UNSUBSCRIBE per channel through the write gate and unified
+    # reader so each confirmation is properly matched to an inflight entry.
+    for my $ch (@to_remove) {
+        await $redis->_pubsub_command('UNSUBSCRIBE', $ch);
+        $self->_remove_channel($ch);
     }
 
     # If no subscriptions remain, close and exit pubsub mode
@@ -576,25 +581,11 @@ async sub punsubscribe {
 
     my $redis = $self->{redis};
 
-    if (@patterns) {
-        await $redis->_send_command('PUNSUBSCRIBE', @patterns);
+    my @to_remove = @patterns ? @patterns : $self->patterns;
 
-        for my $p (@patterns) {
-            my $msg = await $redis->_read_pubsub_frame();
-            $self->_remove_pattern($p);
-        }
-    }
-    else {
-        my @all_patterns = $self->patterns;
-
-        if (@all_patterns) {
-            await $redis->_send_command('PUNSUBSCRIBE');
-
-            for my $p (@all_patterns) {
-                my $msg = await $redis->_read_pubsub_frame();
-                $self->_remove_pattern($p);
-            }
-        }
+    for my $p (@to_remove) {
+        await $redis->_pubsub_command('PUNSUBSCRIBE', $p);
+        $self->_remove_pattern($p);
     }
 
     if ($self->channel_count == 0) {
@@ -612,25 +603,11 @@ async sub sunsubscribe {
 
     my $redis = $self->{redis};
 
-    if (@channels) {
-        await $redis->_send_command('SUNSUBSCRIBE', @channels);
+    my @to_remove = @channels ? @channels : $self->sharded_channels;
 
-        for my $ch (@channels) {
-            my $msg = await $redis->_read_pubsub_frame();
-            $self->_remove_sharded_channel($ch);
-        }
-    }
-    else {
-        my @all = $self->sharded_channels;
-
-        if (@all) {
-            await $redis->_send_command('SUNSUBSCRIBE');
-
-            for my $ch (@all) {
-                my $msg = await $redis->_read_pubsub_frame();
-                $self->_remove_sharded_channel($ch);
-            }
-        }
+    for my $ch (@to_remove) {
+        await $redis->_pubsub_command('SUNSUBSCRIBE', $ch);
+        $self->_remove_sharded_channel($ch);
     }
 
     if ($self->channel_count == 0) {
