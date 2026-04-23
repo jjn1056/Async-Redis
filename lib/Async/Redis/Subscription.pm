@@ -8,7 +8,7 @@ use Carp ();
 use Future;
 use Future::AsyncAwait;
 use Future::IO;
-use Scalar::Util ();
+use Scalar::Util qw(blessed refaddr weaken);
 
 our $VERSION = '0.001';
 
@@ -22,18 +22,20 @@ sub new {
     my ($class, %args) = @_;
 
     return bless {
-        redis            => $args{redis},
-        channels         => {},      # channel => 1 (for regular subscribe)
-        patterns         => {},      # pattern => 1 (for psubscribe)
-        sharded_channels => {},      # channel => 1 (for ssubscribe)
-        _message_queue   => [],      # Buffer for messages
-        _waiters         => [],      # Futures waiting for messages
-        _on_reconnect    => undef,   # Callback for reconnect notification
-        _on_message      => undef,   # Message-arrived callback (Task 3)
-        _on_error        => undef,   # Fatal-error callback (Task 3)
-        _driver_step     => undef,   # Running driver loop closure (callback mode)
-        _current_read    => undef,   # Strong ref to in-flight read Future (F::AA GC pin)
-        _closed          => 0,
+        redis             => $args{redis},
+        channels          => {},      # channel => 1 (for regular subscribe)
+        patterns          => {},      # pattern => 1 (for psubscribe)
+        sharded_channels  => {},      # channel => 1 (for ssubscribe)
+        _pending_messages => [],      # Queued messages for iterator consumers
+        _message_waiter   => undef,   # Future signalled when a message arrives
+        _slot_waiter      => undef,   # Future signalled when queue drains below depth
+        _fatal_error      => undef,   # Typed error set by _fail_fatal
+        _on_reconnect     => undef,   # Callback for reconnect notification
+        _on_message       => undef,   # Message-arrived callback (callback mode)
+        _on_error         => undef,   # Fatal-error callback
+        _driver_step      => undef,   # Running driver loop closure
+        _current_read     => undef,   # Strong ref to in-flight read Future (F::AA GC pin)
+        _closed           => 0,
     }, $class;
 }
 
@@ -160,36 +162,40 @@ sub channel_count {
          + scalar(keys %{$self->{sharded_channels}});
 }
 
-# Receive next message (async iterator pattern)
+# Receive next message (async iterator pattern). Reads from the shared
+# _pending_messages queue populated by the read driver. Waits on
+# _message_waiter when the queue is empty. Returns undef on clean close;
+# dies with the typed error on fatal close.
 async sub next {
     my ($self) = @_;
 
-    return undef if $self->{_closed};
-
     # Exclusivity check: callback mode disables iterator mode.
-    # (The _on_message slot is initialized in new(); inert until Task 3.)
     if ($self->{_on_message}) {
         Carp::croak("Cannot call next() on a callback-driven subscription");
     }
 
-    if (@{$self->{_message_queue}}) {
-        return shift @{$self->{_message_queue}};
+    # Ensure the driver is running to fill the queue. Pass force=1 to
+    # bypass the _on_message gate (iterator mode has no callback, but
+    # still needs the driver). We call this after subscribe() has finished
+    # reading all confirmation frames, so there's no race.
+    $self->_start_driver(1);
+
+    while (!@{$self->{_pending_messages}}) {
+        die $self->{_fatal_error} if $self->{_fatal_error};
+        return undef              if $self->{_closed};
+        $self->{_message_waiter} //= Future->new;
+        await $self->{_message_waiter};
+        delete $self->{_message_waiter};
     }
 
-    while (1) {
-        my $frame = await $self->_read_frame_with_reconnect;
-        last unless $frame;
-        $self->_dispatch_frame($frame);
-        # _dispatch_frame buffers the message into _message_queue (when
-        # on_message is unset — which it must be in this branch since
-        # the exclusivity check above throws otherwise). Pull from queue.
-        if (@{$self->{_message_queue}}) {
-            return shift @{$self->{_message_queue}};
-        }
-        # Otherwise it was a non-message frame; loop for another.
-    }
+    die $self->{_fatal_error} if $self->{_fatal_error};
+    return undef              if $self->{_closed} && !@{$self->{_pending_messages}};
 
-    return undef;
+    my $msg = shift @{$self->{_pending_messages}};
+    if (my $w = delete $self->{_slot_waiter}) {
+        $w->done unless $w->is_ready;
+    }
+    return $msg;
 }
 
 # Read one pub/sub frame from the underlying connection. On transient
@@ -236,13 +242,13 @@ async sub _read_frame_with_reconnect {
 }
 
 # Convert a raw RESP pub/sub frame into a message hashref and deliver it.
-# When on_message is set (callback mode), invoke the callback via
-# _invoke_user_callback and return its result (which may be a Future
-# for consumer-side backpressure). Otherwise buffer the message via
-# _deliver_message for next()/iterator consumers and return undef.
+# In callback mode, invokes _on_message via _invoke_user_callback and
+# returns its result (which may be a Future for consumer-side backpressure).
+# In iterator mode, queues the message into _pending_messages and signals
+# _message_waiter so a blocked next() can wake up.
 #
 # Non-message frames (subscribe confirmations, etc.) return undef and
-# take no action — the caller's loop will read another frame.
+# take no action — the driver loop will read the next frame.
 sub _dispatch_frame {
     my ($self, $frame) = @_;
     return unless $frame && ref $frame eq 'ARRAY';
@@ -275,32 +281,39 @@ sub _dispatch_frame {
         };
     }
     else {
-        return undef;   # non-message frame
+        return undef;   # non-message frame (subscribe confirmation, etc.)
     }
 
     if (my $cb = $self->{_on_message}) {
         return $self->_invoke_user_callback($cb, $msg);
     }
 
-    $self->_deliver_message($msg);
+    # Iterator mode: queue synchronously and signal any blocked next().
+    return if $self->{_closed};
+    push @{$self->{_pending_messages}}, $msg;
+    if (my $w = delete $self->{_message_waiter}) {
+        $w->done unless $w->is_ready;
+    }
     return undef;
 }
 
-# Start the callback driver loop if not already running. Idempotent.
-# Runs while: on_message is set AND channel_count > 0 AND !_closed.
+# Start the read driver loop if not already running. Idempotent.
+# In callback mode (_on_message set), auto-starts when channels are
+# added via _add_channel/_add_pattern/_add_sharded_channel.
+# In iterator mode, started explicitly by next() via _start_driver(1).
 # Uses weak refs on $self and $step to break cycles so DESTROY fires
 # promptly when external refs drop. Uses local($SYNC_DEPTH) to bound
 # synchronous recursion depth when on_done fires synchronously (as
 # it does when the underlying read buffer has multiple frames ready);
 # past MAX_SYNC_DEPTH iterations, yields to the loop via Future::IO->later.
 sub _start_driver {
-    my ($self) = @_;
+    my ($self, $force) = @_;
     return if $self->{_driver_step};
-    return unless $self->{_on_message};
+    return unless $self->{_on_message} || $force;
     return if $self->{_closed};
     return unless $self->channel_count > 0;
 
-    Scalar::Util::weaken(my $weak = $self);
+    weaken(my $weak = $self);
 
     my $step;
     my $weak_step;
@@ -327,7 +340,7 @@ sub _start_driver {
             return unless $weak && !$weak->{_closed};
             $weak->{_current_read} = undef;
             my $cb_result = $weak->_dispatch_frame($_[0]);
-            if (Scalar::Util::blessed($cb_result) && $cb_result->isa('Future')) {
+            if (blessed($cb_result) && $cb_result->isa('Future')) {
                 # Consumer-opted backpressure: wait for their Future
                 # before reading the next frame. Failures route to
                 # on_error (same path as a raised callback exception).
@@ -359,7 +372,7 @@ sub _start_driver {
         });
     };
 
-    Scalar::Util::weaken($weak_step = $step);
+    weaken($weak_step = $step);
 
     $self->{_driver_step} = $step;
     $step->();
@@ -381,19 +394,109 @@ async sub next_message {
     };
 }
 
-# Internal: called when message arrives
-sub _deliver_message {
-    my ($self, $msg) = @_;
+# Intentional teardown: marks the subscription closed and wakes any
+# blocked next() with undef. Clears the parent _subscription slot
+# with an identity guard so a stale _close cannot evict a newer
+# subscription object that reused the same slot.
+sub _close {
+    my ($self) = @_;
+    return if $self->{_closed};
+    $self->{_closed} = 1;
 
-    if (@{$self->{_waiters}}) {
-        # Someone is waiting - deliver directly
-        my $waiter = shift @{$self->{_waiters}};
-        $waiter->done($msg);
+    $self->{_pending_messages} = [];
+
+    if (my $w = delete $self->{_message_waiter}) {
+        $w->done unless $w->is_ready;
     }
-    else {
-        # Buffer the message
-        push @{$self->{_message_queue}}, $msg;
+    if (my $w = delete $self->{_slot_waiter}) {
+        $w->done unless $w->is_ready;
     }
+
+    # Identity-guarded parent-slot clear.
+    my $redis = $self->{redis};
+    if ($redis && defined $redis->{_subscription}
+        && refaddr($redis->{_subscription}) == refaddr($self)) {
+        delete $redis->{_subscription};
+    }
+
+    # Release the driver closure; weak refs already broke the cycle.
+    # Do NOT clear _current_read — the in-flight read Future must stay
+    # pinned until it resolves, or F::AA will warn "lost its returning
+    # future". on_done/on_fail will clear it and see _closed first.
+    $self->{_driver_step} = undef;
+}
+
+# Unrecoverable failure: marks the subscription closed with a typed
+# error. Any blocked next() will die with that error. The error is
+# preserved for callers who call next() after the fact.
+sub _fail_fatal {
+    my ($self, $typed_error) = @_;
+    return if $self->{_closed};
+    $self->{_closed}      = 1;
+    $self->{_fatal_error} = $typed_error;
+
+    $self->{_pending_messages} = [];
+
+    if (my $w = delete $self->{_message_waiter}) {
+        $w->fail($typed_error) unless $w->is_ready;
+    }
+    if (my $w = delete $self->{_slot_waiter}) {
+        $w->done unless $w->is_ready;
+    }
+
+    # Identity-guarded parent-slot clear.
+    my $redis = $self->{redis};
+    if ($redis && defined $redis->{_subscription}
+        && refaddr($redis->{_subscription}) == refaddr($self)) {
+        delete $redis->{_subscription};
+    }
+
+    $self->{_driver_step} = undef;
+}
+
+# Called before a reconnect attempt. Does NOT mark the subscription
+# closed — the reader has already exited (connection dropped). Channels
+# and patterns remain in their tracking hashes for replay via
+# _resume_after_reconnect.
+sub _pause_for_reconnect {
+    my ($self) = @_;
+    # Do NOT set _closed; do NOT fail waiters. Reader has already exited.
+    # The driver will be restarted by _resume_after_reconnect.
+    $self->{_driver_step} = undef;
+    return;
+}
+
+# Replays all tracked subscriptions on a freshly reconnected socket.
+# Sets in_pubsub=1 BEFORE sending SUBSCRIBE/PSUBSCRIBE/SSUBSCRIBE so
+# racing message frames classify correctly (mirrors initial-subscribe timing).
+async sub _resume_after_reconnect {
+    my ($self) = @_;
+    my $redis = $self->{redis} or return;
+    $redis->{in_pubsub} = 1;
+
+    my @channels = keys %{$self->{channels}};
+    my @patterns = keys %{$self->{patterns}};
+    my @sharded  = keys %{$self->{sharded_channels}};
+
+    if (@channels) {
+        await $redis->_send_command('SUBSCRIBE', @channels);
+        for my $ch (@channels) { await $redis->_read_pubsub_frame }
+    }
+    if (@patterns) {
+        await $redis->_send_command('PSUBSCRIBE', @patterns);
+        for my $p (@patterns) { await $redis->_read_pubsub_frame }
+    }
+    if (@sharded) {
+        await $redis->_send_command('SSUBSCRIBE', @sharded);
+        for my $ch (@sharded) { await $redis->_read_pubsub_frame }
+    }
+
+    if (my $cb = $self->{_on_reconnect}) {
+        $cb->($self);
+    }
+
+    # Restart the driver in whichever mode the subscription is in.
+    $self->_start_driver($self->{_on_message} ? 0 : 1);
 }
 
 # Unsubscribe from specific channels
@@ -509,27 +612,6 @@ async sub sunsubscribe {
     return $self;
 }
 
-# Close subscription
-sub _close {
-    my ($self) = @_;
-
-    $self->{_closed} = 1;
-    $self->{redis}{in_pubsub} = 0;
-
-    # Cancel any waiters
-    for my $waiter (@{$self->{_waiters}}) {
-        $waiter->done(undef) unless $waiter->is_ready;
-    }
-    $self->{_waiters} = [];
-
-    # Release the driver closure; weak refs already broke the cycle,
-    # so this is hygienic rather than required for GC.
-    # Do NOT clear _current_read — the in-flight read Future must stay
-    # pinned until it resolves, or F::AA will warn "lost its returning
-    # future". on_done/on_fail will clear it when the read completes
-    # and will see _closed first so they won't re-enter the driver.
-    $self->{_driver_step} = undef;
-}
 
 sub is_closed { shift->{_closed} }
 
@@ -723,5 +805,41 @@ callback (enabling opt-in backpressure above) AND consider moving the
 expensive work to a worker pool so the callback can return quickly.
 Long synchronous processing in pub/sub callbacks is an anti-pattern at
 scale regardless of client.
+
+=head1 INTERNAL LIFECYCLE METHODS
+
+The following methods are used by L<Async::Redis> to manage subscription
+state. They are not part of the public API for end consumers, but are
+documented here for maintainers.
+
+=head2 _close
+
+Intentional teardown. Marks the subscription closed and wakes any
+blocked C<next()> with C<undef>. Clears the parent C<_subscription>
+slot on the L<Async::Redis> object with an identity guard — a stale
+C<_close> call from an earlier subscription object cannot evict a newer
+one that has since taken the slot.
+
+=head2 _fail_fatal($typed_error)
+
+Unrecoverable failure. Marks the subscription closed with a typed error
+object. Any blocked C<next()> call will C<die> with that error. The
+error is preserved for callers who call C<next()> after the fact.
+Routes through C<_close>'s identity guard for parent-slot clearing.
+
+=head2 _pause_for_reconnect
+
+Called before a reconnect attempt. Does B<not> mark the subscription
+closed — the underlying reader has already exited due to the connection
+drop. Channel/pattern tracking hashes are left intact for replay.
+
+=head2 _resume_after_reconnect
+
+Async. Replays all tracked C<SUBSCRIBE>, C<PSUBSCRIBE>, and
+C<SSUBSCRIBE> commands on the freshly reconnected socket. Sets
+C<in_pubsub=1> before sending replay commands so that racing message
+frames classify correctly (mirrors the timing of the initial
+subscribe). Fires C<on_reconnect> after replay, then restarts the read
+driver.
 
 =cut

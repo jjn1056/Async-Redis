@@ -159,16 +159,16 @@ subtest '_dispatch_frame returns Future when callback returns Future (backpressu
     ok(!$result->is_ready, 'Future is still pending');
 };
 
-subtest '_dispatch_frame falls through to _deliver_message when no callback' => sub {
+subtest '_dispatch_frame queues message for iterator consumers when no callback' => sub {
     my $redis = Async::Redis->new(host => 'localhost');
     my $sub = Async::Redis::Subscription->new(redis => $redis);
 
     my $frame = [ 'message', 'chan', 'payload' ];
     my $result = $sub->_dispatch_frame($frame);
 
-    # With no callback, the message is buffered for next() consumers
-    is(scalar @{$sub->{_message_queue}}, 1, 'message buffered in queue');
-    is($sub->{_message_queue}[0]{data}, 'payload', 'buffered message data');
+    # With no callback, the message is queued for next() consumers.
+    is(scalar @{$sub->{_pending_messages}}, 1, 'message buffered in queue');
+    is($sub->{_pending_messages}[0]{data}, 'payload', 'buffered message data');
     is($result, undef, 'dispatch returns undef on fallthrough');
 };
 

@@ -1979,6 +1979,11 @@ async sub subscribe {
     # Wait for pending commands before entering PubSub mode
     await $self->_wait_for_inflight_drain;
 
+    # Clear a stale closed subscription so we allocate a fresh object.
+    if ($self->{_subscription} && $self->{_subscription}->is_closed) {
+        delete $self->{_subscription};
+    }
+
     # Create or reuse subscription
     my $sub = $self->{_subscription} //= Async::Redis::Subscription->new(redis => $self);
 
@@ -2008,6 +2013,11 @@ async sub psubscribe {
     # Wait for pending commands before entering PubSub mode
     await $self->_wait_for_inflight_drain;
 
+    # Clear a stale closed subscription so we allocate a fresh object.
+    if ($self->{_subscription} && $self->{_subscription}->is_closed) {
+        delete $self->{_subscription};
+    }
+
     my $sub = $self->{_subscription} //= Async::Redis::Subscription->new(redis => $self);
 
     await $self->_send_command('PSUBSCRIBE', @patterns);
@@ -2032,6 +2042,11 @@ async sub ssubscribe {
 
     # Wait for pending commands before entering PubSub mode
     await $self->_wait_for_inflight_drain;
+
+    # Clear a stale closed subscription so we allocate a fresh object.
+    if ($self->{_subscription} && $self->{_subscription}->is_closed) {
+        delete $self->{_subscription};
+    }
 
     my $sub = $self->{_subscription} //= Async::Redis::Subscription->new(redis => $self);
 
