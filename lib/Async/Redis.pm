@@ -154,9 +154,6 @@ sub new {
         # Entry: { future => $f, cmd => $cmd, args => \@args, deadline => $t, sent_at => $t }
         inflight => [],
 
-        # Response reader synchronization
-        _reading_responses => 0,
-
         # Reconnection settings
         reconnect              => $args{reconnect} // 0,
         reconnect_delay        => $args{reconnect_delay} // 0.1,
@@ -321,7 +318,6 @@ async sub connect {
     $self->{_socket_live} = 1;   # write gate and reader can now submit
     $self->{connected}    = 1;
     $self->{inflight} = [];
-    $self->{_reading_responses} = 0;
     $self->{_pid} = $$;  # Track PID for fork safety
     $self->{_current_read_future} = undef;
 
@@ -453,7 +449,6 @@ sub disconnect {
     $self->{_reconnect_future}  = undef;
     $self->{connected}          = 0;
     $self->{parser}             = undef;
-    $self->{_reading_responses} = 0;
 
     if ($was_connected && $self->{on_disconnect}) {
         $self->{on_disconnect}->($self, $reason);
@@ -519,7 +514,6 @@ sub _check_fork {
         $self->{socket} = undef;
         $self->{parser} = undef;
         $self->{inflight} = [];
-        $self->{_reading_responses} = 0;
         $self->{_current_read_future} = undef;  # Clear stale reference
 
         my $old_pid = $self->{_pid};
@@ -723,9 +717,6 @@ sub _ensure_reader {
     $f->retain;
     return;
 }
-
-# Shim for the old name. Remove in Task 9 after all callers migrate.
-sub _ensure_response_reader { $_[0]->_ensure_reader; Future->done }
 
 # Read and parse one response
 async sub _read_response {
@@ -1191,7 +1182,6 @@ sub _reset_connection {
     $self->{_reconnect_future}  = undef;
     $self->{connected}          = 0;
     $self->{parser}             = undef;
-    $self->{_reading_responses} = 0;   # still here for now; deleted in Task 9
     $self->{in_pubsub}          = 0;
 
     if ($was_connected && $self->{on_disconnect}) {
@@ -1300,7 +1290,6 @@ sub _reader_fatal {
         $self->{parser}         = undef;
         $self->{in_pubsub}      = 0;
         $self->{_reader_future} = undef;
-        # _reading_responses intentionally not cleared here; removed in Task 9.
 
         # 6. Fail all detached futures with the SAME typed error.
         for my $entry (@$detached_inflight, @$detached_autopipe) {
