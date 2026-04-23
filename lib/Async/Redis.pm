@@ -183,6 +183,13 @@ sub new {
         pipeline_depth => $args{pipeline_depth} // 10000,
         auto_pipeline  => $args{auto_pipeline} // 0,
 
+        # Backpressure: max queued messages before _dispatch_frame's slot wait blocks.
+        message_queue_depth => do {
+            my $d = $args{message_queue_depth} // 1;
+            die "message_queue_depth must be >= 1 (got $d)" if $d < 1;
+            $d;
+        },
+
         # Transaction state
         in_multi => 0,
         watching => 0,
