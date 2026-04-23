@@ -417,55 +417,65 @@ sub is_connected {
     return $self->{connected} ? 1 : 0;
 }
 
-# Disconnect from Redis
+# Disconnect from Redis — user-initiated path.
+# Distinct from _reader_fatal: no reconnect handoff, inflight fails
+# (not cancels) with Disconnected, subscription gets _close (not _fail).
 sub disconnect {
-    my ($self, $reason) = @_;
-    $reason //= 'client_disconnect';
+    my ($self) = @_;
+    return $self unless $self->{_socket_live} || $self->{connected};
 
     my $was_connected = $self->{connected};
 
-    # Notify any active pub/sub subscription that we're disconnecting
-    # cleanly, so its driver's on_fail on the in-flight read treats the
-    # EOF as expected rather than firing on_error / dying.
-    if ($self->{_subscription} && !$self->{_subscription}->is_closed) {
-        $self->{_subscription}->_close;
+    # Close subscription cleanly — iterator next() gets undef, no on_error.
+    if (my $sub = $self->{_subscription}) {
+        $sub->_close unless $sub->is_closed;
     }
 
-    # Cancel any active read future BEFORE closing socket
-    # This ensures Future::IO unregisters its watcher while fileno is still valid
-    if ($self->{_current_read_future} && !$self->{_current_read_future}->is_ready) {
+    # Detach inflight + auto-pipeline queue before socket close so
+    # _close_socket doesn't cancel them — we will fail them explicitly.
+    my $detached_inflight = $self->{inflight};
+    $self->{inflight} = [];
+    my $detached_autopipe = [];
+    if (my $ap = $self->{_auto_pipeline}) {
+        $detached_autopipe = $ap->_detach_queued;
+    }
+
+    # Cancel current read BEFORE closing socket so Future::IO can
+    # unregister its watcher while fileno is still valid.
+    if ($self->{_current_read_future}
+        && !$self->{_current_read_future}->is_ready) {
         $self->{_current_read_future}->cancel;
-        $self->{_current_read_future} = undef;
     }
+    $self->{_current_read_future} = undef;
 
-    # Cancel any pending inflight operations before closing socket
-    if (my $inflight = $self->{inflight}) {
-        for my $entry (@$inflight) {
-            if ($entry->{future} && !$entry->{future}->is_ready) {
-                $entry->{future}->cancel;
-            }
-        }
-        $self->{inflight} = [];
-    }
-
-    if ($self->{socket}) {
-        $self->_close_socket;
-    }
+    $self->_close_socket if $self->{socket};
     $self->{_socket_live}       = 0;
     $self->{_fatal_in_progress} = 0;
     $self->{_reader_future}     = undef;
     $self->{_reconnect_future}  = undef;
     $self->{connected}          = 0;
     $self->{parser}             = undef;
+    $self->{in_pubsub}          = 0;
+
+    # Fail detached futures — typed error so callers can distinguish.
+    my $err = Async::Redis::Error::Disconnected->new(
+        message => "Client disconnect",
+    );
+    for my $entry (@$detached_inflight, @$detached_autopipe) {
+        next if $entry->{future}->is_ready;
+        $entry->{future}->fail($err);
+    }
+
+    # No reconnect handoff — intentional disconnect means stay down.
 
     if ($was_connected && $self->{on_disconnect}) {
-        $self->{on_disconnect}->($self, $reason);
+        $self->{on_disconnect}->($self, 'client disconnect');
     }
 
     # Telemetry: record disconnection
     if ($was_connected && $self->{_telemetry}) {
         $self->{_telemetry}->record_connection(-1);
-        $self->{_telemetry}->log_event('disconnected', $reason);
+        $self->{_telemetry}->log_event('disconnected', 'client disconnect');
     }
 
     return $self;
