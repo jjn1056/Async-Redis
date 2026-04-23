@@ -212,7 +212,7 @@ sub new {
         debug              => $args{debug},
         otel_tracer        => $args{otel_tracer},
         otel_meter         => $args{otel_meter},
-        otel_include_args  => $args{otel_include_args} // 1,
+        otel_include_args  => $args{otel_include_args} // 0,
         otel_redact        => $args{otel_redact} // 1,
     }, $class;
 
