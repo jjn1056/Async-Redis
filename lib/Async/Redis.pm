@@ -316,13 +316,21 @@ async sub connect {
     $self->{socket} = $socket;
     $self->{parser} = _parser_class()->new(api => 1);
     $self->{_socket_live} = 1;   # write gate and reader can now submit
-    $self->{connected}    = 1;
     $self->{inflight} = [];
     $self->{_pid} = $$;  # Track PID for fork safety
     $self->{_current_read_future} = undef;
 
-    # Run Redis protocol handshake (AUTH, SELECT, CLIENT SETNAME)
-    await $self->_redis_handshake;
+    # Run Redis protocol handshake (AUTH, SELECT, CLIENT SETNAME).
+    # connected stays 0 during handshake; set it only on success so
+    # callers never see a half-initialised object.
+    my $handshake_ok = eval { await $self->_redis_handshake; 1 };
+    unless ($handshake_ok) {
+        my $err = $@;
+        $self->_reset_connection('handshake_failure');
+        die $err;
+    }
+
+    $self->{connected} = 1;
 
     # Initialize auto-pipeline if enabled
     if ($self->{auto_pipeline}) {
@@ -357,9 +365,9 @@ async sub _redis_handshake {
     my $deadline = Time::HiRes::time() + $self->{connect_timeout};
 
     # AUTH (password or username+password for ACL)
-    if ($self->{password}) {
+    if (defined $self->{password}) {
         my @auth_args = ('AUTH');
-        push @auth_args, $self->{username} if $self->{username};
+        push @auth_args, $self->{username} if defined $self->{username};
         push @auth_args, $self->{password};
 
         my $cmd = $self->_build_command(@auth_args);
@@ -394,7 +402,7 @@ async sub _redis_handshake {
     }
 
     # CLIENT SETNAME
-    if ($self->{client_name}) {
+    if (defined $self->{client_name} && length $self->{client_name}) {
         my $cmd = $self->_build_command('CLIENT', 'SETNAME', $self->{client_name});
         await $self->_send($cmd);
 
