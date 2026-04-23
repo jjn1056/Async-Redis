@@ -1025,8 +1025,16 @@ async sub _reconnect {
 }
 
 # Ensure the socket is live, reconnecting if configured.
-# Deduplicates concurrent reconnect requests via _reconnect_future.
-# NOTE: the dedupe is race-safe only when called from inside the write
+#
+# Dedup: $self->{_reconnect_future} is the Future for the in-flight
+# reconnect. Concurrent callers share it. The slot is the shared-await
+# signal, NOT the ownership — ownership lives in $self->{_tasks}.
+#
+# Structured-concurrency: the reconnect task is added to the selector
+# so any caller currently awaiting via run_until_ready sees reconnect
+# failures propagated.
+#
+# NOTE: dedup is race-safe only when called from inside the write
 # gate (which serialises callers). Outside the gate, a failed reconnect
 # could be observed after on_ready clears the slot, allowing a second
 # reconnect to start before state converges.
@@ -1039,6 +1047,7 @@ async sub _ensure_connected {
     }
     my $f = $self->_reconnect;
     $self->{_reconnect_future} = $f;
+    $self->{_tasks}->add(data => 'reconnect', f => $f);
     $f->on_ready(sub { $self->{_reconnect_future} = undef });
     await $f;
 }
@@ -1085,6 +1094,11 @@ async sub _reconnect_pubsub {
 sub _reconnect_async {
     my ($self, $sub) = @_;
 
+    # Dedup against any reconnect already in progress (from either this
+    # path or _ensure_connected). The slot is the shared signal.
+    return if $self->{_reconnect_future}
+        && !$self->{_reconnect_future}->is_ready;
+
     weaken(my $weak_self = $self);
     weaken(my $weak_sub  = $sub);
 
@@ -1112,13 +1126,21 @@ sub _reconnect_async {
         }
     })->();
 
+    # Ownership: the selector owns the task; the slot is the dedup signal.
+    # No ->retain — the selector holds the strong reference.
+    $self->{_reconnect_future} = $f;
+    $self->{_tasks}->add(data => 'pubsub-reconnect', f => $f);
+
+    $f->on_ready(sub {
+        return unless $weak_self;
+        $weak_self->{_reconnect_future} = undef;
+    });
     $f->on_fail(sub {
         my $err = shift;
         return unless $weak_sub;
         $weak_sub->_fail_fatal($err);
     });
 
-    $f->retain;
     return;
 }
 
