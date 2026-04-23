@@ -7,7 +7,9 @@ use 5.018;
 use Future;
 use Future::AsyncAwait;
 use Future::IO;
+use Scalar::Util qw(refaddr);
 use Async::Redis;
+use Async::Redis::Error::Disconnected;
 use Async::Redis::Error::Timeout;
 
 our $VERSION = '0.001';
@@ -39,9 +41,10 @@ sub new {
         on_dirty => $pool_args{on_dirty} // 'destroy',
 
         # Pool state
-        _idle    => [],   # Available connections
-        _active  => {},   # Connections in use (conn => 1)
-        _waiters => [],   # Futures waiting for connection
+        _idle     => [],   # Available connections
+        _active   => {},   # Connections in use (refaddr => conn)
+        _waiters  => [],   # Futures waiting for connection
+        _shutdown => 0,    # Set by shutdown(); blocks new acquires
         _pending         => [],   # Background futures (creation, cleanup)
         _creating        => 0,    # Connections currently being created
         _total_created   => 0,
@@ -110,6 +113,12 @@ sub _clear_all_connections {
 async sub acquire {
     my ($self) = @_;
 
+    if ($self->{_shutdown}) {
+        die Async::Redis::Error::Disconnected->new(
+            message => "Pool is shut down",
+        );
+    }
+
     # Check for fork - clear pool if PID changed
     $self->_check_fork;
 
@@ -120,7 +129,7 @@ async sub acquire {
         # Health check
         my $healthy = await $self->_health_check($conn);
         if ($healthy) {
-            $self->{_active}{"$conn"} = $conn;
+            $self->{_active}{refaddr($conn)} = $conn;
             return $conn;
         }
 
@@ -147,7 +156,7 @@ async sub acquire {
             die $error;
         }
 
-        $self->{_active}{"$conn"} = $conn;
+        $self->{_active}{refaddr($conn)} = $conn;
         return $conn;
     }
 
@@ -183,7 +192,7 @@ async sub acquire {
 sub release {
     my ($self, $conn) = @_;
 
-    return unless $conn;
+    return unless defined $conn;
 
     # Check for fork - if forked, don't return to pool
     if ($self->_check_fork) {
@@ -191,8 +200,18 @@ sub release {
         return;
     }
 
-    # Remove from active
-    delete $self->{_active}{"$conn"};
+    my $id = refaddr($conn);
+    unless (exists $self->{_active}{$id}) {
+        warn "Pool: release called on unknown or already-released connection";
+        return;
+    }
+    delete $self->{_active}{$id};
+
+    # After shutdown, destroy instead of pooling
+    if ($self->{_shutdown}) {
+        $self->_destroy_connection($conn);
+        return;
+    }
 
     # Check if connection is dirty
     if ($conn->is_dirty) {
@@ -225,7 +244,7 @@ sub _return_to_pool {
     # Give to waiting acquirer if any
     if (@{$self->{_waiters}}) {
         my $waiter = shift @{$self->{_waiters}};
-        $self->{_active}{"$conn"} = $conn;
+        $self->{_active}{refaddr($conn)} = $conn;
         $waiter->done($conn);
         return;
     }
@@ -398,15 +417,12 @@ async sub with {
     return $result;
 }
 
-# Shutdown the pool
-async sub shutdown {
+# Shutdown the pool — synchronous. Blocks new acquires, fails waiters,
+# closes idle connections. Active connections are destroyed when released.
+sub shutdown {
     my ($self) = @_;
-
-    # Cancel waiters
-    for my $waiter (@{$self->{_waiters}}) {
-        $waiter->fail("Pool shutting down") unless $waiter->is_ready;
-    }
-    $self->{_waiters} = [];
+    return if $self->{_shutdown};
+    $self->{_shutdown} = 1;
 
     # Close idle connections
     for my $conn (@{$self->{_idle}}) {
@@ -414,7 +430,13 @@ async sub shutdown {
     }
     $self->{_idle} = [];
 
-    # Active connections will be closed when released
+    # Fail all pending acquire waiters
+    for my $waiter (@{$self->{_waiters}}) {
+        $waiter->fail(Async::Redis::Error::Disconnected->new(
+            message => "Pool is shutting down",
+        )) unless $waiter->is_ready;
+    }
+    $self->{_waiters} = [];
 }
 
 1;
