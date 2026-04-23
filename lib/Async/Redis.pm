@@ -2031,64 +2031,70 @@ sub pipeline {
 # Execute multiple commands, return all responses
 async sub _execute_pipeline {
     my ($self, $commands) = @_;
-
-    die "Not connected" unless $self->{connected};
-
     return [] unless @$commands;
 
-    # Wait for any inflight regular commands to complete before pipeline
-    # This prevents interleaving pipeline responses with regular command responses
-    await $self->_wait_for_inflight_drain;
-
-    # Take over reading - prevent response reader from running
-    $self->{_reading_responses} = 1;
-
     my $start_time = Time::HiRes::time();
-    my @responses;
-    my $count = scalar @$commands;
+    my $count      = scalar @$commands;
 
-    my $ok = eval {
-        # Send all commands
-        my $data = '';
-        for my $cmd (@$commands) {
-            $data .= $self->_build_command(@$cmd);
-        }
-        await $self->_send($data);
-
-        # Read all responses, capturing per-slot Redis errors
-        for my $i (1 .. $count) {
-            my $msg = await $self->_read_response();
-
-            # Capture Redis errors inline rather than dying
-            my $result;
-            eval {
-                $result = $self->_decode_response($msg);
-            };
-            if ($@) {
-                # Capture the error object inline in the results
-                $result = $@;
-            }
-            push @responses, $result;
-        }
-        1;
-    };
-
-    my $error = $@;
-
-    # Release reading lock
-    $self->{_reading_responses} = 0;
-
-    if (!$ok) {
-        die $error;
+    # Build one RESP buffer and one Future per command up front.
+    my $buffer = '';
+    my @futures;
+    my @deadlines;
+    for my $cmd (@$commands) {
+        $buffer .= $self->_build_command(@$cmd);
+        push @futures, Future->new;
+        push @deadlines, $self->_calculate_deadline(@$cmd);
     }
 
-    # Telemetry: record pipeline metrics
+    await $self->_with_write_gate(sub {
+        return (async sub {
+            if (!$self->{_socket_live}) {
+                if ($self->_reconnect_enabled) {
+                    await $self->_ensure_connected;
+                } else {
+                    die Async::Redis::Error::Disconnected->new(
+                        message => "Not connected",
+                    );
+                }
+            }
+            for my $i (0 .. $#$commands) {
+                $self->_add_inflight(
+                    $futures[$i],
+                    $commands->[$i][0],
+                    [ @{$commands->[$i]}[1..$#{$commands->[$i]}] ],
+                    $deadlines[$i],
+                    'capture',
+                );
+            }
+            await $self->_send($buffer);
+        })->();
+    });
+
+    $self->_ensure_reader;
+
+    # Await every future. capture policy means Redis errors come back as
+    # done($error_object); transport failures come back as fail().
+    my @results;
+    for my $i (0 .. $#futures) {
+        my $ok = eval { push @results, await $futures[$i]; 1 };
+        next if $ok;
+        # Transport failure mid-pipeline: the remaining futures already
+        # got _reader_fatal's typed error. Collect them too (as error
+        # values) so the caller sees a full array.
+        push @results, $@;
+        for my $j ($i + 1 .. $#futures) {
+            my $r_ok = eval { push @results, await $futures[$j]; 1 };
+            push @results, $@ unless $r_ok;
+        }
+        last;
+    }
+
     if ($self->{_telemetry}) {
         my $elapsed_ms = (Time::HiRes::time() - $start_time) * 1000;
         $self->{_telemetry}->record_pipeline($count, $elapsed_ms);
     }
 
-    return \@responses;
+    return \@results;
 }
 
 1;
