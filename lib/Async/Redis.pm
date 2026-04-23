@@ -514,7 +514,8 @@ sub _check_fork {
         # Fork detected - invalidate connection (parent owns the socket)
         # Don't cancel futures - they belong to the parent's event loop
         # Just clear references so we don't try to use them
-        $self->{connected} = 0;
+        $self->{connected}    = 0;
+        $self->{_socket_live} = 0;
         $self->{socket} = undef;
         $self->{parser} = undef;
         $self->{inflight} = [];
@@ -929,6 +930,25 @@ async sub _reconnect {
     $self->{_reconnect_attempt} = 0;
 }
 
+# Ensure the socket is live, reconnecting if configured.
+# Deduplicates concurrent reconnect requests via _reconnect_future.
+# NOTE: the dedupe is race-safe only when called from inside the write
+# gate (which serialises callers). Outside the gate, a failed reconnect
+# could be observed after on_ready clears the slot, allowing a second
+# reconnect to start before state converges.
+async sub _ensure_connected {
+    my ($self) = @_;
+    return if $self->{_socket_live};
+    if (my $f = $self->{_reconnect_future}) {
+        await $f;
+        return;
+    }
+    my $f = $self->_reconnect;
+    $self->{_reconnect_future} = $f;
+    $f->on_ready(sub { $self->{_reconnect_future} = undef });
+    await $f;
+}
+
 # Reconnect and replay pubsub subscriptions
 async sub _reconnect_pubsub {
     my ($self) = @_;
@@ -994,15 +1014,6 @@ async sub command {
         return await $self->{_auto_pipeline}->command($cmd, @args);
     }
 
-    # If disconnected and reconnect enabled, try to reconnect
-    if (!$self->{connected} && $self->{reconnect}) {
-        await $self->_reconnect;
-    }
-
-    die Async::Redis::Error::Disconnected->new(
-        message => "Not connected",
-    ) unless $self->{connected};
-
     # Telemetry: start span and log send
     my $span_context;
     my $start_time = Time::HiRes::time();
@@ -1011,43 +1022,41 @@ async sub command {
         $self->{_telemetry}->log_send($cmd, @args);
     }
 
-    my $raw_cmd = $self->_build_command($cmd, @args);
-
-    # Calculate deadline based on command type
+    my $raw_cmd  = $self->_build_command($cmd, @args);
     my $deadline = $self->_calculate_deadline($cmd, @args);
-
-    # Create response future and register in inflight queue BEFORE sending
-    # This ensures responses are matched in order
-    my $response_future = Future->new;
-    $self->_add_inflight($response_future, $cmd, \@args, $deadline);
+    my $response = Future->new;
 
     my $result;
     my $error;
 
-    my $send_ok = eval {
-        # Send command
-        await $self->_send($raw_cmd);
+    my $submit_ok = eval {
+        await $self->_with_write_gate(sub {
+            return (async sub {
+                # Ensure the socket is live. Reconnect if enabled, else fail.
+                if (!$self->{_socket_live}) {
+                    if ($self->_reconnect_enabled) {
+                        await $self->_ensure_connected;
+                    } else {
+                        die Async::Redis::Error::Disconnected->new(
+                            message => "Not connected",
+                        );
+                    }
+                }
+                # Register inflight BEFORE writing so order matches the wire.
+                $self->_add_inflight($response, $cmd, \@args, $deadline, 'fail');
+                await $self->_send($raw_cmd);
+            })->();
+        });
         1;
     };
 
-    if (!$send_ok) {
+    if (!$submit_ok) {
         $error = $@;
-        # Send failed - remove from inflight and fail
-        $self->_shift_inflight;  # Remove the entry we just added
-        $response_future->fail($error) unless $response_future->is_ready;
+        # _with_write_gate already called _reader_fatal on write failure.
     } else {
-        # Trigger the response reader (fire and forget - it runs in background)
-        $self->_ensure_response_reader->retain;
-
-        # Wait for our response future to be completed by the reader
-        my $await_ok = eval {
-            $result = await $response_future;
-            1;
-        };
-
-        if (!$await_ok) {
-            $error = $@;
-        }
+        $self->_ensure_reader;
+        my $await_ok = eval { $result = await $response; 1 };
+        if (!$await_ok) { $error = $@ }
     }
 
     # Telemetry: log result and end span
