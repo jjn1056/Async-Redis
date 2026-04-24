@@ -7,6 +7,10 @@ use Future;
 use Scalar::Util qw(blessed);
 use Async::Redis;
 
+# Writing to a just-closed socket raises SIGPIPE; tests that exercise
+# disconnect-under-load would otherwise die from the signal.
+local $SIG{PIPE} = 'IGNORE';
+
 plan skip_all => 'REDIS_HOST not set' unless $ENV{REDIS_HOST};
 
 # Structured-concurrency invariants for the Future::Selector-backed
@@ -74,12 +78,66 @@ subtest 'task failure reaches awaiting caller (generic structured-concurrency pr
     })->()->get;
 };
 
-# Note: a "disconnect under load" test was considered and removed.
-# Firing many commands and calling disconnect synchronously surfaces
-# write-gate waiters that aren't torn down by disconnect (they stay
-# pending on _acquire_write_lock after the socket closes). That's a
-# latent gap in disconnect's cleanup, not a Phase 7 concern — fixing
-# it is a behavior change. See conversation log.
+subtest 'disconnect under load: write-gate waiters unwind cleanly' => sub {
+    # Fire many concurrent commands without awaiting individually, so
+    # most end up waiting on _acquire_write_lock rather than in the
+    # inflight queue. Then disconnect and await them all. Verify:
+    #   - every future resolves (no pending futures left)
+    #   - only Disconnected / Connection error types appear
+    #   - no Timeout, Protocol, or generic die leaking out
+    # Uses BLPOP with a 0.1s server-side timeout so commands are slow
+    # enough that disconnect actually catches some mid-flight even on
+    # fast loopback.
+
+    (async sub {
+        my $r = new_redis();
+        await $r->connect;
+
+        my @futures;
+        for my $i (1..30) {
+            push @futures, $r->blpop("load_list_$i", 0.1);
+        }
+        # Disconnect immediately without yielding — waiters in the gate
+        # chain and in the inflight queue all need to unwind.
+        $r->disconnect;
+
+        # Await all so the event loop pumps and suspended awaits resolve.
+        my $timeout = Future::IO->sleep(5);
+        my $all = Future->wait_all(@futures);
+        my $race = Future->wait_any($all, $timeout);
+        eval { await $race };   # may fail with any of them; we check state below
+
+        my %type_counts;
+        my $still_pending = 0;
+        for my $f (@futures) {
+            if (!$f->is_ready) {
+                $still_pending++;
+                next;
+            }
+            if ($f->is_done) {
+                $type_counts{done}++;
+                next;
+            }
+            my ($err) = $f->failure;
+            my $t = (blessed($err) && $err->can('isa'))
+                ? (ref $err)
+                : 'string';
+            $type_counts{$t}++;
+        }
+
+        is $still_pending, 0, 'every future resolved after disconnect+pump';
+
+        # Acceptable terminal states: done (command raced to completion),
+        # Async::Redis::Error::Disconnected, Async::Redis::Error::Connection.
+        my %allowed = map { $_ => 1 } (
+            'done',
+            'Async::Redis::Error::Disconnected',
+            'Async::Redis::Error::Connection',
+        );
+        my @unexpected = grep { !$allowed{$_} } keys %type_counts;
+        is \@unexpected, [], 'no unexpected error types';
+    })->()->get;
+};
 
 subtest 'reconnect cycles do not leak state' => sub {
     (async sub {

@@ -477,20 +477,37 @@ sub disconnect {
     }
     $self->{_current_read_future} = undef;
 
+    # Cancel any in-flight reconnect task so it doesn't re-establish
+    # state (connecting a new socket, setting _socket_live=1) after the
+    # user has intentionally disconnected.
+    if (my $rf = delete $self->{_reconnect_future}) {
+        $rf->cancel unless $rf->is_ready;
+    }
+
+    my $err = Async::Redis::Error::Disconnected->new(
+        message => "Client disconnect",
+    );
+
+    # Wake the write-gate chain. Any commands waiting in
+    # _acquire_write_lock's `await $prev` unwind via their await
+    # throwing, and their _execute_command eval rethrows Disconnected
+    # to the caller. Without this, write-gate waiters stay suspended
+    # because the normal release path only runs when the current
+    # holder's body completes.
+    if (my $lock = delete $self->{_write_lock}) {
+        $lock->fail($err) unless $lock->is_ready;
+    }
+
     $self->_close_socket if $self->{socket};
     $self->{_socket_live}       = 0;
     $self->{_fatal_in_progress} = 0;
     $self->{_reader_running}    = 0;
-    $self->{_reconnect_future}  = undef;
     $self->{connected}          = 0;
     $self->{parser}             = undef;
     $self->{in_pubsub}          = 0;
 
     # Fail detached futures with the user-context type so callers can
     # distinguish "I disconnected" from Connection/EOF.
-    my $err = Async::Redis::Error::Disconnected->new(
-        message => "Client disconnect",
-    );
     for my $entry (@$detached_inflight, @$detached_autopipe) {
         next if $entry->{future}->is_ready;
         $entry->{future}->fail($err);
