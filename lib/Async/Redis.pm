@@ -3021,6 +3021,55 @@ Callback invocation is always serialized. With C<< message_queue_depth => 1 >>
 processing; the reader pauses when that queue slot is full. Higher values
 allow more messages to buffer locally before the reader pauses.
 
+=head1 TASK LIFECYCLE
+
+Async::Redis organizes all fire-and-forget background work (the socket
+reader, reconnect attempts, auto-pipeline submit batches, the pubsub
+callback driver) under a single per-client L<Future::Selector> instance,
+following Paul Evans's client pattern from L<Sys::Async::Virt> and
+L<IPC::MicroSocket>.
+
+Each background task is registered with the selector via
+C<< $selector->add(data => $label, f => $task_future) >>. Command
+execution awaits responses via
+C<< $selector->run_until_ready($response_future) >>, which pumps the
+selector and propagates any task failure to the awaiting caller. The
+practical guarantee: if a background task dies (including from a
+coding bug that escapes explicit fatal-error handling), awaiting
+callers see a typed failure rather than hanging forever.
+
+This structure provides the five structured-concurrency properties
+articulated by the L<trio|https://trio.readthedocs.io/> /
+L<asyncio.TaskGroup|https://docs.python.org/3/library/asyncio-task.html#task-groups>
+ecosystems:
+
+=over
+
+=item * GC safety - every background task is held by the selector.
+
+=item * Error propagation - any task's failure reaches callers awaiting
+the selector via C<run_until_ready>.
+
+=item * Cancellation - socket closure propagates to pending I/O, which
+fails the owning task, which the selector propagates.
+
+=item * Scope cleanup - C<disconnect> tears down state; remaining selector
+tasks unwind via their existing on_fail handlers.
+
+=item * Local reasoning - all concurrent work on one connection is owned
+by one place.
+
+=back
+
+There is no user-facing API for the selector; it is internal
+machinery. Clients should not call C<< $redis->{_tasks} >> directly.
+
+I<Note:> the only use of C<< Future->retain >> in this codebase is
+avoided in favor of selector ownership. Any patch that introduces
+C<< ->retain >> on an Async::Redis-owned Future should instead add
+the task to C<< $self->{_tasks} >> so failure propagation and lifetime
+ownership are consistent.
+
 =head1 KNOWN LIMITATIONS
 
 =over
