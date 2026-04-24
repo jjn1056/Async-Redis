@@ -427,21 +427,41 @@ sub is_connected {
 }
 
 # Disconnect from Redis — user-initiated path.
-# Distinct from _reader_fatal: no reconnect handoff, inflight fails
-# (not cancels) with Disconnected, subscription gets _close (not _fail).
+#
+# Distinct from _reader_fatal (which handles stream-level failure): this
+# path is deterministic for user context. Key differences:
+#   - Inflight futures fail with Async::Redis::Error::Disconnected
+#     ("Client disconnect") rather than Connection ("Connection closed
+#     by peer"). Callers can distinguish "I disconnected" from "the
+#     server/network dropped me."
+#   - Subscription gets _close (clean; iterator next() returns undef,
+#     callback driver exits cleanly) rather than _fail_fatal.
+#   - No reconnect handoff — disconnect means stay down.
+#
+# Relationship to the selector (_tasks): this method does explicit
+# teardown rather than relying on _reader_fatal propagation. Any tasks
+# still in the selector (e.g., in-flight reconnect, autopipeline submit)
+# will see their underlying I/O fail when the socket is closed and
+# unwind via their existing on_fail handlers. Cancelling them explicitly
+# would be cleaner but requires Future::Selector API that doesn't yet
+# exist; this is acceptable because the failing I/O is a deterministic
+# wakeup.
 sub disconnect {
     my ($self) = @_;
     return $self unless $self->{_socket_live} || $self->{connected};
 
     my $was_connected = $self->{connected};
 
-    # Close subscription cleanly — iterator next() gets undef, no on_error.
+    # Close subscription cleanly before socket close so the pubsub branch
+    # in any subsequent _reader_fatal (triggered by the failing read)
+    # sees _closed and no-ops on _fail_fatal.
     if (my $sub = $self->{_subscription}) {
         $sub->_close unless $sub->is_closed;
     }
 
     # Detach inflight + auto-pipeline queue before socket close so
-    # _close_socket doesn't cancel them — we will fail them explicitly.
+    # _close_socket doesn't cancel them — we will fail them explicitly
+    # with a user-context error type.
     my $detached_inflight = $self->{inflight};
     $self->{inflight} = [];
     my $detached_autopipe = [];
@@ -466,7 +486,8 @@ sub disconnect {
     $self->{parser}             = undef;
     $self->{in_pubsub}          = 0;
 
-    # Fail detached futures — typed error so callers can distinguish.
+    # Fail detached futures with the user-context type so callers can
+    # distinguish "I disconnected" from Connection/EOF.
     my $err = Async::Redis::Error::Disconnected->new(
         message => "Client disconnect",
     );
@@ -475,13 +496,12 @@ sub disconnect {
         $entry->{future}->fail($err);
     }
 
-    # No reconnect handoff — intentional disconnect means stay down.
-
+    # on_disconnect + telemetry fire only if we were publicly connected,
+    # mirroring _reader_fatal's guard so a failed initial handshake
+    # doesn't spuriously emit these.
     if ($was_connected && $self->{on_disconnect}) {
         $self->{on_disconnect}->($self, 'client disconnect');
     }
-
-    # Telemetry: record disconnection
     if ($was_connected && $self->{_telemetry}) {
         $self->{_telemetry}->record_connection(-1);
         $self->{_telemetry}->log_event('disconnected', 'client disconnect');
