@@ -184,10 +184,14 @@ subtest 'reconnect cycles do not leak state' => sub {
             ok $got_msg && $got_msg->{data} eq "cycle-$cycle",
                 "cycle $cycle: received expected message";
 
-            # Force a disconnect to trigger reconnect.
-            close $sub_redis->{socket} if $sub_redis->{socket};
-            $sub_redis->{connected}    = 0;
-            $sub_redis->{_socket_live} = 0;
+            # Force a disconnect to trigger reconnect. Use CLIENT KILL
+            # from the publisher so the server closes the subscriber's
+            # connection — kernel delivers EOF cleanly through Future::IO's
+            # poller. Closing the client socket locally would leave a stale
+            # poller with undef fileno in the select loop.
+            my $sub_sock = $sub_redis->{socket};
+            my $sub_addr = $sub_sock->sockhost . ':' . $sub_sock->sockport;
+            eval { await $pub->client('KILL', 'ADDR', $sub_addr) };
             # Give reconnect a moment to kick off.
             await Future::IO->sleep(0.3);
         }

@@ -163,11 +163,15 @@ async sub delay {
     await Future::IO->sleep($seconds);
 }
 
-# Force-close the socket under the reader. Next read returns 0 bytes,
-# triggering the reader's EOF handling path.
+# Force EOF on the socket under the reader. Next read returns 0 bytes,
+# triggering the reader's EOF handling path. Uses shutdown() rather
+# than close() so the file descriptor stays valid for Future::IO's
+# select loop — close() on an fh that Future::IO has an active poller
+# on leaves a stale watcher whose fileno is undef, which taints select()
+# with uninit warnings.
 sub inject_eof {
     my ($redis) = @_;
-    close $redis->{socket} if $redis->{socket};
+    shutdown($redis->{socket}, 2) if $redis->{socket};
 }
 
 # Feed bytes directly into the parser, bypassing the socket. Useful
@@ -268,9 +272,11 @@ Returns the Redis port from REDIS_PORT env var (default: 6379).
 
 =item inject_eof($redis)
 
-Force-close the underlying socket so the next read returns 0 bytes.
-Triggers the reader's EOF handling path. Used in adverse-interleaving
-tests to simulate abrupt server disconnect.
+Force EOF on the underlying socket via C<shutdown(..., 2)> so the next
+sysread returns 0 bytes. Triggers the reader's EOF handling path. Used
+in adverse-interleaving tests to simulate abrupt server disconnect.
+C<shutdown> is used in preference to C<close> so the file descriptor
+stays valid for any active Future::IO poller watching the socket.
 
 =item inject_unexpected_frame($redis, $raw_bytes)
 

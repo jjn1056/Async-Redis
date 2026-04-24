@@ -209,6 +209,18 @@ SKIP: {
 
     my $TEST_TIMEOUT = 5;
 
+    # Helper: simulate a dropped connection by having the publisher
+    # CLIENT KILL the subscriber. Server-side close → kernel delivers
+    # EOF on our still-valid fd → reader sees 0 bytes → _reader_fatal
+    # fires cleanly. Matches how a real peer-initiated disconnect works,
+    # whereas `close $sub_redis->{socket}` leaves a stale poller in
+    # Future::IO's select loop with undef fileno, which gets coerced to
+    # fd 0 (STDIN) and deadlocks select in a TTY context.
+    #
+    # CLIENT commands are forbidden once a connection enters pub/sub
+    # mode, so the caller MUST capture the subscriber's client ID
+    # BEFORE subscribing and issue the KILL from a separate connection.
+
     subtest 'subscriber reconnects and receives messages after drop' => sub {
         my $pub = Async::Redis->new(
             host => $ENV{REDIS_HOST} // 'localhost',
@@ -221,6 +233,9 @@ SKIP: {
             reconnect_delay => 0.1,
         );
         run { $sub_redis->connect };
+
+        # Capture subscriber's client ID before pubsub mode locks us out.
+        my $sub_client_id = run { $sub_redis->client('ID') };
 
         my $subscription = run { $sub_redis->subscribe('reconnect:test') };
         ok($subscription, 'subscribed');
@@ -235,9 +250,8 @@ SKIP: {
         is($msg1->{data}, 'before', 'received message before disconnect');
         run { $pre_future };
 
-        # Force disconnect
-        close $sub_redis->{socket};
-        $sub_redis->{connected} = 0;
+        # Server-initiated disconnect via KILL from pub connection.
+        eval { run { $pub->client('KILL', 'ID', $sub_client_id) } };
 
         # Publish after reconnect window
         my $post_future = (async sub {
@@ -281,6 +295,8 @@ SKIP: {
         );
         run { $sub_redis->connect };
 
+        my $sub_client_id = run { $sub_redis->client('ID') };
+
         my $subscription = run { $sub_redis->subscribe('callback:test') };
 
         # Register callback
@@ -293,9 +309,8 @@ SKIP: {
             };
         });
 
-        # Force disconnect
-        close $sub_redis->{socket};
-        $sub_redis->{connected} = 0;
+        # Server-initiated disconnect.
+        eval { run { $pub->client('KILL', 'ID', $sub_client_id) } };
 
         my $publish_future = (async sub {
             await Future::IO->sleep(0.3);
@@ -338,14 +353,15 @@ SKIP: {
         );
         run { $sub_redis->connect };
 
+        my $sub_client_id = run { $sub_redis->client('ID') };
+
         my $subscription = run { $sub_redis->psubscribe('precon:*') };
 
         my @events;
         $subscription->on_reconnect(sub { push @events, 'reconnected' });
 
-        # Force disconnect
-        close $sub_redis->{socket};
-        $sub_redis->{connected} = 0;
+        # Server-initiated disconnect.
+        eval { run { $pub->client('KILL', 'ID', $sub_client_id) } };
 
         my $publish_future = (async sub {
             await Future::IO->sleep(0.3);
@@ -386,12 +402,13 @@ SKIP: {
         );
         run { $sub_redis->connect };
 
+        my $sub_client_id = run { $sub_redis->client('ID') };
+
         my $subscription = run { $sub_redis->subscribe('multi:a', 'multi:b', 'multi:c') };
         is(scalar $subscription->channel_count, 3, 'subscribed to 3 channels');
 
-        # Force disconnect
-        close $sub_redis->{socket};
-        $sub_redis->{connected} = 0;
+        # Server-initiated disconnect.
+        eval { run { $pub->client('KILL', 'ID', $sub_client_id) } };
 
         my $publish_future = (async sub {
             await Future::IO->sleep(0.3);
@@ -439,12 +456,13 @@ SKIP: {
         );
         run { $sub_redis->connect };
 
+        my $sub_client_id = run { $sub_redis->client('ID') };
+
         my $subscription = run { $sub_redis->subscribe('nocb:test') };
         # No on_reconnect callback registered
 
-        # Force disconnect
-        close $sub_redis->{socket};
-        $sub_redis->{connected} = 0;
+        # Server-initiated disconnect.
+        eval { run { $pub->client('KILL', 'ID', $sub_client_id) } };
 
         my $publish_future = (async sub {
             await Future::IO->sleep(0.3);
@@ -471,17 +489,23 @@ SKIP: {
     };
 
     subtest 'no reconnect when reconnect disabled' => sub {
+        my $killer = Async::Redis->new(
+            host => $ENV{REDIS_HOST} // 'localhost',
+        );
+        run { $killer->connect };
+
         my $sub_redis = Async::Redis->new(
             host      => $ENV{REDIS_HOST} // 'localhost',
             reconnect => 0,
         );
         run { $sub_redis->connect };
 
+        my $sub_client_id = run { $sub_redis->client('ID') };
+
         my $subscription = run { $sub_redis->subscribe('norecon:test') };
 
-        # Force disconnect
-        close $sub_redis->{socket};
-        $sub_redis->{connected} = 0;
+        # Server-initiated disconnect.
+        eval { run { $killer->client('KILL', 'ID', $sub_client_id) } };
 
         my $next_f = $subscription->next;
         my $timeout_f = Future::IO->sleep($TEST_TIMEOUT)->then(sub {
@@ -492,7 +516,10 @@ SKIP: {
         $error = $@;
 
         ok($error, 'error thrown when reconnect disabled');
-        like("$error", qr/connect|disconnect|fileno|closed/i, 'error is connection-related');
+        like("$error", qr/connect|disconnect|closed|peer/i, 'error is connection-related');
+
+        eval { $killer->disconnect };
+        eval { $sub_redis->disconnect };
     };
 }
 
