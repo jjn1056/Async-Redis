@@ -1103,26 +1103,18 @@ sub _reconnect_async {
     weaken(my $weak_sub  = $sub);
 
     my $f = (async sub {
-        my @replay = $weak_sub ? $weak_sub->get_replay_commands : ();
-
-        # Reconnect loop — mirrors _ensure_connected.
+        # Reconnect the socket. _reconnect handles retry/backoff and
+        # dies with Disconnected if reconnect_max_attempts is exhausted.
         await $weak_self->_reconnect;
 
-        # Replay subscriptions via the unified reader.
-        $weak_self->{in_pubsub} = 1;
-        for my $cmd (@replay) {
-            my ($command, @args) = @$cmd;
-            for my $arg (@args) {
-                await $weak_self->_pubsub_command($command, $arg);
-            }
-        }
-
+        # Delegate the replay, on_reconnect, and driver-restart work to
+        # the subscription's unified resume path. _resume_after_reconnect
+        # handles clearing _paused, setting in_pubsub, replaying all
+        # tracked channels/patterns, firing on_reconnect, and starting
+        # the driver. Keeps the "who restarts what after reconnect"
+        # logic in one place.
         if ($weak_sub) {
-            if (my $cb = $weak_sub->{_on_reconnect}) {
-                $cb->($weak_sub);
-            }
-            # Restart the driver in whichever mode the subscription is in.
-            $weak_sub->_start_driver($weak_sub->{_on_message} ? 0 : 1);
+            await $weak_sub->_resume_after_reconnect;
         }
     })->();
 
