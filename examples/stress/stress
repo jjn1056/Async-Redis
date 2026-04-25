@@ -1,0 +1,10 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use FindBin qw($Bin);
+use lib "$Bin/lib";
+use lib "$Bin/../../lib";  # for Async::Redis
+
+# Stub — full CLI is implemented in Task 12.
+print "stress harness (stub) — see docs/plans/2026-04-24-stress-example-plan.md\n";
+exit 0;
