@@ -187,4 +187,60 @@ async sub run_blocking_driver {
     return;
 }
 
+async sub run_pubsub_subscriber {
+    my %args = @_;
+    my $client    = $args{client};
+    my $channels  = $args{channels};
+    my $metrics   = $args{metrics};
+    my $integrity = $args{integrity};
+    my $stop      = $args{stop};
+
+    my $sub = await $client->subscribe(@$channels);
+
+    while (!$stop->is_ready) {
+        my $msg = eval { await $sub->next };
+        # next() returns undef cleanly when the harness disconnects the
+        # client; on any other failure, the eval traps and we re-check stop.
+        if (!$msg) {
+            await Future::IO->sleep(0.01);
+            next;
+        }
+        $metrics->incr_op('message_rx');
+        my $payload = $msg->{data} // '';
+        if ($payload =~ /^chan=([^:]+):seq=(\d+):/) {
+            $integrity->note_pubsub_observation($1, $2);
+        }
+    }
+    return;
+}
+
+async sub run_pubsub_publisher {
+    my %args = @_;
+    my $client   = $args{client};
+    my $channels = $args{channels};
+    my $metrics  = $args{metrics};
+    my $stop     = $args{stop};
+    my $rate_hz  = $args{rate_hz} // 100;
+
+    my %seq;
+    my $period = 1.0 / $rate_hz;
+    my $i = 0;
+
+    while (!$stop->is_ready) {
+        my $ch = $channels->[ $i++ % scalar @$channels ];
+        $seq{$ch}++;
+        my $payload = "chan=${ch}:seq=$seq{$ch}:t=" . time;
+        my $t0 = time;
+        my $ok = eval { await $client->publish($ch, $payload); 1 };
+        $metrics->record_latency('publish', time - $t0) if $ok;
+        if ($ok) {
+            $metrics->incr_op('publish');
+        } else {
+            _record_error($metrics, $@);
+        }
+        await Future::IO->sleep($period);
+    }
+    return;
+}
+
 1;
