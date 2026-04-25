@@ -76,7 +76,9 @@ async sub _run_async {
              && (time - $self->{start_time}) >= $self->{duration_s};
         await Future::IO->sleep(1);
         $self->_tick;
-        if ($self->{integrity}->violations) {
+        # --no-verify (verify=0) keeps integrity tracking running for
+        # observability but stops it from failing the run.
+        if ($self->{verify} && $self->{integrity}->violations) {
             $self->{exit_code} = 1;
             last;
         }
