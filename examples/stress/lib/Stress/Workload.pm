@@ -114,4 +114,77 @@ async sub run_autopipe {
     return;
 }
 
+async sub run_blocking_consumer {
+    my %args = @_;
+    my $client    = $args{client};
+    my $metrics   = $args{metrics};
+    my $integrity = $args{integrity};
+    my $queue     = $args{queue};
+    my $stop      = $args{stop};
+
+    while (!$stop->is_ready) {
+        my $t0 = time;
+        my $res;
+        my $ok = eval {
+            $res = await $client->blpop($queue, 1);  # 1-second BLPOP timeout
+            1;
+        };
+        if ($ok) {
+            # BLPOP returns undef on timeout, an arrayref on success.
+            # Only a successful pop counts as a queue operation; a
+            # timeout means we waited and got nothing.
+            if (defined $res) {
+                $metrics->record_latency('blpop', time - $t0);
+                $metrics->incr_op('blpop');
+                $integrity->note_queue_popped;
+            }
+        } else {
+            _record_error($metrics, $@);
+        }
+    }
+    return;
+}
+
+async sub run_blocking_driver {
+    my %args = @_;
+    my $client    = $args{client};
+    my $metrics   = $args{metrics};
+    my $integrity = $args{integrity};
+    my $queue     = $args{queue};
+    my $rate_hz   = $args{rate_hz} // 100;
+    my $stop      = $args{stop};
+
+    my $seq = 0;
+    my $period = 1.0 / $rate_hz;
+
+    while (!$stop->is_ready) {
+        $seq++;
+        my $job = "job_${seq}";
+        # Pre-increment pushed BEFORE the await. Otherwise the Perl event
+        # loop can fire the consumer's BLPOP-response continuation before
+        # the driver's LPUSH-response continuation, creating a transient
+        # popped > pushed state even though Redis itself never popped a
+        # phantom message. By bumping pushed synchronously, any BLPOP
+        # wakeup necessarily sees pushed >= corresponding popped.
+        #
+        # We do NOT decrement on LPUSH failure: under chaos, an await can
+        # fail after the bytes reached Redis (response lost on disconnect),
+        # so we can't reliably know whether the push actually happened.
+        # Treating pushed as ATTEMPTS — not successes — is conservative:
+        # pushed never falls below actual pushes, so the invariant
+        # "popped > pushed" remains a true bug indicator.
+        $integrity->note_queue_pushed;
+        my $t0 = time;
+        my $ok = eval { await $client->lpush($queue, $job); 1 };
+        $metrics->record_latency('lpush', time - $t0) if $ok;
+        if ($ok) {
+            $metrics->incr_op('lpush');
+        } else {
+            _record_error($metrics, $@);
+        }
+        await Future::IO->sleep($period);
+    }
+    return;
+}
+
 1;
