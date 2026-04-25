@@ -9,6 +9,7 @@ our $VERSION = '0.002000';
 use Future;
 use Future::AsyncAwait;
 use Future::IO 0.19;
+use Future::Selector 0.05;
 use Scalar::Util qw(blessed weaken);
 use Socket qw(pack_sockaddr_in pack_sockaddr_un inet_aton AF_INET AF_UNIX SOCK_STREAM);
 use IO::Handle ();
@@ -141,9 +142,10 @@ sub new {
         connected          => 0,
         _socket_live       => 0,
         _fatal_in_progress => 0,
-        _reader_future     => undef,
+        _reader_running    => 0,   # dedup guard; the selector owns the reader Future itself
         _write_lock        => undef,     # will be a Future used as a lock, populated lazily
         _reconnect_future  => undef,
+        _tasks             => Future::Selector->new,
 
         # Timeout settings
         connect_timeout         => $args{connect_timeout} // 10,
@@ -425,21 +427,41 @@ sub is_connected {
 }
 
 # Disconnect from Redis — user-initiated path.
-# Distinct from _reader_fatal: no reconnect handoff, inflight fails
-# (not cancels) with Disconnected, subscription gets _close (not _fail).
+#
+# Distinct from _reader_fatal (which handles stream-level failure): this
+# path is deterministic for user context. Key differences:
+#   - Inflight futures fail with Async::Redis::Error::Disconnected
+#     ("Client disconnect") rather than Connection ("Connection closed
+#     by peer"). Callers can distinguish "I disconnected" from "the
+#     server/network dropped me."
+#   - Subscription gets _close (clean; iterator next() returns undef,
+#     callback driver exits cleanly) rather than _fail_fatal.
+#   - No reconnect handoff — disconnect means stay down.
+#
+# Relationship to the selector (_tasks): this method does explicit
+# teardown rather than relying on _reader_fatal propagation. Any tasks
+# still in the selector (e.g., in-flight reconnect, autopipeline submit)
+# will see their underlying I/O fail when the socket is closed and
+# unwind via their existing on_fail handlers. Cancelling them explicitly
+# would be cleaner but requires Future::Selector API that doesn't yet
+# exist; this is acceptable because the failing I/O is a deterministic
+# wakeup.
 sub disconnect {
     my ($self) = @_;
     return $self unless $self->{_socket_live} || $self->{connected};
 
     my $was_connected = $self->{connected};
 
-    # Close subscription cleanly — iterator next() gets undef, no on_error.
+    # Close subscription cleanly before socket close so the pubsub branch
+    # in any subsequent _reader_fatal (triggered by the failing read)
+    # sees _closed and no-ops on _fail_fatal.
     if (my $sub = $self->{_subscription}) {
         $sub->_close unless $sub->is_closed;
     }
 
     # Detach inflight + auto-pipeline queue before socket close so
-    # _close_socket doesn't cancel them — we will fail them explicitly.
+    # _close_socket doesn't cancel them — we will fail them explicitly
+    # with a user-context error type.
     my $detached_inflight = $self->{inflight};
     $self->{inflight} = [];
     my $detached_autopipe = [];
@@ -455,31 +477,48 @@ sub disconnect {
     }
     $self->{_current_read_future} = undef;
 
+    # Cancel any in-flight reconnect task so it doesn't re-establish
+    # state (connecting a new socket, setting _socket_live=1) after the
+    # user has intentionally disconnected.
+    if (my $rf = delete $self->{_reconnect_future}) {
+        $rf->cancel unless $rf->is_ready;
+    }
+
+    my $err = Async::Redis::Error::Disconnected->new(
+        message => "Client disconnect",
+    );
+
+    # Wake the write-gate chain. Any commands waiting in
+    # _acquire_write_lock's `await $prev` unwind via their await
+    # throwing, and their _execute_command eval rethrows Disconnected
+    # to the caller. Without this, write-gate waiters stay suspended
+    # because the normal release path only runs when the current
+    # holder's body completes.
+    if (my $lock = delete $self->{_write_lock}) {
+        $lock->fail($err) unless $lock->is_ready;
+    }
+
     $self->_close_socket if $self->{socket};
     $self->{_socket_live}       = 0;
     $self->{_fatal_in_progress} = 0;
-    $self->{_reader_future}     = undef;
-    $self->{_reconnect_future}  = undef;
+    $self->{_reader_running}    = 0;
     $self->{connected}          = 0;
     $self->{parser}             = undef;
     $self->{in_pubsub}          = 0;
 
-    # Fail detached futures — typed error so callers can distinguish.
-    my $err = Async::Redis::Error::Disconnected->new(
-        message => "Client disconnect",
-    );
+    # Fail detached futures with the user-context type so callers can
+    # distinguish "I disconnected" from Connection/EOF.
     for my $entry (@$detached_inflight, @$detached_autopipe) {
         next if $entry->{future}->is_ready;
         $entry->{future}->fail($err);
     }
 
-    # No reconnect handoff — intentional disconnect means stay down.
-
+    # on_disconnect + telemetry fire only if we were publicly connected,
+    # mirroring _reader_fatal's guard so a failed initial handshake
+    # doesn't spuriously emit these.
     if ($was_connected && $self->{on_disconnect}) {
         $self->{on_disconnect}->($self, 'client disconnect');
     }
-
-    # Telemetry: record disconnection
     if ($was_connected && $self->{_telemetry}) {
         $self->{_telemetry}->record_connection(-1);
         $self->{_telemetry}->log_event('disconnected', 'client disconnect');
@@ -609,9 +648,9 @@ sub _fail_all_inflight {
 }
 
 # The single socket reader. Runs while there is work (inflight or pubsub).
-# Calls _reader_fatal on any stream-alignment failure. _reader_future is
-# cleared on every exit path so _ensure_reader can restart it on the next
-# submission.
+# Calls _reader_fatal on any stream-alignment failure. The selector
+# (_tasks) owns this task; _reader_running is cleared on every exit path
+# via on_ready so _ensure_reader can restart it on the next submission.
 async sub _run_reader {
     my ($self) = @_;
 
@@ -733,13 +772,24 @@ async sub _run_reader {
 }
 
 # Start the reader if not already running. Idempotent.
+#
+# Ownership: the reader Future lives in $self->{_tasks} (a Future::Selector).
+# The selector holds the strong reference and auto-removes the item on
+# completion. $self->{_reader_running} is a boolean dedup guard — it's NOT
+# a second source of truth about ownership, only a "is one already running?"
+# flag that's cheap to check without peeking at selector internals.
+#
+# Failure propagation: because the reader is in the selector, any awaiting
+# caller using $self->{_tasks}->run_until_ready($their_future) will see the
+# reader's failure propagated to them. That's the structured-concurrency
+# guarantee — no hanging callers when the reader dies unhandled.
 sub _ensure_reader {
     my ($self) = @_;
-    return if $self->{_reader_future} && !$self->{_reader_future}->is_ready;
+    return if $self->{_reader_running};
+    $self->{_reader_running} = 1;
     my $f = $self->_run_reader;
-    $f->on_ready(sub { $self->{_reader_future} = undef });
-    $self->{_reader_future} = $f;
-    $f->retain;
+    $f->on_ready(sub { $self->{_reader_running} = 0 });
+    $self->{_tasks}->add(data => 'reader', f => $f);
     return;
 }
 
@@ -1012,8 +1062,16 @@ async sub _reconnect {
 }
 
 # Ensure the socket is live, reconnecting if configured.
-# Deduplicates concurrent reconnect requests via _reconnect_future.
-# NOTE: the dedupe is race-safe only when called from inside the write
+#
+# Dedup: $self->{_reconnect_future} is the Future for the in-flight
+# reconnect. Concurrent callers share it. The slot is the shared-await
+# signal, NOT the ownership — ownership lives in $self->{_tasks}.
+#
+# Structured-concurrency: the reconnect task is added to the selector
+# so any caller currently awaiting via run_until_ready sees reconnect
+# failures propagated.
+#
+# NOTE: dedup is race-safe only when called from inside the write
 # gate (which serialises callers). Outside the gate, a failed reconnect
 # could be observed after on_ready clears the slot, allowing a second
 # reconnect to start before state converges.
@@ -1026,6 +1084,7 @@ async sub _ensure_connected {
     }
     my $f = $self->_reconnect;
     $self->{_reconnect_future} = $f;
+    $self->{_tasks}->add(data => 'reconnect', f => $f);
     $f->on_ready(sub { $self->{_reconnect_future} = undef });
     await $f;
 }
@@ -1072,40 +1131,45 @@ async sub _reconnect_pubsub {
 sub _reconnect_async {
     my ($self, $sub) = @_;
 
+    # Dedup against any reconnect already in progress (from either this
+    # path or _ensure_connected). The slot is the shared signal.
+    return if $self->{_reconnect_future}
+        && !$self->{_reconnect_future}->is_ready;
+
     weaken(my $weak_self = $self);
     weaken(my $weak_sub  = $sub);
 
     my $f = (async sub {
-        my @replay = $weak_sub ? $weak_sub->get_replay_commands : ();
-
-        # Reconnect loop — mirrors _ensure_connected.
+        # Reconnect the socket. _reconnect handles retry/backoff and
+        # dies with Disconnected if reconnect_max_attempts is exhausted.
         await $weak_self->_reconnect;
 
-        # Replay subscriptions via the unified reader.
-        $weak_self->{in_pubsub} = 1;
-        for my $cmd (@replay) {
-            my ($command, @args) = @$cmd;
-            for my $arg (@args) {
-                await $weak_self->_pubsub_command($command, $arg);
-            }
-        }
-
+        # Delegate the replay, on_reconnect, and driver-restart work to
+        # the subscription's unified resume path. _resume_after_reconnect
+        # handles clearing _paused, setting in_pubsub, replaying all
+        # tracked channels/patterns, firing on_reconnect, and starting
+        # the driver. Keeps the "who restarts what after reconnect"
+        # logic in one place.
         if ($weak_sub) {
-            if (my $cb = $weak_sub->{_on_reconnect}) {
-                $cb->($weak_sub);
-            }
-            # Restart the driver in whichever mode the subscription is in.
-            $weak_sub->_start_driver($weak_sub->{_on_message} ? 0 : 1);
+            await $weak_sub->_resume_after_reconnect;
         }
     })->();
 
+    # Ownership: the selector owns the task; the slot is the dedup signal.
+    # No ->retain — the selector holds the strong reference.
+    $self->{_reconnect_future} = $f;
+    $self->{_tasks}->add(data => 'pubsub-reconnect', f => $f);
+
+    $f->on_ready(sub {
+        return unless $weak_self;
+        $weak_self->{_reconnect_future} = undef;
+    });
     $f->on_fail(sub {
         my $err = shift;
         return unless $weak_sub;
         $weak_sub->_fail_fatal($err);
     });
 
-    $f->retain;
     return;
 }
 
@@ -1179,7 +1243,14 @@ async sub command {
         # _with_write_gate already called _reader_fatal on write failure.
     } else {
         $self->_ensure_reader;
-        my $await_ok = eval { $result = await $response; 1 };
+        # run_until_ready awaits $response while the selector pumps the
+        # reader (and any other adopted tasks). If any selector task fails
+        # unhandled — in particular, the reader — the failure propagates
+        # here, so callers never hang waiting on a dead reader.
+        my $await_ok = eval {
+            $result = await $self->{_tasks}->run_until_ready($response);
+            1;
+        };
         if (!$await_ok) { $error = $@ }
     }
 
@@ -1311,7 +1382,7 @@ sub _reset_connection {
 
     $self->{_socket_live}       = 0;
     $self->{_fatal_in_progress} = 0;
-    $self->{_reader_future}     = undef;
+    $self->{_reader_running}    = 0;
     $self->{_reconnect_future}  = undef;
     $self->{connected}          = 0;
     $self->{parser}             = undef;
@@ -1422,7 +1493,7 @@ sub _reader_fatal {
         $self->{connected}      = 0;
         $self->{parser}         = undef;
         $self->{in_pubsub}      = 0;
-        $self->{_reader_future} = undef;
+        $self->{_reader_running} = 0;
 
         # 6. Fail all detached futures with the SAME typed error.
         for my $entry (@$detached_inflight, @$detached_autopipe) {
@@ -2966,6 +3037,55 @@ Callback invocation is always serialized. With C<< message_queue_depth => 1 >>
 (the default), one message may be queued while one callback is still
 processing; the reader pauses when that queue slot is full. Higher values
 allow more messages to buffer locally before the reader pauses.
+
+=head1 TASK LIFECYCLE
+
+Async::Redis organizes all fire-and-forget background work (the socket
+reader, reconnect attempts, auto-pipeline submit batches, the pubsub
+callback driver) under a single per-client L<Future::Selector> instance,
+following Paul Evans's client pattern from L<Sys::Async::Virt> and
+L<IPC::MicroSocket>.
+
+Each background task is registered with the selector via
+C<< $selector->add(data => $label, f => $task_future) >>. Command
+execution awaits responses via
+C<< $selector->run_until_ready($response_future) >>, which pumps the
+selector and propagates any task failure to the awaiting caller. The
+practical guarantee: if a background task dies (including from a
+coding bug that escapes explicit fatal-error handling), awaiting
+callers see a typed failure rather than hanging forever.
+
+This structure provides the five structured-concurrency properties
+articulated by the L<trio|https://trio.readthedocs.io/> /
+L<asyncio.TaskGroup|https://docs.python.org/3/library/asyncio-task.html#task-groups>
+ecosystems:
+
+=over
+
+=item * GC safety - every background task is held by the selector.
+
+=item * Error propagation - any task's failure reaches callers awaiting
+the selector via C<run_until_ready>.
+
+=item * Cancellation - socket closure propagates to pending I/O, which
+fails the owning task, which the selector propagates.
+
+=item * Scope cleanup - C<disconnect> tears down state; remaining selector
+tasks unwind via their existing on_fail handlers.
+
+=item * Local reasoning - all concurrent work on one connection is owned
+by one place.
+
+=back
+
+There is no user-facing API for the selector; it is internal
+machinery. Clients should not call C<< $redis->{_tasks} >> directly.
+
+I<Note:> the only use of C<< Future->retain >> in this codebase is
+avoided in favor of selector ownership. Any patch that introduces
+C<< ->retain >> on an Async::Redis-owned Future should instead add
+the task to C<< $self->{_tasks} >> so failure propagation and lifetime
+ownership are consistent.
 
 =head1 KNOWN LIMITATIONS
 

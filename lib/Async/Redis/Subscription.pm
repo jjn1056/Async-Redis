@@ -12,10 +12,9 @@ use Scalar::Util qw(blessed refaddr weaken);
 
 our $VERSION = '0.001';
 
-# Synchronous recursion depth for the callback driver loop. See
-# _start_driver. Package-level so local() can scope it dynamically —
-# local() cannot be applied to lexicals.
-our $SYNC_DEPTH = 0;
+# Threshold for periodic event-loop yield inside the callback driver
+# loop. Prevents stack growth when many messages are pre-queued and
+# await on an already-ready Future returns synchronously.
 use constant MAX_SYNC_DEPTH => 32;
 
 sub new {
@@ -33,9 +32,9 @@ sub new {
         _on_reconnect     => undef,   # Callback for reconnect notification
         _on_message       => undef,   # Message-arrived callback (callback mode)
         _on_error         => undef,   # Fatal-error callback
-        _driver_step      => undef,   # Running driver loop closure
-        _current_read     => undef,   # Strong ref to in-flight read Future (F::AA GC pin)
+        _driver_step      => undef,   # Running driver loop Future (owned by _tasks selector)
         _closed           => 0,
+        _paused           => 0,       # Set during reconnect; clears in _resume_after_reconnect
     }, $class;
 }
 
@@ -167,18 +166,28 @@ sub channel_count {
 # both next() (iterator mode) and _start_driver (callback mode driver loop).
 # Returns undef on clean close; dies with typed error on fatal close.
 async sub _dequeue {
-    my ($self) = @_;
+    my ($self, $exit_on_pause) = @_;
 
+    # Iterator mode (default): pause is transient. Block through it and
+    # return real messages once the driver resumes.
+    #
+    # Callback driver (exit_on_pause=1): exit cleanly on pause so the
+    # driver task can be restarted after reconnect without two drivers
+    # racing. _pause_for_reconnect wakes any in-flight _message_waiter
+    # via done() so this path can exit promptly.
     while (!@{$self->{_pending_messages}}) {
         die $self->{_fatal_error} if $self->{_fatal_error};
-        return undef              if $self->{_closed};
+        return undef if $self->{_closed};
+        return undef if $exit_on_pause && $self->{_paused};
         $self->{_message_waiter} //= Future->new;
         await $self->{_message_waiter};
         delete $self->{_message_waiter};
     }
 
     die $self->{_fatal_error} if $self->{_fatal_error};
-    return undef              if $self->{_closed} && !@{$self->{_pending_messages}};
+    return undef if $self->{_closed} && !@{$self->{_pending_messages}};
+    return undef
+        if $exit_on_pause && $self->{_paused} && !@{$self->{_pending_messages}};
 
     my $msg = shift @{$self->{_pending_messages}};
     if (my $w = delete $self->{_slot_waiter}) {
@@ -325,90 +334,80 @@ sub _dispatch_frame {
     return undef;
 }
 
-# Start the callback-mode driver loop if not already running. Idempotent.
-# Only starts when _on_message is set (callback mode). Iterator mode
-# consumers call _dequeue directly via next() — no driver loop needed.
+# The callback-mode driver loop. Consumes from _pending_messages via
+# _dequeue (populated by _run_reader's dispatch path), invokes the
+# user's _on_message callback, and awaits its returned Future if any
+# for consumer-opted backpressure.
 #
-# The driver consumes from _pending_messages (via _dequeue), which is
-# populated by _run_reader's dispatch path. This keeps the driver out of
-# the socket-reading business: _run_reader is the sole socket reader.
+# Exits cleanly when _dequeue returns undef (subscription closed or
+# paused for reconnect). Dies with the typed error if _dequeue dies
+# (fatal); _run_driver's Future failure is visible through the
+# client's Future::Selector to any caller using run_until_ready.
 #
-# Uses weak refs on $self and $step to break cycles so DESTROY fires
-# promptly when external refs drop. Uses local($SYNC_DEPTH) to bound
-# synchronous recursion depth when on_done fires synchronously; past
-# MAX_SYNC_DEPTH, yields to the loop via Future::IO->sleep(0).
-sub _start_driver {
-    my ($self, $force) = @_;
-    return if $self->{_driver_step};
-    return unless $self->{_on_message};   # only callback mode needs a driver
-    return if $self->{_closed};
-    return unless $self->channel_count > 0;
-
-    weaken(my $weak = $self);
-
-    my $step;
-    my $weak_step;
-    $step = sub {
-        return unless $weak && !$weak->{_closed};
-
-        # Trampoline: bound synchronous recursion to prevent stack overflow
-        # when many queued messages resolve on_done synchronously.
-        if ($SYNC_DEPTH >= MAX_SYNC_DEPTH) {
-            Future::IO->sleep(0)->on_done(sub {
-                $weak_step->() if $weak_step && $weak && !$weak->{_closed};
-            });
+# Periodic sleep(0) yield every MAX_SYNC_DEPTH iterations prevents
+# stack growth when messages are pre-queued and await returns
+# synchronously from an already-ready Future.
+async sub _run_driver {
+    my ($self) = @_;
+    my $iter = 0;
+    while (!$self->{_closed} && !$self->{_paused}) {
+        my $msg;
+        my $deq_ok = eval { $msg = await $self->_dequeue(1); 1 };
+        unless ($deq_ok) {
+            my $err = $@;
+            # _fail_fatal already set _closed and fired on_error; don't
+            # double-fire. Any other propagation path routes through
+            # _handle_fatal_error.
+            return if $self->{_closed} || $self->{_paused};
+            $self->_handle_fatal_error($err);
             return;
         }
-        local $SYNC_DEPTH = $SYNC_DEPTH + 1;
+        last unless defined $msg;
+        last if $self->{_closed} || $self->{_paused};
 
-        # Consume the next message from the queue populated by _run_reader.
-        my $f = $weak->{_current_read} = $weak->_dequeue;
+        my $cb = $self->{_on_message} or last;
+        my $result = $self->_invoke_user_callback($cb, $msg);
 
-        $f->on_done(sub {
-            return unless $weak && !$weak->{_closed};
-            $weak->{_current_read} = undef;
-            my $msg = $_[0];
-
-            # Clean close: _dequeue returns undef when subscription is closed.
-            return unless defined $msg;
-
-            if (my $cb = $weak->{_on_message}) {
-                my $cb_result = $weak->_invoke_user_callback($cb, $msg);
-                if (blessed($cb_result) && $cb_result->isa('Future')) {
-                    # Consumer-opted backpressure: wait for their Future
-                    # before dequeuing the next message.
-                    $cb_result->on_ready(sub {
-                        return unless $weak && !$weak->{_closed};
-                        my $res = shift;
-                        if ($res->is_failed) {
-                            $weak->_handle_fatal_error(
-                                "on_message callback Future failed: " . $res->failure
-                            );
-                            return;
-                        }
-                        $weak_step->() if $weak_step && $weak && !$weak->{_closed};
-                    });
-                } else {
-                    $weak_step->() if $weak_step && $weak && !$weak->{_closed};
-                }
-            } else {
-                # _on_message was cleared while driver was running; stop.
+        if (blessed($result) && $result->isa('Future')) {
+            my $cb_ok = eval { await $result; 1 };
+            unless ($cb_ok) {
+                my $err = $@;
+                return if $self->{_closed} || $self->{_paused};
+                $self->_handle_fatal_error(
+                    "on_message callback Future failed: $err"
+                );
                 return;
             }
-        });
+        }
 
-        $f->on_fail(sub {
-            return unless $weak;
-            $weak->{_current_read} = undef;
-            return if $weak->{_closed};
-            $weak->_handle_fatal_error($_[0]);
-        });
-    };
+        # Periodic yield prevents stack blowup when pre-queued messages
+        # resolve await synchronously.
+        await Future::IO->sleep(0) if ++$iter % MAX_SYNC_DEPTH == 0;
+    }
+}
 
-    weaken($weak_step = $step);
+# Start the driver if not already running. Idempotent.
+# Only starts when _on_message is set (callback mode). Iterator mode
+# consumers call next() directly — no driver loop needed.
+#
+# Ownership: the driver Future is added to the client's Future::Selector
+# ($redis->{_tasks}) and stored in $self->{_driver_step}. The selector
+# owns the task; the slot is the dedup signal. on_ready clears the slot
+# regardless of outcome. No ->retain.
+sub _start_driver {
+    my ($self, $force) = @_;
+    return if $self->{_driver_step} && !$self->{_driver_step}->is_ready;
+    return unless $self->{_on_message};   # only callback mode needs a driver
+    return if $self->{_closed};
+    return if $self->{_paused};
+    return unless $self->channel_count > 0;
 
-    $self->{_driver_step} = $step;
-    $step->();
+    my $redis = $self->{redis} or return;
+
+    my $f = $self->_run_driver;
+    $self->{_driver_step} = $f;
+    $redis->{_tasks}->add(data => 'subscription-driver', f => $f);
+    $f->on_ready(sub { $self->{_driver_step} = undef });
     return;
 }
 
@@ -452,11 +451,12 @@ sub _close {
         delete $redis->{_subscription};
     }
 
-    # Release the driver closure; weak refs already broke the cycle.
-    # Do NOT clear _current_read — the in-flight read Future must stay
-    # pinned until it resolves, or F::AA will warn "lost its returning
-    # future". on_done/on_fail will clear it and see _closed first.
-    $self->{_driver_step} = undef;
+    # Cancel any running driver Future. The driver's await on _dequeue
+    # also unwinds because we resolved _message_waiter above, so this is
+    # belt-and-suspenders; either path exits the driver cleanly.
+    if (my $f = delete $self->{_driver_step}) {
+        $f->cancel unless $f->is_ready;
+    }
 }
 
 # Unrecoverable failure: marks the subscription closed with a typed
@@ -485,7 +485,12 @@ sub _fail_fatal {
         delete $redis->{_subscription};
     }
 
-    $self->{_driver_step} = undef;
+    # Cancel any running driver Future. _message_waiter was failed with
+    # the typed error above, so driver's _dequeue also dies with the
+    # typed error; cancel is belt-and-suspenders.
+    if (my $f = delete $self->{_driver_step}) {
+        $f->cancel unless $f->is_ready;
+    }
 
     # Notify callback-mode consumers of the fatal error. In iterator mode
     # the caller detects it via die from next(). Loud-by-default: if
@@ -510,11 +515,27 @@ sub _fail_fatal {
 # closed — the reader has already exited (connection dropped). Channels
 # and patterns remain in their tracking hashes for replay via
 # _resume_after_reconnect.
+#
+# Fixes a latent "two drivers after reconnect" bug from the closure-based
+# driver era: clearing the driver slot without cancelling left the old
+# driver suspended on _dequeue. After _resume_after_reconnect started a
+# new driver, both raced. The fix: cancel the Future explicitly, and
+# wake _dequeue via the _paused flag so its await exits cleanly.
 sub _pause_for_reconnect {
     my ($self) = @_;
-    # Do NOT set _closed; do NOT fail waiters. Reader has already exited.
-    # The driver will be restarted by _resume_after_reconnect.
-    $self->{_driver_step} = undef;
+    $self->{_paused} = 1;
+
+    # Wake any suspended _dequeue so the driver's while-loop exits.
+    if (my $w = delete $self->{_message_waiter}) {
+        $w->done unless $w->is_ready;
+    }
+
+    # Cancel the driver Future. F::AA's continuation stops; the Future
+    # becomes cancelled; the selector's on_ready fires and removes the
+    # item; our on_ready fires and clears _driver_step.
+    if (my $f = delete $self->{_driver_step}) {
+        $f->cancel unless $f->is_ready;
+    }
     return;
 }
 
@@ -524,6 +545,10 @@ sub _pause_for_reconnect {
 async sub _resume_after_reconnect {
     my ($self) = @_;
     my $redis = $self->{redis} or return;
+
+    # Clear the paused flag so _dequeue and _run_driver don't immediately
+    # exit when the new driver starts.
+    $self->{_paused} = 0;
 
     # Set in_pubsub before issuing any commands so the unified reader
     # classifies incoming message frames correctly (mirrors subscribe timing).
