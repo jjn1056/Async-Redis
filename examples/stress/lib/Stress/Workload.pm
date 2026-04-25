@@ -78,4 +78,40 @@ sub _record_error {
     return;
 }
 
+async sub run_autopipe {
+    my %args = @_;
+    my $client     = $args{client};
+    my $metrics    = $args{metrics};
+    my $stop       = $args{stop};
+    my $burst_size = $args{burst_size} // 100;
+    my $prefix     = $args{key_prefix} // 'stress:ap';
+
+    my $seq = 0;
+
+    while (!$stop->is_ready) {
+        my @futures;
+        my $t0 = time;
+        for my $i (1 .. $burst_size) {
+            $seq++;
+            my $key = "${prefix}_${seq}";
+            push @futures, $client->set($key, "seq=${seq}");
+        }
+        my $ok = eval { await Future->wait_all(@futures); 1 };
+        if ($ok) {
+            my $count = grep { $_->is_done } @futures;
+            $metrics->incr_op('set', $count);
+            my $elapsed = time - $t0;
+            $metrics->record_latency('autopipe_burst', $elapsed);
+            for my $f (@futures) {
+                next unless $f->is_failed;
+                _record_error($metrics, ($f->failure)[0]);
+            }
+        } else {
+            _record_error($metrics, $@);
+        }
+        await Future::IO->sleep(0);
+    }
+    return;
+}
+
 1;
