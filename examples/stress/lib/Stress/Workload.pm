@@ -248,4 +248,64 @@ async sub run_pubsub_publisher {
     return;
 }
 
+async sub run_pattern_subscriber {
+    my %args = @_;
+    my $client    = $args{client};
+    my $pattern   = $args{pattern};
+    my $metrics   = $args{metrics};
+    my $integrity = $args{integrity};
+    my $stop      = $args{stop};
+
+    my $sub = await $client->psubscribe($pattern);
+
+    while (!$stop->is_ready) {
+        my $msg = eval { await $sub->next };
+        # next() returns undef cleanly on disconnect; classify any other
+        # trapped failure so it shows up in errors_typed.
+        if (!defined $msg) {
+            _record_error($metrics, $@) if $@;
+            await Future::IO->sleep(0.01);
+            next;
+        }
+        $metrics->incr_op('pattern_rx');
+        my $payload = $msg->{data} // '';
+        # id is `<pid>_<seq>` — colon-free, so [^:]+ is safe.
+        if ($payload =~ /^id=([^:]+)/) {
+            $integrity->note_pattern_received($1);
+        }
+    }
+    return;
+}
+
+async sub run_pattern_publisher {
+    my %args = @_;
+    my $client    = $args{client};
+    my $prefix    = $args{prefix};
+    my $suffixes  = $args{suffixes} // 8;
+    my $metrics   = $args{metrics};
+    my $integrity = $args{integrity};
+    my $stop      = $args{stop};
+    my $rate_hz   = $args{rate_hz} // 50;
+
+    my $period = 1.0 / $rate_hz;
+    my $msg_id = 0;
+
+    while (!$stop->is_ready) {
+        $msg_id++;
+        my $suf = int rand $suffixes;
+        my $ch = "${prefix}:${suf}";
+        my $id_str = "${$}_${msg_id}";
+        my $payload = "id=${id_str}:t=" . time;
+        my $ok = eval { await $client->publish($ch, $payload); 1 };
+        if ($ok) {
+            $metrics->incr_op('pattern_publish');
+            $integrity->note_pattern_published($id_str);
+        } else {
+            _record_error($metrics, $@);
+        }
+        await Future::IO->sleep($period);
+    }
+    return;
+}
+
 1;
