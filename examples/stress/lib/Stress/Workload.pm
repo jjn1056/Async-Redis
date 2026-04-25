@@ -201,14 +201,19 @@ async sub run_pubsub_subscriber {
         my $msg = eval { await $sub->next };
         # next() returns undef cleanly when the harness disconnects the
         # client; on any other failure, the eval traps and we re-check stop.
-        if (!$msg) {
+        if (!defined $msg) {
+            _record_error($metrics, $@) if $@;
             await Future::IO->sleep(0.01);
             next;
         }
         $metrics->incr_op('message_rx');
+        # Use the channel from the message envelope rather than parsing
+        # it out of the payload — Redis channel names can (and do)
+        # contain colons (`stress:bus:0`), so a `[^:]+` extraction
+        # would miss most realistic naming schemes.
         my $payload = $msg->{data} // '';
-        if ($payload =~ /^chan=([^:]+):seq=(\d+):/) {
-            $integrity->note_pubsub_observation($1, $2);
+        if ($payload =~ /^seq=(\d+):/) {
+            $integrity->note_pubsub_observation($msg->{channel}, $1);
         }
     }
     return;
@@ -229,7 +234,7 @@ async sub run_pubsub_publisher {
     while (!$stop->is_ready) {
         my $ch = $channels->[ $i++ % scalar @$channels ];
         $seq{$ch}++;
-        my $payload = "chan=${ch}:seq=$seq{$ch}:t=" . time;
+        my $payload = "seq=$seq{$ch}:t=" . time;
         my $t0 = time;
         my $ok = eval { await $client->publish($ch, $payload); 1 };
         $metrics->record_latency('publish', time - $t0) if $ok;
