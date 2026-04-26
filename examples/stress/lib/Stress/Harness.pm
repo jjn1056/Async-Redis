@@ -99,36 +99,68 @@ async sub _setup_clients {
         reconnect       => 1,
     );
 
-    $self->{controller} = Async::Redis->new(%common);
-    await $self->{controller}->connect;
-    await $self->{controller}->client('SETNAME', 'stress-controller');
+    # Helper: build a client with a stress-* name that's re-applied
+    # automatically after each (re)connect via on_connect. The name is
+    # how Stress::Chaos identifies workload clients in CLIENT LIST and
+    # excludes everything else (controller, replication, external
+    # tools). on_connect is sync, but the SETNAME command is async —
+    # we hand the future to the client's own selector so it lives in
+    # the same structured-concurrency scope as the workload's
+    # commands. SETNAME failure surfaces to the next caller awaiting
+    # on this client, which is the correct propagation: if SETNAME
+    # failed, the connection is dead and the next command is dead too.
+    my $named = sub {
+        my ($role, %extra) = @_;
+        my $name = "stress-$role";
+        my $on_connect = sub {
+            my ($c) = @_;
+            $c->{_tasks}->add(
+                data => "setname-$name",
+                f    => $c->client('SETNAME', $name),
+            );
+        };
+        return Async::Redis->new(%common, %extra, on_connect => $on_connect);
+    };
 
+    $self->{controller} = $named->('controller');
+    await $self->{controller}->connect;
+
+    # Pool: each pool connection is also stress-named so chaos can pick
+    # them. Same on_connect mechanism via shared client args.
+    my $pool_on_connect = sub {
+        my ($c) = @_;
+        $c->{_tasks}->add(
+            data => 'setname-stress-pool',
+            f    => $c->client('SETNAME', 'stress-pool'),
+        );
+    };
     $self->{pool} = Async::Redis::Pool->new(
         %common,
-        max => $self->{pool_size},
+        max        => $self->{pool_size},
+        on_connect => $pool_on_connect,
     );
 
-    $self->{autopipe_client} = Async::Redis->new(%common, auto_pipeline => 1);
+    $self->{autopipe_client} = $named->('autopipe', auto_pipeline => 1);
     await $self->{autopipe_client}->connect;
 
-    $self->{subscriber} = Async::Redis->new(%common);
+    $self->{subscriber} = $named->('subscriber');
     await $self->{subscriber}->connect;
 
-    $self->{pattern_sub} = Async::Redis->new(%common);
+    $self->{pattern_sub} = $named->('pattern-sub');
     await $self->{pattern_sub}->connect;
 
-    $self->{publisher} = Async::Redis->new(%common);
+    $self->{publisher} = $named->('publisher');
     await $self->{publisher}->connect;
 
-    $self->{pattern_publisher} = Async::Redis->new(%common);
+    $self->{pattern_publisher} = $named->('pattern-publisher');
     await $self->{pattern_publisher}->connect;
 
-    $self->{driver} = Async::Redis->new(%common);
+    $self->{driver} = $named->('driver');
     await $self->{driver}->connect;
 
     $self->{blockers} = [];
     for my $i (1 .. $self->{blocker_count}) {
-        my $b = Async::Redis->new(%common);
+        my $b = $named->("blocker-$i");
         await $b->connect;
         push @{ $self->{blockers} }, $b;
     }
@@ -169,20 +201,15 @@ sub _start_chaos {
     my ($self) = @_;
     return if !$self->{kill_interval};
 
-    my @targets = (
-        [ "autopipe"     => $self->{autopipe_client} ],
-        [ "subscriber"   => $self->{subscriber} ],
-        [ "pattern_sub"  => $self->{pattern_sub} ],
-        [ "publisher"    => $self->{publisher} ],
-        [ "pat_pub"      => $self->{pattern_publisher} ],
-        [ "driver"       => $self->{driver} ],
-    );
-    for my $i (0 .. $#{ $self->{blockers} }) {
-        push @targets, [ "blocker[$i]" => $self->{blockers}[$i] ];
-    }
+    # Chaos asks Redis (via CLIENT LIST) which clients exist, filters
+    # by name prefix, and kills by ID. No need to track refs here —
+    # the server's view is authoritative across reconnects and works
+    # through Docker NAT (where the local sockhost differs from the
+    # address Redis sees).
     $self->{chaos} = Stress::Chaos->new(
         controller      => $self->{controller},
-        targets         => \@targets,
+        name_prefix     => 'stress-',
+        exclude_name    => 'stress-controller',
         interval        => $self->{kill_interval},
         recovery_window => $self->{recovery_window},
         integrity       => $self->{integrity},
