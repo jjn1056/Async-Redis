@@ -22,6 +22,18 @@ docker compose -f examples/docker-compose.yml down -v
 
 ## Examples
 
+### async-job-queue
+
+A small CLI demo that queues a burst of Redis list jobs, processes them with
+multiple async workers, and prints heartbeat lines while workers wait in
+`BLPOP` or simulate slow work.
+
+```bash
+REDIS_HOST=localhost perl examples/async-job-queue/app.pl
+```
+
+See [async-job-queue/README.md](async-job-queue/README.md) for details.
+
 ### slow-redis
 
 Demonstrates non-blocking I/O by intentionally delaying each request by 1 second.
