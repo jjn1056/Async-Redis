@@ -3223,6 +3223,8 @@ consequences.
 
 =item * L<Async::Redis::Subscription> - PubSub subscriptions
 
+=item * L<Async::Redis::Cookbook> - Practical usage recipes
+
 =item * L<Redis> - Synchronous Redis client
 
 =item * L<Net::Async::Redis> - Another async Redis client
