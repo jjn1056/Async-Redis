@@ -10,7 +10,6 @@ use Future::AsyncAwait;
 use Future::IO;
 use Scalar::Util qw(blessed refaddr weaken);
 
-our $VERSION = '0.001';
 
 # Threshold for periodic event-loop yield inside the callback driver
 # loop. Prevents stack growth when many messages are pre-queued and

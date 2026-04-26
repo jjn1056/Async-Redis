@@ -6,8 +6,6 @@ use 5.018;
 
 use Time::HiRes qw(time);
 
-our $VERSION = '0.001';
-
 # Commands with sensitive arguments that need redaction
 our %REDACT_RULES = (
     AUTH => sub {

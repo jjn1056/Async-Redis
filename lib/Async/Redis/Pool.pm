@@ -12,8 +12,6 @@ use Async::Redis;
 use Async::Redis::Error::Disconnected;
 use Async::Redis::Error::Timeout;
 
-our $VERSION = '0.001';
-
 sub new {
     my ($class, %args) = @_;
 

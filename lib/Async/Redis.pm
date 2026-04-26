@@ -8,7 +8,7 @@ our $VERSION = '0.002000';
 
 use Future;
 use Future::AsyncAwait;
-use Future::IO 0.19;
+use Future::IO 0.23;
 use Future::Selector 0.05;
 use Scalar::Util qw(blessed weaken);
 use Socket qw(pack_sockaddr_in pack_sockaddr_un inet_aton AF_INET AF_UNIX SOCK_STREAM);
