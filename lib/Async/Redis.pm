@@ -1750,6 +1750,8 @@ sub define_command {
     die "Command name required" unless defined $name && length $name;
     die "Command definition required" unless ref $def eq 'HASH';
     die "Lua script required (lua => '...')" unless defined $def->{lua};
+    die "define_command install option is not supported; use run_script()"
+        if exists $def->{install};
 
     # Validate name (alphanumeric and underscore only)
     die "Invalid command name '$name' - use only alphanumeric and underscore"
@@ -1764,11 +1766,6 @@ sub define_command {
     );
 
     $self->{_scripts}{$name} = $script;
-
-    # Optional: install as method on this instance
-    if ($def->{install}) {
-        $self->_install_script_method($name);
-    }
 
     return $script;
 }
@@ -1822,22 +1819,6 @@ async sub preload_scripts {
     }
 
     return scalar @names;
-}
-
-# Install a script as a method (internal)
-sub _install_script_method {
-    my ($self, $name) = @_;
-
-    # Create closure that captures $name
-    my $method = sub {
-        my ($self, @args) = @_;
-        return $self->run_script($name, @args);
-    };
-
-    # Install on the class (affects all instances)
-    no strict 'refs';
-    no warnings 'redefine';
-    *{"Async::Redis::$name"} = $method;
 }
 
 # ============================================================================
@@ -2774,7 +2755,6 @@ See L<Async::Redis::Script> for details.
         keys        => 1,               # Number of KEYS (or 'dynamic')
         lua         => 'return ...',    # Lua script code
         description => 'Does X',        # Optional documentation
-        install     => 1,               # Optional: install as method
     });
 
 Register a named Lua script for reuse. The script is automatically cached
@@ -2790,8 +2770,6 @@ variable (first arg to run_script will be the key count).
 =item * C<lua> - The Lua script source code.
 
 =item * C<description> - Optional description for documentation.
-
-=item * C<install> - If true, install as a method on the Async::Redis class.
 
 =back
 
@@ -2859,19 +2837,6 @@ Registered scripts work in pipelines:
     my $results = await $pipe->execute;
 
 Scripts are automatically preloaded before pipeline execution.
-
-=head2 Method Installation
-
-For frequently used scripts, install as methods:
-
-    $redis->define_command(cache_get => {
-        keys    => 1,
-        lua     => 'return redis.call("GET", KEYS[1])',
-        install => 1,
-    });
-
-    # Now call directly
-    my $value = await $redis->cache_get('my:key');
 
 =head2 EVALSHA Optimization
 
@@ -3115,10 +3080,6 @@ C<inet_aton> before the async connect, which blocks during DNS lookup.
 Not covered by C<connect_timeout>.
 
 =item * IPv6 URI hosts are not yet supported.
-
-=item * C<define_command(install =E<gt> 1)> installs a method into the
-C<Async::Redis> package globally, affecting all instances in the process.
-Use C<run_script> for per-instance dispatch if you need isolation.
 
 =item * Some generated wrappers expose mode-changing commands (HELLO,
 CLIENT REPLY, MONITOR, SYNC, PSYNC) that interact poorly with the
