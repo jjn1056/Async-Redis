@@ -1981,8 +1981,9 @@ sub is_dirty {
 
 async sub watch {
     my ($self, @keys) = @_;
+    my $result = await $self->command('WATCH', @keys);
     $self->{watching} = 1;
-    return await $self->command('WATCH', @keys);
+    return $result;
 }
 
 async sub unwatch {
@@ -1994,8 +1995,9 @@ async sub unwatch {
 
 async sub multi_start {
     my ($self) = @_;
+    my $result = await $self->command('MULTI');
     $self->{in_multi} = 1;
-    return await $self->command('MULTI');
+    return $result;
 }
 
 async sub exec {
@@ -2010,56 +2012,73 @@ async sub discard {
     my ($self) = @_;
     my $result = await $self->command('DISCARD');
     $self->{in_multi} = 0;
-    # Note: DISCARD does NOT clear watches
+    $self->{watching} = 0;  # DISCARD clears watches
     return $result;
 }
 
 async sub watch_multi {
     my ($self, $keys, $callback) = @_;
 
-    # WATCH the keys
-    await $self->watch(@$keys);
-
-    # Get current values of watched keys
-    my %watched;
-    for my $key (@$keys) {
-        $watched{$key} = await $self->get($key);
-    }
-
-    # Create transaction collector
-    my $tx = Async::Redis::Transaction->new(redis => $self);
-
-    # Run callback with watched values
-    await $callback->($tx, \%watched);
-
-    my @commands = $tx->commands;
-
-    # If no commands queued, just unwatch and return empty
-    unless (@commands) {
-        await $self->unwatch;
-        return [];
-    }
-
-    # Execute transaction
-    $self->{in_multi} = 1;
-
+    my $watch_active  = 0;
+    my $multi_started = 0;
     my $results;
-    eval {
-        await $self->command('MULTI');
 
-        for my $cmd (@commands) {
-            await $self->command(@$cmd);
+    my $ok = eval {
+        # WATCH must be unwound on any pre-MULTI failure, including a
+        # callback die, otherwise the connection remains poisoned.
+        await $self->watch(@$keys);
+        $watch_active = 1;
+
+        # Get current values of watched keys
+        my %watched;
+        for my $key (@$keys) {
+            $watched{$key} = await $self->get($key);
         }
 
-        $results = await $self->command('EXEC');
+        # Create transaction collector
+        my $tx = Async::Redis::Transaction->new(redis => $self);
+
+        # Run callback with watched values
+        await $callback->($tx, \%watched);
+
+        my @commands = $tx->commands;
+
+        # If no commands queued, just unwatch and return empty
+        unless (@commands) {
+            await $self->unwatch;
+            $watch_active = 0;
+            $results = [];
+        }
+        else {
+            await $self->multi_start;
+            $multi_started = 1;
+
+            for my $cmd (@commands) {
+                await $self->command(@$cmd);
+            }
+
+            $results = await $self->exec;
+            $multi_started = 0;
+            $watch_active  = 0;
+        }
+
+        1;
     };
     my $error = $@;
 
-    $self->{in_multi} = 0;
-    $self->{watching} = 0;
+    if (!$ok) {
+        if ($multi_started) {
+            eval { await $self->discard; 1 };
+        }
+        elsif ($watch_active) {
+            eval { await $self->unwatch; 1 };
+        }
 
-    if ($error) {
-        eval { await $self->command('DISCARD') };
+        # Cleanup can fail on a dead socket; keep local state conservative
+        # and preserve the original caller-facing error.
+        $self->{in_multi} = 0;
+        $self->{watching} = 0;
+
         die $error;
     }
 
