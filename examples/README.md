@@ -55,6 +55,18 @@ REDIS_HOST=localhost pagi-server \
 
 See [pagi-chat/README.md](pagi-chat/README.md) for details.
 
+### stress
+
+A CLI harness that runs all major Async::Redis features under load
+with periodic CLIENT KILL chaos and integrity verification. Used both
+as a soak test and a CI smoke gate.
+
+```bash
+REDIS_HOST=localhost ./examples/stress/stress --duration 60 --kill-interval 10
+```
+
+See [stress/README.md](stress/README.md) for output format and exit codes.
+
 ## Environment Variables
 
 - `REDIS_HOST` - Redis server hostname (default: localhost)
