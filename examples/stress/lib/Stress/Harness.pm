@@ -67,7 +67,9 @@ async sub _run_async {
     $self->{start_time} = time;
 
     await $self->_setup_clients;
-    $self->_install_telemetry_hooks;
+    # Telemetry hooks (on_connect SETNAME, on_disconnect reconnect-counter)
+    # are wired in _setup_clients via the named-client helper, so no
+    # separate hook-installation step is needed.
     $self->_start_chaos;
     $self->_start_workloads;
 
@@ -109,6 +111,12 @@ async sub _setup_clients {
     # commands. SETNAME failure surfaces to the next caller awaiting
     # on this client, which is the correct propagation: if SETNAME
     # failed, the connection is dead and the next command is dead too.
+    #
+    # on_disconnect counts reconnect events. Setting it via the
+    # constructor (rather than mutating $c->{on_disconnect} after the
+    # fact) means it also propagates to pool connections, which the
+    # post-construction hook would have missed.
+    my $on_disconnect = sub { $self->{reconnect_count}++ };
     my $named = sub {
         my ($role, %extra) = @_;
         my $name = "stress-$role";
@@ -119,7 +127,11 @@ async sub _setup_clients {
                 f    => $c->client('SETNAME', $name),
             );
         };
-        return Async::Redis->new(%common, %extra, on_connect => $on_connect);
+        return Async::Redis->new(
+            %common, %extra,
+            on_connect    => $on_connect,
+            on_disconnect => $on_disconnect,
+        );
     };
 
     $self->{controller} = $named->('controller');
@@ -136,8 +148,9 @@ async sub _setup_clients {
     };
     $self->{pool} = Async::Redis::Pool->new(
         %common,
-        max        => $self->{pool_size},
-        on_connect => $pool_on_connect,
+        max           => $self->{pool_size},
+        on_connect    => $pool_on_connect,
+        on_disconnect => $on_disconnect,
     );
 
     $self->{autopipe_client} = $named->('autopipe', auto_pipeline => 1);
@@ -168,18 +181,6 @@ async sub _setup_clients {
     $self->{channels}      = [ map { "$self->{key_prefix}:bus:$_" }     0 .. $self->{channel_count} - 1 ];
     $self->{queue_key}     = "$self->{key_prefix}:queue";
     $self->{pattern_prefix}= "$self->{key_prefix}:pattern";
-    return;
-}
-
-sub _install_telemetry_hooks {
-    my ($self) = @_;
-    for my $c ($self->_all_clients) {
-        my $prev_on_disconnect = $c->{on_disconnect};
-        $c->{on_disconnect} = sub {
-            $self->{reconnect_count}++;
-            $prev_on_disconnect->(@_) if $prev_on_disconnect;
-        };
-    }
     return;
 }
 
