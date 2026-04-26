@@ -100,14 +100,6 @@ Revision history for Async-Redis
       Future::Selector contract; user-disconnect vs reader-fatal path
       distinction; broad POD review and corrections across the public
       surface.
-    - Known limitations (documented in POD):
-        - Some commands (BITFIELD, LMPOP/BLMPOP, ZINTERCARD, LCS,
-          GEORADIUS*_RO) do not yet have key extraction
-        - Hostname resolution is synchronous
-        - IPv6 URI hosts not yet supported
-        - Some generated wrappers expose mode-changing commands (HELLO,
-          CLIENT REPLY, MONITOR, SYNC, PSYNC) that interact poorly
-          with the response model
 
 0.001008  2026-04-22
     - Bug Fix: _reconnect no longer spins forever on permanent failure
