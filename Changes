@@ -93,6 +93,9 @@ Revision history for Async-Redis
     - Added: examples/ — async job queue, bulk insert, and a stress
       harness (examples/stress/) that drives all major features under
       load with chaos injection (CLIENT KILL) and integrity verification.
+    - Added: GitHub Actions CI workflow (thanks @GaNardelli, PR #4)
+      runs the full test suite with RELEASE_TESTING=1 against a
+      Dockerized Redis on every push and pull request.
     - Documentation: TASK LIFECYCLE POD section explaining the
       Future::Selector contract; user-disconnect vs reader-fatal path
       distinction; broad POD review and corrections across the public
