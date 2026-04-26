@@ -34,6 +34,17 @@ REDIS_HOST=localhost perl examples/async-job-queue/app.pl
 
 See [async-job-queue/README.md](async-job-queue/README.md) for details.
 
+### bulk-insert
+
+A CLI demo that inserts many TTL'd Redis keys in concurrent batches while a
+separate heartbeat connection keeps printing progress and Redis ping latency.
+
+```bash
+REDIS_HOST=localhost perl examples/bulk-insert/app.pl --count 10000 --heartbeat 0.05
+```
+
+See [bulk-insert/README.md](bulk-insert/README.md) for details.
+
 ### slow-redis
 
 Demonstrates non-blocking I/O by intentionally delaying each request by 1 second.
