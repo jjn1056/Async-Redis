@@ -168,10 +168,25 @@ without changing the caller's API.
 
 When C<auto_pipeline =E<gt> 1>:
 
-1. Commands queue locally instead of sending immediately
-2. A "next tick" callback is scheduled
-3. When event loop yields, all queued commands flush as pipeline
-4. Responses distributed to original futures
+=over 4
+
+=item 1.
+
+Commands queue locally instead of sending immediately.
+
+=item 2.
+
+A next-tick flush is scheduled with C<< Future::IO->sleep(0) >>.
+
+=item 3.
+
+When the event loop yields, queued commands flush as a pipeline.
+
+=item 4.
+
+Responses are distributed to the original command futures.
+
+=back
 
 =head2 Invariants
 
@@ -183,7 +198,7 @@ When C<auto_pipeline =E<gt> 1>:
 
 =item * Depth limit triggers multiple batches if exceeded
 
-=item * C<Future::IO-E<gt>later> is non-blocking next-tick
+=item * C<< Future::IO->sleep(0) >> provides the non-blocking yield point
 
 =back
 

@@ -689,6 +689,92 @@ Async::Redis::Subscription - PubSub subscription handler
 
 Manages Redis PubSub subscriptions with async iterator pattern.
 
+=head1 METHODS
+
+=head2 next
+
+    my $msg = await $sub->next;
+
+Return the next pub/sub message hashref, or C<undef> after a clean close.
+Fatal subscription errors are rethrown to the caller. Cannot be used after
+C<on_message> switches the subscription into callback mode.
+
+=head2 next_message
+
+    my $msg = await $sub->next_message;
+
+Backward-compatible wrapper around C<next>. It returns the same message data
+using C<message> instead of C<data>:
+
+    {
+        channel => 'channel_name',
+        message => 'payload',
+        pattern => undef,
+        type    => 'message',
+    }
+
+=head2 on_reconnect
+
+    $sub->on_reconnect(sub {
+        my ($sub) = @_;
+        ...
+    });
+
+Set or get the callback fired after subscriptions are replayed on a reconnected
+socket.
+
+=head2 on_message
+
+    $sub->on_message(sub {
+        my ($sub, $msg) = @_;
+        ...
+    });
+
+Set or get callback-driven delivery. See L</CALLBACK-DRIVEN DELIVERY>.
+
+=head2 on_error
+
+    $sub->on_error(sub {
+        my ($sub, $err) = @_;
+        ...
+    });
+
+Set or get the fatal-error callback used by callback-driven delivery.
+
+=head2 unsubscribe
+
+    await $sub->unsubscribe('channel1');
+    await $sub->unsubscribe;  # all regular channels
+
+Unsubscribe regular channels. With no arguments, unsubscribes all regular
+channels tracked by this subscription.
+
+=head2 punsubscribe
+
+    await $sub->punsubscribe('prefix:*');
+    await $sub->punsubscribe;  # all patterns
+
+Unsubscribe pattern subscriptions.
+
+=head2 sunsubscribe
+
+    await $sub->sunsubscribe('shard-channel');
+    await $sub->sunsubscribe;  # all sharded channels
+
+Unsubscribe sharded pub/sub channels.
+
+=head2 channels / patterns / sharded_channels
+
+Return the currently tracked regular channels, patterns, or sharded channels.
+
+=head2 channel_count
+
+Return the total number of tracked regular, pattern, and sharded subscriptions.
+
+=head2 is_closed
+
+Return true after the subscription has been closed.
+
 =head1 MESSAGE STRUCTURE
 
     {
@@ -869,7 +955,8 @@ Async. Replays all tracked C<SUBSCRIBE>, C<PSUBSCRIBE>, and
 C<SSUBSCRIBE> commands on the freshly reconnected socket. Sets
 C<in_pubsub=1> before sending replay commands so that racing message
 frames classify correctly (mirrors the timing of the initial
-subscribe). Fires C<on_reconnect> after replay, then restarts the read
-driver.
+subscribe). Fires C<on_reconnect> after replay. Callback-mode subscriptions
+restart their callback driver; iterator-mode subscriptions continue to receive
+frames through the parent Redis connection's reader.
 
 =cut

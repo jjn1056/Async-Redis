@@ -446,12 +446,14 @@ Async::Redis::Telemetry - Observability for Redis client
         otel_tracer => OpenTelemetry->tracer_provider->tracer('redis'),
         otel_meter  => OpenTelemetry->meter_provider->meter('redis'),
 
-        # Debug logging
-        debug => 1,                    # log to STDERR
-        debug => sub {                 # custom logger
-            my ($direction, $data) = @_;
-            $logger->debug("[$direction] $data");
-        },
+        # Debug logging to STDERR
+        debug => 1,
+
+        # Or pass a custom logger instead:
+        # debug => sub {
+        #     my ($direction, $data) = @_;
+        #     $logger->debug("[$direction] $data");
+        # },
     );
 
 =head1 DESCRIPTION

@@ -468,9 +468,107 @@ Async::Redis::Pool - Connection pool for Async::Redis
 
 =head1 DESCRIPTION
 
-Manages a pool of Redis connections with automatic dirty detection.
+Manages a pool of Redis connections with automatic dirty detection. Pool-specific
+options are consumed by C<Async::Redis::Pool>; all other constructor arguments
+are passed through to C<< Async::Redis->new >>.
 
-=head2 Connection Cleanliness
+=head1 CONSTRUCTOR
+
+=head2 new
+
+    my $pool = Async::Redis::Pool->new(
+        host            => 'localhost',
+        min             => 2,
+        max             => 10,
+        acquire_timeout => 5,
+        cleanup_timeout => 5,
+        on_dirty        => 'destroy',
+    );
+
+Options:
+
+=over 4
+
+=item min
+
+Minimum desired pool size. Default: 1. The pool creates replacement
+connections after dirty connections are destroyed if the total drops below
+this value.
+
+=item max
+
+Maximum number of active, idle, and currently-creating connections. Default: 10.
+
+=item acquire_timeout
+
+Seconds to wait for a connection when the pool is at capacity. Default: 5.
+Timeouts throw L<Async::Redis::Error::Timeout>.
+
+=item cleanup_timeout
+
+Seconds to allow a best-effort cleanup command such as C<DISCARD> or
+C<UNWATCH>. Default: 5.
+
+=item on_dirty
+
+Dirty connection policy. Default: C<destroy>.
+
+C<destroy> closes dirty connections instead of returning them to the pool.
+
+C<cleanup> attempts bounded cleanup only for transaction/watch state. PubSub
+connections and connections with pending responses are still destroyed.
+
+=item idle_timeout
+
+Accepted as a pool option but not currently enforced.
+
+=back
+
+=head1 METHODS
+
+=head2 acquire
+
+    my $redis = await $pool->acquire;
+
+Return a healthy L<Async::Redis> connection from the pool, creating one if the
+pool is below C<max>. The caller must later call C<release>.
+
+=head2 release
+
+    $pool->release($redis);
+
+Return a connection to the pool. Dirty connections are either destroyed or
+cleaned according to C<on_dirty>.
+
+=head2 with
+
+    my $result = await $pool->with(async sub {
+        my ($redis) = @_;
+        return await $redis->get('key');
+    });
+
+Acquire a connection, run the callback, and release the connection even if the
+callback dies. This is the recommended public API.
+
+=head2 stats
+
+    my $stats = $pool->stats;
+
+Returns a hashref with C<active>, C<idle>, C<waiting>, C<total>, and
+C<destroyed> counts.
+
+=head2 shutdown
+
+    $pool->shutdown;
+
+Stop new acquires, fail pending waiters, and close idle connections. Active
+connections are destroyed when they are released.
+
+=head2 min / max
+
+Return the configured pool size limits.
+
+=head1 CONNECTION CLEANLINESS
 
 A connection is "dirty" if it has state that could affect the next user:
 
@@ -487,9 +585,11 @@ A connection is "dirty" if it has state that could affect the next user:
 =back
 
 Dirty connections are destroyed by default. The cost of a new TCP handshake
-is far less than the risk of data corruption.
+is far less than the risk of data corruption. With C<< on_dirty => 'cleanup' >>,
+the pool attempts C<DISCARD> and/or C<UNWATCH> only when it can prove those are
+the only dirty states present.
 
-=head2 The with() Pattern
+=head1 RECOMMENDED USAGE
 
 Always prefer C<with()> over manual acquire/release:
 

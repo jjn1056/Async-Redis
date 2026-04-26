@@ -2488,6 +2488,11 @@ Redis server port. Default: 6379
 Connection URI (e.g., 'redis://user:pass@host:port/db').
 If provided, overrides host, port, password, database options.
 
+=item path => $path
+
+Unix domain socket path. When provided, C<host> and C<port> are ignored.
+Also available via C<redis+unix://> URIs.
+
 =item password => $password
 
 Authentication password.
@@ -2509,6 +2514,7 @@ Enable TLS/SSL connection. Can be a boolean or hashref with options:
         cert_file => '/path/to/client.crt',
         key_file  => '/path/to/client.key',
         verify    => 1,  # verify server certificate
+        verify_hostname => 1,  # verify certificate name/IP
     }
 
 =item connect_timeout => $seconds
@@ -2521,6 +2527,8 @@ Per-request timeout for commands. Default: 5
 
 Blocking commands (BLPOP, BRPOP, etc.) automatically extend this timeout
 based on their server-side timeout plus C<blocking_timeout_buffer>.
+Blocking commands with a Redis timeout of C<0> block indefinitely and do not
+get a client-side request deadline.
 
 =item blocking_timeout_buffer => $seconds
 
@@ -2560,27 +2568,45 @@ fatal-error contract.
 
 =item on_connect => $coderef
 
-Callback when connection established.
+Callback when connection is established. Called as C<< $coderef->($redis) >>.
 
 =item on_disconnect => $coderef
 
-Callback when connection lost.
+Callback when a live connection is intentionally closed or lost. Called as
+C<< $coderef->($redis, $reason) >>.
 
 =item on_error => $coderef
 
-Callback for connection errors.
+Callback for connection/read errors before they are propagated. Called as
+C<< $coderef->($redis, $error) >>.
 
 =item prefix => $prefix
 
-Key prefix applied to all commands.
+Key prefix applied to supported key-bearing commands. See
+L</PREFIX LIMITATIONS>.
 
 =item client_name => $name
 
 CLIENT SETNAME value sent on connect.
 
-=item debug => $bool
+=item pipeline_depth => $int
 
-Enable debug logging.
+Maximum commands allowed in an explicit pipeline. Default: 10000
+
+=item auto_pipeline => $bool
+
+If true, commands issued in the same event-loop tick are automatically batched
+and sent as one pipeline. Default: 0
+
+=item message_queue_depth => $int
+
+Maximum number of locally queued pub/sub messages before the reader applies
+backpressure. Must be at least 1. Default: 1
+
+=item debug => $bool | $coderef
+
+Enable debug logging. A true non-coderef logs to STDERR. A coderef receives
+C<< ($direction, $data) >>.
 
 =item otel_tracer => $tracer
 
@@ -2589,6 +2615,16 @@ OpenTelemetry tracer for span creation.
 =item otel_meter => $meter
 
 OpenTelemetry meter for metrics.
+
+=item otel_include_args => $bool
+
+Include command arguments in OpenTelemetry span statements. Default: 0.
+See L</OPENTELEMETRY ARGUMENTS>.
+
+=item otel_redact => $bool
+
+Apply built-in credential redaction when command arguments are included in
+logs or spans. Default: 1.
 
 =back
 
@@ -2629,6 +2665,18 @@ to the Redis client instance.
 
 Close connection gracefully.
 
+=head2 is_connected
+
+    my $ok = $redis->is_connected;
+
+Return true when the client currently has an open Redis connection.
+
+=head2 ping
+
+    my $pong = await $redis->ping;
+
+Send C<PING> and return Redis's response.
+
 =head2 command
 
     my $result = await $redis->command('GET', 'key');
@@ -2664,9 +2712,9 @@ reference.
     # Lists
     await $redis->lpush('queue', 'job1', 'job2');
     await $redis->rpush('queue', 'job3');
-    my $job = await $redis->lpop('queue');
-    my $job = await $redis->rpop('queue');
-    my $job = await $redis->blpop('queue', 5);     # blocking pop, 5s timeout
+    my $left = await $redis->lpop('queue');
+    my $right = await $redis->rpop('queue');
+    my $popped = await $redis->blpop('queue', 5);  # ['queue', 'job'] or undef
     my $items = await $redis->lrange('queue', 0, -1);
     my $len = await $redis->llen('queue');
 
@@ -2713,7 +2761,26 @@ Subscribe to channels. Returns a L<Async::Redis::Subscription> object.
 
     my $sub = await $redis->psubscribe('chan:*');
 
-Subscribe to pattern. Returns a Subscription object.
+Subscribe to patterns. Returns a L<Async::Redis::Subscription> object.
+
+=head2 ssubscribe
+
+    my $sub = await $redis->ssubscribe('shard-channel');
+
+Subscribe to Redis 7 sharded pub/sub channels. Returns a
+L<Async::Redis::Subscription> object.
+
+=head2 publish
+
+    my $receivers = await $redis->publish('channel', 'message');
+
+Publish a regular pub/sub message.
+
+=head2 spublish
+
+    my $receivers = await $redis->spublish('shard-channel', 'message');
+
+Publish a Redis 7 sharded pub/sub message.
 
 =head2 multi
 
@@ -2729,7 +2796,34 @@ Execute a transaction with callback.
 
     await $redis->watch('key1', 'key2');
 
-Watch keys for transaction.
+Watch keys for a manual optimistic transaction. Redis clears watched keys on
+C<EXEC>, C<DISCARD>, or C<UNWATCH>.
+
+=head2 unwatch
+
+    await $redis->unwatch;
+
+Clear all watched keys on the current connection.
+
+=head2 multi_start
+
+    await $redis->multi_start;
+
+Start a manual C<MULTI> transaction and mark the connection dirty until
+C<exec> or C<discard>.
+
+=head2 exec
+
+    my $results = await $redis->exec;
+
+Execute a manual transaction. Returns C<undef> if Redis aborts because a
+watched key changed.
+
+=head2 discard
+
+    await $redis->discard;
+
+Abort a manual transaction. Redis also clears any active watched keys.
 
 =head2 watch_multi
 
@@ -2758,7 +2852,9 @@ See L<Async::Redis::Script> for details.
     });
 
 Register a named Lua script for reuse. The script is automatically cached
-and uses EVALSHA for efficiency.
+and uses EVALSHA for efficiency. Script names are kept in this Redis object's
+registry only; they are not installed as Perl methods. Execute registered
+scripts with C<run_script>.
 
 Options:
 
@@ -2804,6 +2900,26 @@ List all registered script names.
 
 Load all registered scripts to Redis server. Useful before pipeline
 execution to ensure EVALSHA will succeed.
+
+=head2 script_load / script_exists / script_flush / script_kill
+
+    my $sha = await $redis->script_load($lua);
+    my $flags = await $redis->script_exists($sha1, $sha2);
+    await $redis->script_flush('ASYNC');
+    await $redis->script_kill;
+
+Thin wrappers around Redis C<SCRIPT> subcommands.
+
+=head2 is_dirty
+
+    my $dirty = $redis->is_dirty;
+
+Return true if the connection has state that makes it unsafe to return to a
+pool: active transaction, watched keys, pub/sub mode, or pending responses.
+
+=head2 in_multi / watching / in_pubsub / inflight_count
+
+State accessors used by L<Async::Redis::Pool> and useful for diagnostics.
 
 =head1 LUA SCRIPTING
 
@@ -2851,7 +2967,14 @@ and caches for future calls. This is transparent to your code.
         for my $key (@$keys) { ... }
     }
 
-Create an iterator for SCAN. Also available: hscan_iter, sscan_iter, zscan_iter.
+Create an iterator for SCAN. Also available:
+
+    my $hash_iter = $redis->hscan_iter('hash', match => 'field:*');
+    my $set_iter  = $redis->sscan_iter('set', count => 100);
+    my $zset_iter = $redis->zscan_iter('zset');
+
+Iterators return batches. C<ZSCAN> batches are the Redis flat
+member/score list.
 
 =head1 CONNECTION POOLING
 
@@ -2875,16 +2998,16 @@ For high-throughput applications, use L<Async::Redis::Pool>:
 
 Errors are thrown as exception objects:
 
-    use Try::Tiny;
-
-    try {
+    eval {
         await $redis->get('key');
-    } catch {
-        if ($_->isa('Async::Redis::Error::Connection')) {
+        1;
+    } or do {
+        my $error = $@;
+        if (ref($error) && $error->isa('Async::Redis::Error::Connection')) {
             # Connection error
-        } elsif ($_->isa('Async::Redis::Error::Timeout')) {
+        } elsif (ref($error) && $error->isa('Async::Redis::Error::Timeout')) {
             # Timeout error
-        } elsif ($_->isa('Async::Redis::Error::Redis')) {
+        } elsif (ref($error) && $error->isa('Async::Redis::Error::Redis')) {
             # Redis error (e.g., WRONGTYPE)
         }
     };
