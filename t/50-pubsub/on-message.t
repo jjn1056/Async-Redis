@@ -407,8 +407,8 @@ SKIP: {
             Future::IO->sleep(0.2)->get;
 
             # Force a targeted disconnect via the captured client ID.
-            # The reconnect logic in _read_frame_with_reconnect will
-            # re-establish and replay subscriptions.
+            # _reader_fatal hands off to _reconnect_async, which
+            # re-establishes and replays subscriptions.
             eval { $publisher->client('KILL', 'ID', $sub_client_id)->get };
             Future::IO->sleep(0.4)->get;
 

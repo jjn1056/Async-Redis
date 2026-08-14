@@ -213,49 +213,6 @@ async sub next {
     return await $self->_dequeue;
 }
 
-# Read one pub/sub frame from the underlying connection. On transient
-# read error, attempt reconnect if enabled and fire on_reconnect on
-# success; on unrecoverable failure, propagate the error.
-# Returns a Future resolving to the raw frame (arrayref) or undef if
-# the connection is gone and no more frames are available.
-# Shared by next() and the callback driver loop added in a later task.
-async sub _read_frame_with_reconnect {
-    my ($self) = @_;
-    my $redis = $self->{redis};
-
-    while (1) {
-        my $frame;
-        my $ok = eval {
-            $frame = await $redis->_read_pubsub_frame;
-            1;
-        };
-
-        unless ($ok) {
-            my $error = $@;
-            if ($redis->{reconnect} && $self->channel_count > 0) {
-                my $reconnect_error;
-                my $reconnect_ok = eval {
-                    await $redis->_reconnect_pubsub;
-                    1;
-                };
-                $reconnect_error = $@ unless $reconnect_ok;
-                unless ($reconnect_ok) {
-                    die $reconnect_error;
-                }
-
-                if ($self->{_on_reconnect}) {
-                    $self->{_on_reconnect}->($self);
-                }
-
-                next;
-            }
-            die $error;
-        }
-
-        return $frame;
-    }
-}
-
 # Convert a raw RESP pub/sub frame into a message hashref and deliver it.
 # In callback mode, invokes _on_message via _invoke_user_callback and
 # returns its result (which may be a Future for consumer-side backpressure).

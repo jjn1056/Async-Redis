@@ -793,33 +793,6 @@ sub _ensure_reader {
     return;
 }
 
-# Read and parse one response
-async sub _read_response {
-    my ($self) = @_;
-
-    # First check if parser already has a complete message
-    # (from previous read that contained multiple responses)
-    if (my $msg = $self->{parser}->get_message) {
-        return $msg;
-    }
-
-    # Read until we get a complete message
-    while (1) {
-        my $buf = await Future::IO->read($self->{socket}, 65536);
-
-        # EOF
-        if (!defined $buf || length($buf) == 0) {
-            die "Connection closed by server";
-        }
-
-        $self->{parser}->parse($buf);
-
-        if (my $msg = $self->{parser}->get_message) {
-            return $msg;
-        }
-    }
-}
-
 # Dispatch table mapping each blocking command to how its timeout is encoded.
 # position: 'last'         => final argument (seconds)
 # position: N (integer)    => argument at index N (seconds, unless unit=>'ms')
@@ -1087,41 +1060,6 @@ async sub _ensure_connected {
     $self->{_tasks}->add(data => 'reconnect', f => $f);
     $f->on_ready(sub { $self->{_reconnect_future} = undef });
     await $f;
-}
-
-# Reconnect and replay pubsub subscriptions
-async sub _reconnect_pubsub {
-    my ($self) = @_;
-
-    my $sub = $self->{_subscription}
-        or die Async::Redis::Error::Disconnected->new(
-            message => "No subscription to replay",
-        );
-
-    my @replay = $sub->get_replay_commands;
-
-    # Ensure connection state is fully cleaned up before reconnecting.
-    # _reset_connection may have already been called by _read_response,
-    # but if the socket was closed externally, we need to clean up
-    # stale IO watchers and state here. It is safe to call twice —
-    # the on_disconnect callback is guarded by $was_connected.
-    $self->_reset_connection('pubsub_reconnect');
-
-    await $self->_reconnect;
-
-    # Re-enter pubsub mode before replaying so the unified reader
-    # classifies incoming message frames correctly during replay.
-    $self->{in_pubsub} = 1;
-
-    # Replay all subscription commands through the write gate and unified
-    # reader. Each channel/pattern gets its own command so confirmations
-    # are matched one-to-one via the inflight queue.
-    for my $cmd (@replay) {
-        my ($command, @args) = @$cmd;
-        for my $arg (@args) {
-            await $self->_pubsub_command($command, $arg);
-        }
-    }
 }
 
 # Asynchronously reconnect after a pubsub connection drop. Called by
@@ -2189,26 +2127,13 @@ async sub ssubscribe {
     return $sub;
 }
 
-# Read pubsub frame (subscription confirmation or message)
-async sub _read_pubsub_frame {
-    my ($self) = @_;
-
-    die Async::Redis::Error::Disconnected->new(
-        message => "Not connected",
-    ) unless $self->{connected};
-
-    my $msg = await $self->_read_response();
-    return $self->_decode_response($msg);
-}
-
 # Execute a single pubsub management command (SUBSCRIBE, UNSUBSCRIBE,
 # PSUBSCRIBE, PUNSUBSCRIBE, SSUBSCRIBE, SUNSUBSCRIBE) through the write
 # gate and unified reader. Each call registers one inflight entry and
 # awaits the matching confirmation frame from the reader.
 #
-# Use instead of _send_command + _read_pubsub_frame when in_pubsub=1
-# so that the unified reader (_run_reader) remains the sole socket
-# reader. Does not apply prefix or go through auto-pipeline.
+# The unified reader (_run_reader) remains the sole socket reader. Does
+# not apply prefix or go through auto-pipeline.
 async sub _pubsub_command {
     my ($self, $cmd, @args) = @_;
 
@@ -2239,25 +2164,6 @@ async sub _pubsub_command {
 
     $self->_ensure_reader;
     return await $response;
-}
-
-# Send command without reading response (for pubsub)
-async sub _send_command {
-    my ($self, @args) = @_;
-
-    my $cmd = $self->_build_command(@args);
-    await $self->_send($cmd);
-}
-
-# Read next pubsub message (blocking) - for compatibility
-async sub _read_pubsub_message {
-    my ($self) = @_;
-
-    my $msg = await $self->_read_response();
-
-    # Message format: ['message', $channel, $payload]
-    # or: ['pmessage', $pattern, $channel, $payload]
-    return $msg;
 }
 
 # ============================================================================
@@ -2560,11 +2466,12 @@ Set to C<0> for unlimited retries (not recommended in production:
 an unreachable Redis will loop with exponential backoff forever,
 giving consumers no way to distinguish "reconnecting" from "broken").
 
-When the cap is exceeded, the failure propagates through
-C<_reconnect_pubsub> to any active L<Async::Redis::Subscription>'s
-read loop, where it routes to C<on_error> (or C<die>s loudly if
-no C<on_error> is registered) per the existing Subscription
-fatal-error contract.
+When the cap is exceeded, the failure is delivered to any active
+L<Async::Redis::Subscription> as a fatal subscription error, where it
+routes to C<on_error> (or C<die>s loudly if no C<on_error> is
+registered) per the existing Subscription fatal-error contract. A
+consumer blocked in C<next> receives that error rather than the
+read error that triggered recovery.
 
 =item on_connect => $coderef
 
