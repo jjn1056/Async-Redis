@@ -102,6 +102,50 @@ subtest '_reader_fatal fails the subscription when reconnect is disabled' => sub
     like("$err", qr/stream died/, 'blocked next() rethrows the typed error');
 };
 
+subtest 'reconnect exhaustion reaches the consumer, not the original read error' => sub {
+    my $redis = Async::Redis->new(
+        host                   => 'localhost',
+        reconnect              => 1,
+        reconnect_max_attempts => 1,
+        reconnect_delay        => 0,
+        reconnect_delay_max    => 0,
+        reconnect_jitter       => 0,
+    );
+    my $sub = Async::Redis::Subscription->new(redis => $redis);
+    $sub->_add_channel('chan');
+
+    $redis->{_subscription} = $sub;
+    $redis->{in_pubsub}     = 1;
+    $redis->{connected}     = 1;
+
+    # Every reconnect attempt fails, so the cap is exhausted.
+    no warnings 'redefine';
+    local *Async::Redis::connect = async sub {
+        die Async::Redis::Error::Disconnected->new(message => 'connect failed');
+    };
+
+    # The read error starts recovery. Recovery then exhausts the cap. The
+    # consumer-facing error must be the exhaustion, because that reports
+    # recovery was attempted and failed; the read error is only the cause
+    # that began it.
+    $redis->_reader_fatal(
+        Async::Redis::Error::Connection->new(message => 'read failed')
+    );
+
+    # Drive the loop until _reconnect_async's on_fail has fired _fail_fatal.
+    for (1 .. 200) {
+        last if $sub->{_fatal_error};
+        run { Future::IO->sleep(0.01) };
+    }
+    ok($sub->{_fatal_error}, 'reconnect task gave up and failed the subscription');
+
+    my $err = dies { run { $sub->next } };
+    like("$err", qr/Reconnect gave up after 1 attempts/,
+        'consumer sees the reconnect exhaustion error');
+    unlike("$err", qr/read failed/,
+        'original read error does not mask reconnect exhaustion');
+};
+
 # --- Integration tests (require Redis) ---
 
 SKIP: {

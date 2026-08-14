@@ -158,40 +158,8 @@ subtest '_reconnect cap is per reconnect cycle, not permanent client poison' => 
         'attempt counter reset after successful later reconnect');
 };
 
-subtest 'pubsub reports reconnect exhaustion, not the original read error' => sub {
-    my $redis = Async::Redis->new(
-        host                   => 'localhost',
-        reconnect              => 1,
-        reconnect_max_attempts => 1,
-        reconnect_delay        => 0,
-        reconnect_delay_max    => 0,
-        reconnect_jitter       => 0,
-    );
-    my $sub = Async::Redis::Subscription->new(redis => $redis);
-
-    $redis->{_subscription} = $sub;
-    $sub->_add_channel('chan');
-
-    # The read fails first, which is the trigger for pub/sub recovery.
-    # Recovery then exhausts reconnect_max_attempts.  The consumer-facing
-    # error should be the reconnect exhaustion error, because that tells
-    # users recovery was attempted and failed; the original read error is
-    # only the cause that started the recovery path.
-    no warnings 'redefine';
-    local *Async::Redis::_read_pubsub_frame = async sub {
-        die Async::Redis::Error::Disconnected->new(message => 'read failed');
-    };
-    local *Async::Redis::connect = async sub {
-        die Async::Redis::Error::Disconnected->new(message => 'connect failed');
-    };
-
-    my $err = dies { $sub->_read_frame_with_reconnect->get };
-
-    like("$err", qr/Reconnect gave up after 1 attempts/,
-        'subscription sees reconnect exhaustion error');
-    unlike("$err", qr/read failed/,
-        'original read error does not mask reconnect exhaustion');
-};
+# Reconnect exhaustion routing lives in t/50-pubsub/reconnect-handoff.t,
+# which drives it through _reader_fatal and _reconnect_async.
 
 # --- Integration tests (require Redis) ---
 
