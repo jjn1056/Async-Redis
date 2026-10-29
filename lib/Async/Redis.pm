@@ -15,6 +15,7 @@ use Socket qw(pack_sockaddr_in pack_sockaddr_un inet_aton AF_INET AF_UNIX SOCK_S
 use IO::Handle ();
 use IO::Socket::INET;
 use Time::HiRes ();
+use Carp ();
 
 # Error classes
 use Async::Redis::Error::Connection;
@@ -708,8 +709,11 @@ async sub _run_reader {
 
         $self->{parser}->parse($buf);
 
-        # Drain all complete messages the parser has.
-        while (my $msg = $self->{parser}->get_message) {
+        # Drain all complete messages the parser has. Dispatching a reply runs
+        # the caller's continuation synchronously, and that code may tear the
+        # connection down (disconnect, or a fatal), so re-check before each
+        # message, as the outer loop does before each read.
+        while ($self->{_socket_live} and my $msg = $self->{parser}->get_message) {
             my ($kind, $value) = $self->_decode_response_result($msg);
 
             if ($kind eq 'protocol_error') {
@@ -784,6 +788,13 @@ async sub _run_reader {
 # routed there too, so whatever kind of submission is waiting — a command,
 # a pipeline, an auto-pipelined command, a pubsub command — sees a typed
 # error rather than waiting forever.
+#
+# The reader future only fails when nothing else will report the error: an
+# unhandled exception in the reader, or one raised by _reader_fatal itself
+# (a user callback that died, or a callback-mode subscription with no
+# on_error). So it is reported here as a warning. Nothing may be thrown from
+# this handler: it runs inside the event loop's completion handling, and an
+# exception there breaks the loop for every connection sharing it.
 sub _ensure_reader {
     my ($self) = @_;
     return if $self->{_reader_running};
@@ -793,6 +804,7 @@ sub _ensure_reader {
     $f->on_fail(sub {
         my ($err) = @_;
         chomp(my $reason = "$err");
+        Carp::carp("Async::Redis reader stopped: $reason");
         my $typed = (ref $err && eval { $err->isa('Async::Redis::Error') })
             ? $err
             : Async::Redis::Error::Connection->new(
@@ -800,7 +812,10 @@ sub _ensure_reader {
                 host    => $self->{host},
                 port    => $self->{port},
             );
-        $self->_reader_fatal($typed);
+        local $@;
+        my $ok = eval { $self->_reader_fatal($typed); 1 };
+        Carp::carp("Async::Redis error while handling reader failure: "
+            . ($@ // 'unknown error')) unless $ok;
     });
     $self->{_tasks}->add(data => 'reader', f => $f);
     return;

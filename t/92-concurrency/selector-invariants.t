@@ -28,6 +28,8 @@ sub new_redis {
 }
 
 subtest 'reader failure reaches the waiting caller' => sub {
+    my @reader_warnings;
+    local $SIG{__WARN__} = sub { push @reader_warnings, @_ };
     # Drives a reader failure by monkey-patching _decode_response_result
     # (same as reader-unhandled-exception.t) and checks the GET waiting on
     # that reply fails rather than hanging or completing.
@@ -70,6 +72,9 @@ subtest 'reader failure reaches the waiting caller' => sub {
         { no warnings 'redefine'; *Async::Redis::_decode_response_result = $orig; }
         eval { $r->disconnect };
     })->()->get;
+    is scalar(grep { /Async::Redis reader stopped: SELECTOR_INVARIANT_TEST_BUG/ } @reader_warnings), 1,
+        'the reader crash is reported once as a warning'
+        or diag "warnings: @reader_warnings";
 };
 
 subtest 'disconnect under load: write-gate waiters unwind cleanly' => sub {

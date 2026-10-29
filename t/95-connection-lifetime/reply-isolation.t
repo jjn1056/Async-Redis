@@ -10,31 +10,13 @@ use strict;
 use warnings;
 use Test2::V0;
 use Test::Lib;
-use Test::Async::Redis qw(run settle failure_of skip_without_redis cleanup_keys);
+use Test::Async::Redis qw(run settle failure_of inject_reader_bug skip_without_redis cleanup_keys);
 use Future::AsyncAwait;
 use Future::IO;
 use Future;
 use Async::Redis;
-use Scalar::Util qw(refaddr);
 
 $SIG{PIPE} = 'IGNORE';
-
-# Make $target's reader die on its next decode, as an unhandled coding bug
-# would. Other clients are unaffected, so a publisher in the same test cannot
-# consume the trap. Returns a guard that restores the original when it goes out of scope.
-sub arm_reader_bug {
-    my ($target) = @_;
-    my $orig  = \&Async::Redis::_decode_response_result;
-    my $armed = 1;
-    no warnings 'redefine';
-    *Async::Redis::_decode_response_result = sub {
-        if ($armed && refaddr($_[0]) == refaddr($target)) { $armed = 0; die "INJECTED_READER_BUG\n" }
-        return $orig->(@_);
-    };
-    return bless sub { no warnings 'redefine'; *Async::Redis::_decode_response_result = $orig },
-        'ReaderBugGuard';
-}
-sub ReaderBugGuard::DESTROY { $_[0]->() }
 
 sub new_client {
     Async::Redis->new(host => $ENV{REDIS_HOST} // 'localhost', @_);
@@ -100,9 +82,11 @@ SKIP: {
     };
 
     subtest 'B11: reader crash ends a pipeline instead of hanging' => sub {
+        my @reader_warnings;
+        local $SIG{__WARN__} = sub { push @reader_warnings, @_ };
         my $r = new_client(); run { $r->connect };
         run { $r->set('iso:k', 'v') };
-        my $guard = arm_reader_bug($r);
+        my $guard = inject_reader_bug($r);
         my $pipe = $r->pipeline;
         $pipe->get('iso:k');
         $pipe->get('iso:k');
@@ -114,24 +98,34 @@ SKIP: {
         isa_ok $_, 'Async::Redis::Error::Connection' for @$slots;
         undef $guard;
         eval { $r->disconnect };
+        is scalar(grep { /Async::Redis reader stopped: INJECTED_READER_BUG/ } @reader_warnings), 1,
+            'the reader crash is reported once as a warning'
+            or diag "warnings: @reader_warnings";
     };
 
     subtest 'B11: reader crash fails an auto-pipelined command instead of hanging' => sub {
+        my @reader_warnings;
+        local $SIG{__WARN__} = sub { push @reader_warnings, @_ };
         my $r = new_client(auto_pipeline => 1); run { $r->connect };
         run { $r->set('iso:k', 'v') };
-        my $guard = arm_reader_bug($r);
+        my $guard = inject_reader_bug($r);
         my $f = $r->get('iso:k');
         is settle($f), 'failed', 'auto-pipelined GET fails (not hung, not done)';
         undef $guard;
         eval { $r->disconnect };
+        is scalar(grep { /Async::Redis reader stopped: INJECTED_READER_BUG/ } @reader_warnings), 1,
+            'the reader crash is reported once as a warning'
+            or diag "warnings: @reader_warnings";
     };
 
     subtest 'reader crash while subscribed does not hang' => sub {
+        my @reader_warnings;
+        local $SIG{__WARN__} = sub { push @reader_warnings, @_ };
         my $sub_redis = new_client(reconnect => 0); run { $sub_redis->connect };
         my $pub = new_client(); run { $pub->connect };
         my $sub = run { $sub_redis->subscribe('iso:chan') };
 
-        my $guard = arm_reader_bug($sub_redis);
+        my $guard = inject_reader_bug($sub_redis);
         my $next  = $sub->next;
         my $published = $pub->publish('iso:chan', 'hello');
         is settle($next), 'failed', 'blocked next() fails (not hung, not delivered)';
@@ -140,6 +134,9 @@ SKIP: {
         undef $guard;
         eval { $pub->disconnect };
         eval { $sub_redis->disconnect };
+        is scalar(grep { /Async::Redis reader stopped: INJECTED_READER_BUG/ } @reader_warnings), 1,
+            'the reader crash is reported once as a warning'
+            or diag "warnings: @reader_warnings";
     };
 
     # Errors stay with the caller that owns them.

@@ -19,6 +19,8 @@ plan skip_all => 'REDIS_HOST not set' unless $ENV{REDIS_HOST};
 # _reader_fatal, which fails every inflight entry.
 
 subtest 'reader unhandled exception propagates to awaiting caller' => sub {
+    my @reader_warnings;
+    local $SIG{__WARN__} = sub { push @reader_warnings, @_ };
     (async sub {
         my $r = Async::Redis->new(
             host => $ENV{REDIS_HOST},
@@ -86,6 +88,9 @@ subtest 'reader unhandled exception propagates to awaiting caller' => sub {
         }
         eval { $r->disconnect };
     })->()->get;
+    is scalar(grep { /Async::Redis reader stopped: INJECTED_READER_BUG/ } @reader_warnings), 1,
+        'the reader crash is reported once as a warning'
+        or diag "warnings: @reader_warnings";
 };
 
 done_testing;

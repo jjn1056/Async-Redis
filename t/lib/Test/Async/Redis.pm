@@ -6,6 +6,7 @@ use parent 'Exporter';
 use Future::AsyncAwait;
 use Test2::V0;
 use Future::IO;
+use Scalar::Util ();
 
 # Run the suite on a real event loop. Future::IO's built-in default impl
 # documents support for a single filehandle only, and these tests open
@@ -23,6 +24,7 @@ our @EXPORT_OK = qw(
     with_timeout
     settle
     failure_of
+    inject_reader_bug
     fails_with
     delay
     redis_host
@@ -171,6 +173,27 @@ sub failure_of {
     my ($f) = @_;
     return $f->is_failed ? ($f->failure)[0] : undef;
 }
+
+# Make $target's reader die on its next decode, as an unhandled coding bug
+# would. Other clients are unaffected. Returns a guard that restores the
+# original decoder when it goes out of scope.
+sub inject_reader_bug {
+    my ($target, $message) = @_;
+    $message //= "INJECTED_READER_BUG\n";
+    my $orig  = \&Async::Redis::_decode_response_result;
+    my $armed = 1;
+    no warnings 'redefine';
+    *Async::Redis::_decode_response_result = sub {
+        if ($armed && Scalar::Util::refaddr($_[0]) == Scalar::Util::refaddr($target)) {
+            $armed = 0;
+            die $message;
+        }
+        return $orig->(@_);
+    };
+    return bless sub { no warnings 'redefine'; *Async::Redis::_decode_response_result = $orig },
+        'Test::Async::Redis::ReaderBugGuard';
+}
+sub Test::Async::Redis::ReaderBugGuard::DESTROY { $_[0]->() }
 
 # Assert Future fails with specific error type
 sub fails_with {
