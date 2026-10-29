@@ -102,14 +102,16 @@ subtest '_invoke_user_callback routes die to on_error' => sub {
     ok($sub->is_closed, 'subscription closed after fatal error');
 };
 
-subtest '_handle_fatal_error dies when no on_error set' => sub {
+subtest '_handle_fatal_error warns when no on_error set' => sub {
     my $redis = Async::Redis->new(host => 'localhost');
     my $sub = Async::Redis::Subscription->new(redis => $redis);
 
-    my $err;
-    eval { $sub->_handle_fatal_error("loud failure\n"); };
-    $err = $@;
-    like($err, qr/loud failure/, 'die propagates when no on_error registered');
+    my @warnings;
+    local $SIG{__WARN__} = sub { push @warnings, @_ };
+    ok(lives { $sub->_handle_fatal_error("loud failure\n") },
+        'does not throw: it runs inside the event loop, where nothing can catch it');
+    is(scalar(grep { /no on_error.*loud failure/s } @warnings), 1,
+        'the fatal error is reported as a warning');
     ok($sub->is_closed, 'subscription closed');
 };
 

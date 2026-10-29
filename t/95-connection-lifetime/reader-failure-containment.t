@@ -100,6 +100,47 @@ SKIP: {
         eval { $r->disconnect };
     };
 
+    # A reconnect fails a loop turn after the drop, outside the reader. The
+    # subscription's fatal error is raised from the reconnect task then.
+    subtest 'a listener with no on_error is reported when reconnect gives up' => sub {
+        my @warnings;
+        local $SIG{__WARN__} = sub { push @warnings, @_ };
+        my $admin = Async::Redis->new(host => $ENV{REDIS_HOST} // 'localhost');
+        run { $admin->connect };
+        my $r = Async::Redis->new(
+            host                   => $ENV{REDIS_HOST} // 'localhost',
+            reconnect              => 1,
+            reconnect_max_attempts => 1,
+            reconnect_delay        => 0,
+            reconnect_delay_max    => 0,
+            reconnect_jitter       => 0,
+        );
+        run { $r->connect };
+        my $id  = run { $r->client('ID') };
+        my $sub = run { $r->subscribe('lt:contain:rc') };
+        $sub->on_message(sub { });
+
+        {
+            no warnings 'redefine';
+            local *Async::Redis::connect = sub {
+                Future::IO->sleep(0.02)->then(sub {
+                    Future->fail(Async::Redis::Error::Disconnected->new(
+                        message => 'connect failed'));
+                });
+            };
+            run { $admin->client('KILL', 'ID', $id) };
+            my $thrown = dies { run { Future::IO->sleep(0.01) } for 1 .. 100 };
+            is $thrown, undef, 'nothing is thrown into the event loop';
+        }
+
+        ok $sub->is_closed, 'the subscription is closed';
+        ok loop_still_works(), 'the event loop still runs afterwards';
+        ok((grep { /no on_error.*Reconnect gave up after 1 attempts/s } @warnings),
+            'the exhausted reconnect is reported')
+            or diag "warnings: @warnings";
+        eval { $admin->disconnect };
+    };
+
     # Completing a reply runs the caller's continuation synchronously, inside
     # the reader's drain loop. A caller that disconnects there tears the
     # connection down while a second reply is still in the read buffer.

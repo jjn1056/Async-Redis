@@ -791,8 +791,8 @@ async sub _run_reader {
 #
 # The reader future only fails when nothing else will report the error: an
 # unhandled exception in the reader, or one raised by _reader_fatal itself
-# (a user callback that died, or a callback-mode subscription with no
-# on_error). So it is reported here as a warning. Nothing may be thrown from
+# (a user callback such as on_disconnect that died). So it is reported
+# here as a warning. Nothing may be thrown from
 # this handler: it runs inside the event loop's completion handling, and an
 # exception there breaks the loop for every connection sharing it.
 sub _ensure_reader {
@@ -2497,8 +2497,8 @@ giving consumers no way to distinguish "reconnecting" from "broken").
 
 When the cap is exceeded, the failure is delivered to any active
 L<Async::Redis::Subscription> as a fatal subscription error, where it
-routes to C<on_error> (or C<die>s loudly if no C<on_error> is
-registered) per the existing Subscription fatal-error contract. A
+routes to C<on_error> (or is reported with a warning if no C<on_error>
+is registered) per the Subscription fatal-error contract. A
 consumer blocked in C<next> receives that error rather than the
 read error that triggered recovery.
 

@@ -99,7 +99,9 @@ sub _invoke_user_callback {
 
 # Single chokepoint for fatal errors from either the read loop or the
 # callback path. Closes the subscription, fires on_error if registered,
-# and dies loudly if not. Loud-by-default prevents silent zombies.
+# and warns if not, so a listener never dies silently. It does not die:
+# it runs inside the event loop (the reader, the reconnect task, or the
+# callback driver), where nothing in the subscriber's code could catch it.
 sub _handle_fatal_error {
     my ($self, $err) = @_;
     $self->_close;
@@ -111,7 +113,15 @@ sub _handle_fatal_error {
         }
         return;
     }
-    die $err;
+    _report_unhandled_fatal($err);
+}
+
+# A callback-mode subscription with no on_error has nowhere to deliver a
+# fatal error, so report it rather than lose it.
+sub _report_unhandled_fatal {
+    my ($err) = @_;
+    chomp(my $reason = "$err");
+    Carp::carp("Async::Redis::Subscription fatal error with no on_error handler: $reason");
 }
 
 # Track a channel subscription
@@ -298,7 +308,7 @@ sub _dispatch_frame {
 # Exits cleanly when _dequeue returns undef (subscription closed or
 # paused for reconnect). Dies with the typed error if _dequeue dies
 # (fatal); by then _fail_fatal has already reported that error through
-# on_error, or died, so the driver's own failure carries nothing new.
+# on_error or a warning, so the driver's own failure carries nothing new.
 #
 # Periodic sleep(0) yield every MAX_SYNC_DEPTH iterations prevents
 # stack growth when messages are pre-queued and await returns
@@ -418,7 +428,7 @@ sub _close {
 # Unrecoverable failure: marks the subscription closed with a typed
 # error. Any blocked next() will die with that error. The error is
 # preserved for callers who call next() after the fact.
-# In callback mode, fires on_error if registered; dies otherwise.
+# In callback mode, fires on_error if registered; warns otherwise.
 sub _fail_fatal {
     my ($self, $typed_error) = @_;
     return if $self->{_closed};
@@ -449,9 +459,8 @@ sub _fail_fatal {
     }
 
     # Notify callback-mode consumers of the fatal error. In iterator mode
-    # the caller detects it via die from next(). Loud-by-default: if
-    # no on_error is registered in callback mode, die so silent death
-    # of a listener is impossible.
+    # the caller detects it via die from next(). With no on_error in
+    # callback mode, warn so silent death of a listener is impossible.
     if (my $cb = $self->{_on_error}) {
         local $@;
         my $ok = eval { $cb->($self, $typed_error); 1 };
@@ -460,10 +469,8 @@ sub _fail_fatal {
         }
         return;
     }
-    # In iterator mode (no callback), callers discover the error via next().
-    # In callback mode with no on_error, die loudly.
     if ($self->{_on_message}) {
-        die $typed_error;
+        _report_unhandled_fatal($typed_error);
     }
 }
 
@@ -829,10 +836,14 @@ cannot be recovered by reconnect (e.g., reconnect is disabled, or
 reconnect itself failed). After C<on_error> fires, the subscription is
 closed and the driver stops.
 
-B<If C<on_error> is not registered, fatal errors C<die>.> Silent death
-of a pub/sub consumer is a debugging nightmare; loud-by-default
-prevents it. If you genuinely want to swallow errors, register an
-explicit no-op: C<< $sub->on_error(sub { }) >>.
+B<If C<on_error> is not registered, fatal errors are reported with a
+warning> (C<Carp::carp>), and the subscription is closed. Silent death of
+a pub/sub consumer is a debugging nightmare, so the error is never
+dropped. It is not thrown either: a fatal error is detected inside the
+event loop (while reading, reconnecting, or running your callback),
+where no code of yours is on the stack to catch it. If you genuinely
+want to swallow errors, register an explicit no-op:
+C<< $sub->on_error(sub { }) >>.
 
 Callback exceptions (dying inside C<on_message>) are also routed to
 C<on_error>; the callback-died message is prepended to the error

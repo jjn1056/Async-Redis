@@ -16,6 +16,26 @@ Unreleased
           completed; only plain commands saw the error
         - The reader's failure now fails every request still waiting on
           that connection with a typed Async::Redis::Error::Connection
+    - Behaviour change: a callback-mode subscription with no on_error
+      now warns on a fatal error instead of dying
+        - Previously documented as "dies loudly". In practice the die was
+          raised inside the event loop: on reconnect exhaustion it was
+          thrown out of whatever unrelated code was running the loop, and
+          on a reader failure it could leave the event loop broken
+        - The error is now reported with Carp::carp and the subscription
+          is closed, the same way a dying on_error is already treated.
+          Register on_error to handle it yourself
+        - Signed off by John 2026-10-29
+    - Bug Fix: a failing reader can no longer break the event loop
+        - A user callback (such as on_disconnect) that died while the
+          reader's failure was being handled escaped into the event loop
+        - Such errors are now reported as warnings; every request waiting
+          on the connection still fails with a typed error first
+    - Bug Fix: disconnecting from inside a reply no longer crashes the
+      reader
+        - A caller that called disconnect() in the code run when its own
+          reply arrived could leave the reader reading from a parser that
+          no longer existed
     - Test suite: runs on Future::IO::Impl::IOAsync (reverses 0.001006)
         - 0.001006 moved the suite onto Future::IO's built-in default impl
           because load_impl('IOAsync') failed on Future::IO 0.22+. That
