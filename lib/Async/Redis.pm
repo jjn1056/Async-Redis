@@ -2260,8 +2260,9 @@ Async::Redis - Async Redis client using Future::IO
     use Async::Redis;
     use Future::AsyncAwait;
 
-    # Future::IO 0.23+ has a built-in poll-based impl that works
-    # out of the box. For IO::Async or UV, require the impl directly:
+    # Future::IO 0.23+ has a built-in default impl, documented for a
+    # single filehandle -- enough for this one-connection example. For
+    # more than one connection, require a real impl:
     # require Future::IO::Impl::IOAsync;  # if using IO::Async
     # require Future::IO::Impl::UV;       # if using UV
 
@@ -2959,10 +2960,11 @@ compatible with IO::Async, UV, AnyEvent, and other event loops. However,
 B<Async::Redis does not choose which event loop to use> - that's the
 application's responsibility.
 
-=head2 Default (No Configuration Needed)
+=head2 Default (Single Connection Only)
 
-B<Future::IO 0.23+> includes a built-in poll-based implementation that works
-out of the box. For standalone scripts, you don't need to configure anything:
+B<Future::IO 0.23+> includes a built-in default implementation, which
+L<Future::IO> documents as supporting a single filehandle. A standalone
+script with exactly one connection needs no configuration:
 
     #!/usr/bin/env perl
     use strict;
@@ -2970,7 +2972,11 @@ out of the box. For standalone scripts, you don't need to configure anything:
     use Async::Redis;
 
     my $redis = Async::Redis->new(host => 'localhost');
-    # Just works - Future::IO uses its built-in IO::Poll backend
+    # One connection: Future::IO's built-in default impl is enough
+
+Anything that holds more than one connection open at a time - a publisher
+alongside a subscriber, L<Async::Redis::Pool>, or several clients - needs a
+real implementation, such as the IO::Async or UV ones below.
 
 =head2 The Golden Rule
 

@@ -32,8 +32,9 @@ cpanm Protocol::Redis::XS
 use Async::Redis;
 use Future::AsyncAwait;
 
-# Future::IO 0.23+ has a built-in poll-based impl that works out of the box.
-# For IO::Async or UV, require the impl directly:
+# Future::IO 0.23+ has a built-in default impl, which Future::IO documents
+# for a single filehandle -- enough for this one-connection example. For more
+# than one connection (pub/sub, pools, several clients), require a real impl:
 #   require Future::IO::Impl::IOAsync;
 #   require Future::IO::Impl::UV;
 
