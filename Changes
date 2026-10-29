@@ -39,6 +39,7 @@ Unreleased
           call itself hanging
         - The subscribe call now fails with
           Async::Redis::Error::Disconnected ("Not connected")
+        - Signed off by John 2026-10-29
     - Bug Fix: one command's error could fail other commands
         - A Redis error in one command's reply (for example WRONGTYPE)
           could fail an unrelated command in flight at the same time
