@@ -50,6 +50,9 @@ use Async::Redis::Subscription;
 # Telemetry support
 use Async::Redis::Telemetry;
 
+# One connection and the tasks started on it
+use Async::Redis::Connection;
+
 # Try XS version first, fall back to pure Perl
 BEGIN {
     eval { require Protocol::Redis::XS; 1 }
