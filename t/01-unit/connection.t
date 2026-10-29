@@ -101,6 +101,28 @@ subtest 'two submits write and resolve in order' => sub {
     $conn->close(disconnected());
 };
 
+subtest 'a second submit waits for the first write to finish' => sub {
+    my ($client, $conn, $peer, $mine) = pair();
+    my $ECHO = "*1\r\n\$4\r\nECHO\r\n";
+    fill_send_buffer($mine);
+    my $first  = $conn->submit($ECHO, [entry()]);
+    my $second = $conn->submit($PING, [entry()]);
+    ok !$first->is_ready, 'the first write is pending';
+    ok !$second->is_ready, 'the second submit waits';
+
+    my $data  = '';
+    my $until = Time::HiRes::time() + 2;
+    until ($second->is_ready || Time::HiRes::time() > $until) {
+        my $n = sysread($peer, my $buf, 65536);
+        $data .= $buf if $n;
+        run { Future::IO->sleep(0.001) };
+    }
+    $data .= (peer_reads($peer, 0.05))[0];
+    is [settle($first), settle($second)], ['done', 'done'], 'both writes complete';
+    like $data, qr/\Q$ECHO$PING\E\z/, 'the second was written after the first, whole';
+    $conn->close(disconnected());
+};
+
 subtest 'close fails pending entries with the close error' => sub {
     my ($client, $conn, $peer, $mine) = pair();
     my $e = entry();
@@ -158,6 +180,15 @@ subtest 'close cancels the pending read before shutdown' => sub {
     ok $read_f->is_cancelled, 'the read was cancelled';
     my (undef, $eof) = peer_reads($peer);
     ok $eof, 'the peer sees EOF';
+};
+
+subtest 'close ends the reader' => sub {
+    my ($client, $conn, $peer, $mine) = pair();
+    settle($conn->submit($PING, [entry()]));
+    my $reader = $conn->{reader};
+    ok $reader && !$reader->is_ready, 'the reader is waiting';
+    $conn->close(disconnected());
+    ok $reader->is_ready, 'the reader has ended, not left parked on its deadline';
 };
 
 subtest 'close is idempotent and never throws' => sub {

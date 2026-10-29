@@ -2,7 +2,7 @@ use strict;
 use warnings;
 use Test2::V0;
 use Test::Lib;
-use Test::Async::Redis ();   # selects the suite's Future::IO event loop
+use Test::Async::Redis qw(current_connection);
 use Future::AsyncAwait;
 use Future::IO;
 use Future;
@@ -79,8 +79,8 @@ subtest 'reader failure reaches the waiting caller' => sub {
 
 subtest 'disconnect under load: write-gate waiters unwind cleanly' => sub {
     # Fire many concurrent commands without awaiting individually, so
-    # most end up waiting on _acquire_write_lock rather than in the
-    # inflight queue. Then disconnect and await them all. Verify:
+    # most end up waiting on the connection's write gate rather than in
+    # the inflight queue. Then disconnect and await them all. Verify:
     #   - every future resolves (no pending futures left)
     #   - only Disconnected / Connection error types appear
     #   - no Timeout, Protocol, or generic die leaking out
@@ -188,7 +188,7 @@ subtest 'reconnect cycles do not leak state' => sub {
             # connection — kernel delivers EOF cleanly through Future::IO's
             # poller. Closing the client socket locally would leave a stale
             # poller with undef fileno in the select loop.
-            my $sub_sock = $sub_redis->{socket};
+            my $sub_sock = current_connection($sub_redis)->socket;
             my $sub_addr = $sub_sock->sockhost . ':' . $sub_sock->sockport;
             eval { await $pub->client('KILL', 'ADDR', $sub_addr) };
             # Give reconnect a moment to kick off.

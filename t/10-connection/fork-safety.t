@@ -2,7 +2,7 @@
 use strict;
 use warnings;
 use Test::Lib;
-use Test::Async::Redis ':redis';
+use Test::Async::Redis ':redis', 'current_connection';
 use Test2::V0;
 use Async::Redis;
 use POSIX qw(_exit);
@@ -20,8 +20,8 @@ SKIP: {
     skip "Redis not available: $@", 1 unless $redis;
 
     subtest 'connection tracks PID' => sub {
-        ok($redis->{_pid}, 'PID tracked');
-        is($redis->{_pid}, $$, 'PID matches current process');
+        ok(current_connection($redis)->pid, 'PID tracked');
+        is(current_connection($redis)->pid, $$, 'PID matches current process');
     };
 
     subtest 'connection detects fork and reconnects' => sub {

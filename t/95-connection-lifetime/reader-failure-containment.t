@@ -100,6 +100,27 @@ SKIP: {
         eval { $r->disconnect };
     };
 
+    subtest 'on_disconnect calling disconnect' => sub {
+        my @warnings;
+        local $SIG{__WARN__} = sub { push @warnings, @_ };
+        my $fired = 0;
+        my $r = Async::Redis->new(
+            host          => $ENV{REDIS_HOST} // 'localhost',
+            on_disconnect => sub { $fired++; $_[0]->disconnect },
+        );
+        run { $r->connect };
+        run { $r->del('lt:missing') };
+
+        my $blpop = $r->command('BLPOP', 'lt:missing', '1');
+        run { Future::IO->sleep(0.05) };
+        inject_eof($r);
+        is settle($blpop), 'failed', 'the waiting command fails';
+
+        is $fired, 1, 'on_disconnect fires once';
+        is \@warnings, [], 'no warnings';
+        ok !$r->is_connected, 'the client ends disconnected';
+    };
+
     # A reconnect fails a loop turn after the drop, outside the reader. The
     # subscription's fatal error is raised from the reconnect task then.
     subtest 'a listener with no on_error is reported when reconnect gives up' => sub {

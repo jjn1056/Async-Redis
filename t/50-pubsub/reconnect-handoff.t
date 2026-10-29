@@ -2,14 +2,14 @@
 #
 # Covers the pub/sub reconnect handoff as the unified reader performs it:
 #
-#   _reader_fatal
+#   a connection fails ($conn->_fail) -> _connection_lost
 #     -> $subscription->_pause_for_reconnect   (keep channels, stop the driver)
 #     -> $redis->_reconnect_async($subscription)
 #          -> _reconnect
 #          -> $subscription->_resume_after_reconnect  (replay, on_reconnect,
 #                                                      restart the driver)
 #
-# and the no-reconnect branch, where _reader_fatal routes to _fail_fatal
+# and the no-reconnect branch, where _connection_lost routes to _fail_fatal
 # instead so a blocked next() sees the typed error.
 #
 # t/50-pubsub/reconnect.t covers reconnect from the consumer's side (messages
@@ -19,7 +19,7 @@
 use strict;
 use warnings;
 use Test::Lib;
-use Test::Async::Redis qw(run await_f);
+use Test::Async::Redis qw(run await_f fake_connection);
 use Future::AsyncAwait;
 use Test2::V0;
 use Async::Redis;
@@ -51,22 +51,22 @@ subtest '_pause_for_reconnect stops the driver without closing the subscription'
     is([sort $sub->patterns], ['events.*'], 'patterns retained for replay');
 };
 
-subtest '_reader_fatal hands a live subscription to _reconnect_async' => sub {
+subtest 'a lost connection hands a live subscription to _reconnect_async' => sub {
     my $redis = Async::Redis->new(host => 'localhost', reconnect => 1);
     my $sub   = Async::Redis::Subscription->new(redis => $redis);
     $sub->_add_channel('chan:a');
 
     $redis->{_subscription} = $sub;
-    $redis->{in_pubsub}     = 1;
-    $redis->{connected}     = 1;
+    my ($conn, $peer) = fake_connection($redis);
+    $redis->_set_in_pubsub(1);
 
     # Spy on the handoff target. This records the call; the routing decision
-    # under test (_reader_fatal choosing this branch) is the real code.
+    # under test (_connection_lost choosing this branch) is the real code.
     my @handoffs;
     no warnings 'redefine';
     local *Async::Redis::_reconnect_async = sub { push @handoffs, $_[1] };
 
-    $redis->_reader_fatal(
+    $conn->_fail(
         Async::Redis::Error::Connection->new(message => 'stream died')
     );
 
@@ -74,24 +74,24 @@ subtest '_reader_fatal hands a live subscription to _reconnect_async' => sub {
     is(scalar @handoffs, 1, '_reconnect_async invoked exactly once');
     ok($handoffs[0] && $handoffs[0] == $sub, 'handed the active subscription');
     ok(!$sub->is_closed, 'subscription left open for the resume path');
-    is($redis->{in_pubsub}, 0, 'connection state torn down before reconnect');
+    is($redis->in_pubsub, 0, 'connection state torn down before reconnect');
 };
 
-subtest '_reader_fatal fails the subscription when reconnect is disabled' => sub {
+subtest 'a lost connection fails the subscription when reconnect is disabled' => sub {
     my $redis = Async::Redis->new(host => 'localhost', reconnect => 0);
     my $sub   = Async::Redis::Subscription->new(redis => $redis);
     $sub->_add_channel('chan:a');
 
     $redis->{_subscription} = $sub;
-    $redis->{in_pubsub}     = 1;
-    $redis->{connected}     = 1;
+    my ($conn, $peer) = fake_connection($redis);
+    $redis->_set_in_pubsub(1);
 
     my @handoffs;
     no warnings 'redefine';
     local *Async::Redis::_reconnect_async = sub { push @handoffs, $_[1] };
 
     my $typed = Async::Redis::Error::Connection->new(message => 'stream died');
-    $redis->_reader_fatal($typed);
+    $conn->_fail($typed);
 
     is(scalar @handoffs, 0, 'no reconnect attempted');
     ok($sub->is_closed, 'subscription closed');
@@ -115,8 +115,8 @@ subtest 'reconnect exhaustion reaches the consumer, not the original read error'
     $sub->_add_channel('chan');
 
     $redis->{_subscription} = $sub;
-    $redis->{in_pubsub}     = 1;
-    $redis->{connected}     = 1;
+    my ($conn, $peer) = fake_connection($redis);
+    $redis->_set_in_pubsub(1);
 
     # Every reconnect attempt fails, so the cap is exhausted.
     no warnings 'redefine';
@@ -128,7 +128,7 @@ subtest 'reconnect exhaustion reaches the consumer, not the original read error'
     # consumer-facing error must be the exhaustion, because that reports
     # recovery was attempted and failed; the read error is only the cause
     # that began it.
-    $redis->_reader_fatal(
+    $conn->_fail(
         Async::Redis::Error::Connection->new(message => 'read failed')
     );
 

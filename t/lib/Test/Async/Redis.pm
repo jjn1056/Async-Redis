@@ -7,6 +7,7 @@ use Future::AsyncAwait;
 use Test2::V0;
 use Future::IO;
 use Scalar::Util ();
+use Socket qw(AF_UNIX SOCK_STREAM PF_UNSPEC);
 
 # Run the suite on a real event loop. Future::IO's built-in default impl
 # documents support for a single filehandle only, and these tests open
@@ -32,6 +33,8 @@ our @EXPORT_OK = qw(
     inject_eof
     inject_unexpected_frame
     force_read_timeout
+    current_connection
+    fake_connection
 );
 
 our %EXPORT_TAGS = (
@@ -218,26 +221,49 @@ async sub delay {
 # with uninit warnings.
 sub inject_eof {
     my ($redis) = @_;
-    shutdown($redis->{socket}, 2) if $redis->{socket};
+    my $conn = current_connection($redis) or return;
+    shutdown($conn->socket, 2) if $conn->socket;
 }
 
 # Feed bytes directly into the parser, bypassing the socket. Useful
 # for exercising the reader's decode/dispatch path with a crafted frame.
 sub inject_unexpected_frame {
     my ($redis, $raw_bytes) = @_;
-    $redis->{parser}->parse($raw_bytes) if $redis->{parser};
+    my $conn = current_connection($redis) or return;
+    $conn->parser->parse($raw_bytes) if $conn->parser;
 }
 
-# Synthesize a fatal timeout directly. Routes through the detach-first
-# _reader_fatal path so the typed Async::Redis::Error::Timeout is
-# propagated to all inflight futures (not a generic cancellation).
+# Synthesize a fatal timeout directly. Fails the current connection the
+# way its reader does, so the typed Async::Redis::Error::Timeout reaches
+# all inflight futures (not a generic cancellation).
 sub force_read_timeout {
     my ($redis) = @_;
     require Async::Redis::Error::Timeout;
-    $redis->_reader_fatal(Async::Redis::Error::Timeout->new(
+    current_connection($redis)->_fail(Async::Redis::Error::Timeout->new(
         message => "synthetic timeout for test",
         timeout => 0,
     ));
+}
+
+# The client's current Async::Redis::Connection, or undef.
+sub current_connection {
+    my ($redis) = @_;
+    return $redis->{_connection};
+}
+
+# Install a socketpair-backed connection as $redis's current one, for unit
+# tests that need a connected client without Redis. Returns ($conn, $peer);
+# the test plays the server on $peer.
+sub fake_connection {
+    my ($redis, %opt) = @_;
+    socketpair(my $mine, my $peer, AF_UNIX, SOCK_STREAM, PF_UNSPEC)
+        or die "socketpair: $!";
+    $mine->blocking(0);
+    $peer->blocking(0);
+    my $conn = Async::Redis::Connection->new(client => $redis, socket => $mine);
+    $redis->{_connection} = $conn;
+    $redis->{connected}   = $opt{connected} // 1;
+    return ($conn, $peer);
 }
 
 1;
@@ -272,8 +298,8 @@ Test::Async::Redis - Test utilities for Async::Redis
 
 =head1 DESCRIPTION
 
-Test utilities for Async::Redis using async/await. Uses Future::IO's
-built-in default implementation (IO::Poll based) for event loop management.
+Test utilities for Async::Redis using async/await. Runs the suite on
+L<Future::IO::Impl::IOAsync> unless a Future::IO impl is already loaded.
 
 =head1 FUNCTIONS
 
@@ -333,10 +359,20 @@ or malformed frame without needing a live server to send it.
 
 =item force_read_timeout($redis)
 
-Synthesize a fatal timeout by calling C<_reader_fatal> with a typed
-C<Async::Redis::Error::Timeout> object. All inflight futures receive
-the typed error via the detach-first path rather than generic
-cancellation.
+Synthesize a fatal timeout by failing the current connection with a
+typed C<Async::Redis::Error::Timeout> object, as its reader does on a
+deadline. All inflight futures receive the typed error rather than a
+generic cancellation.
+
+=item current_connection($redis)
+
+The client's current L<Async::Redis::Connection>, or undef.
+
+=item fake_connection($redis, %opt)
+
+Install a socketpair-backed connection as the client's current one and
+return C<($conn, $peer)>; the test plays the server on C<$peer>. The
+client counts as connected unless C<< connected =E<gt> 0 >> is passed.
 
 =back
 

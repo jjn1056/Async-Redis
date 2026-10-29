@@ -2,13 +2,17 @@ use strict;
 use warnings;
 use Test2::V0;
 use Test::Lib;
-use Test::Async::Redis ();   # selects the suite's Future::IO event loop
+use Test::Async::Redis qw(current_connection);
 use Future::AsyncAwait;
 use Async::Redis;
 
 plan skip_all => 'REDIS_HOST not set' unless $ENV{REDIS_HOST};
 
 subtest 'wrong password dies with typed error, connected remains 0' => sub {
+    my @made;
+    my $orig = \&Async::Redis::Connection::new;
+    no warnings 'redefine';
+    local *Async::Redis::Connection::new = sub { push @made, $orig->(@_); $made[-1] };
     (async sub {
         my $c = Async::Redis->new(
             host     => $ENV{REDIS_HOST},
@@ -19,9 +23,10 @@ subtest 'wrong password dies with typed error, connected remains 0' => sub {
         my $err = $@ unless $ok;
         ok !$ok, 'connect died';
         isa_ok $err, ['Async::Redis::Error'], 'typed error';
-        is $c->{connected},    0, 'connected == 0';
-        is $c->{_socket_live}, 0, '_socket_live == 0';
-        ok !$c->{socket},         'socket torn down';
+        is $c->is_connected, 0, 'connected == 0';
+        ok !current_connection($c), 'no current connection';
+        is scalar(@made), 1, 'one connection was made';
+        ok $made[0]->is_closed, 'and torn down';
     })->()->get;
 };
 
@@ -34,7 +39,8 @@ subtest 'invalid SELECT db dies with typed error, connected remains 0' => sub {
         );
         my $ok = eval { await $c->connect; 1 };
         ok !$ok, 'connect died on SELECT';
-        is $c->{connected}, 0, 'connected == 0 after handshake failure';
+        is $c->is_connected, 0, 'connected == 0 after handshake failure';
+        ok !current_connection($c), 'no current connection';
     })->()->get;
 };
 

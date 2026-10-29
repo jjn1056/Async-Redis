@@ -7,18 +7,27 @@ use 5.018;
 use Future;
 use Future::AsyncAwait;
 use Future::IO;
+use Scalar::Util qw(weaken);
 use Async::Redis::Error::Disconnected;
 
 sub new {
     my ($class, %args) = @_;
 
-    return bless {
+    my $self = bless {
         redis         => $args{redis},
+        connection    => $args{connection},
         max_depth     => $args{max_depth} // 1000,
         _queue        => [],
         _flush_pending => 0,
         _flushing     => 0,
     }, $class;
+
+    # The connection owns this auto-pipeline, and the client owns the
+    # connection.
+    weaken($self->{redis});
+    weaken($self->{connection});
+
+    return $self;
 }
 
 sub command {
@@ -76,8 +85,8 @@ sub _do_flush {
 }
 
 # Detach and return all queued-but-not-yet-flushed commands. Caller is
-# responsible for failing their futures. Called by Async::Redis::_reader_fatal
-# when the connection dies before a scheduled flush.
+# responsible for failing their futures. Called by the connection's close
+# when it closes before a scheduled flush.
 sub _detach_queued {
     my ($self) = @_;
     my $queued = $self->{_queue} // [];
@@ -89,47 +98,35 @@ sub _detach_queued {
 sub _send_batch {
     my ($self, $batch) = @_;
     my $redis = $self->{redis};
+    my $conn  = $self->{connection};
 
-    my @commands = map { $_->{cmd}    } @$batch;
-    my @futures  = map { $_->{future} } @$batch;
+    my @futures = map { $_->{future} } @$batch;
 
-    my $submit = (async sub {
+    my $submit;
+    if ($redis && $conn) {
         my $buffer = '';
-        my @deadlines;
-        for my $cmd (@commands) {
+        my @entries;
+        for my $queued (@$batch) {
+            my $cmd = $queued->{cmd};
             $buffer .= $redis->_build_command(@$cmd);
-            push @deadlines, $redis->_calculate_deadline(@$cmd);
+            push @entries, {
+                future      => $queued->{future},
+                cmd         => $cmd->[0],
+                args        => [ @{$cmd}[1 .. $#$cmd] ],
+                deadline    => $redis->_calculate_deadline(@$cmd),
+                redis_error => 'fail',
+            };
         }
+        $submit = $conn->submit($buffer, \@entries);
+    }
+    else {
+        $submit = Future->fail(Async::Redis::Error::Disconnected->new(
+            message => "Not connected",
+        ));
+    }
 
-        await $redis->_with_write_gate(sub {
-            return (async sub {
-                if (!$redis->{_socket_live}) {
-                    if ($redis->_reconnect_enabled) {
-                        await $redis->_ensure_connected;
-                    } else {
-                        die Async::Redis::Error::Disconnected->new(
-                            message => "Not connected",
-                        );
-                    }
-                }
-                for my $i (0 .. $#commands) {
-                    $redis->_add_inflight(
-                        $futures[$i],
-                        $commands[$i][0],
-                        [ @{$commands[$i]}[1..$#{$commands[$i]}] ],
-                        $deadlines[$i],
-                        'fail',
-                    );
-                }
-                await $redis->_send($buffer);
-            })->();
-        });
-
-        $redis->_ensure_reader;
-    })->();
-
-    # Transport failure on submit cascades to every future that wasn't
-    # already failed by _reader_fatal.
+    # A submit failure (the connection closed, or the write failed) reaches
+    # every future in the batch the connection did not already fail.
     $submit->on_fail(sub {
         my ($err) = @_;
         for my $f (@futures) {
@@ -138,9 +135,8 @@ sub _send_batch {
     });
 
     # Ownership: the client's Future::Selector (_tasks) holds this submit
-    # task, so no ->retain is needed. A submit failure reaches callers
-    # through the on_fail above, which fails every future in the batch.
-    $redis->{_tasks}->add(data => 'autopipe-submit', f => $submit);
+    # task, so no ->retain is needed.
+    $redis->{_tasks}->add(data => 'autopipe-submit', f => $submit) if $redis;
 }
 
 1;

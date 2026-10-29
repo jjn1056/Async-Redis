@@ -22,7 +22,7 @@ use strict;
 use warnings;
 use Test2::V0;
 use Test::Lib;
-use Test::Async::Redis qw(skip_without_redis run);
+use Test::Async::Redis qw(skip_without_redis run current_connection);
 
 # Ignore SIGPIPE — this test deliberately closes sockets while writes are pending
 $SIG{PIPE} = 'IGNORE';
@@ -44,7 +44,8 @@ SKIP: {
         my $blocking_future = $r->blpop('nonexistent:key:for:close:test', 1);
 
         # Get the socket fileno before disconnect
-        my $fileno_before = fileno($r->{socket});
+        my $conn = current_connection($r);
+        my $fileno_before = fileno($conn->socket);
         ok(defined $fileno_before, "socket has valid fileno before disconnect: $fileno_before");
 
         # Now disconnect while the BLPOP is still waiting
@@ -53,7 +54,8 @@ SKIP: {
         $r->disconnect;
 
         # The socket should be gone now
-        ok(!defined $r->{socket}, 'socket is undef after disconnect');
+        ok(!current_connection($r), 'the client holds no connection after disconnect');
+        ok($conn->is_closed, 'the old connection is closed');
 
         # Wait a moment for any async cleanup to propagate
         run { Future::IO->sleep(0.1) };

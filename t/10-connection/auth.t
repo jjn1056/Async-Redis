@@ -2,7 +2,7 @@
 use strict;
 use warnings;
 use Test::Lib;
-use Test::Async::Redis ':redis';
+use Test::Async::Redis ':redis', 'current_connection';
 use Test2::V0;
 use Async::Redis;
 
@@ -119,10 +119,9 @@ SKIP: {
         # Set key in db 2
         run { $redis->set('auth:reconnect:key', 'val') };
 
-        # Force disconnect (simulate what _reader_fatal does)
-        close $redis->{socket};
-        $redis->{connected}    = 0;
-        $redis->{_socket_live} = 0;
+        # Drop the connection the way its reader does on a stream failure
+        current_connection($redis)->_fail(
+            Async::Redis::Error::Connection->new(message => 'simulated drop'));
 
         # Command should reconnect and still be in db 2
         my $val = run { $redis->get('auth:reconnect:key') };

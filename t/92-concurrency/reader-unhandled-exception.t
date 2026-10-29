@@ -12,11 +12,11 @@ use Async::Redis;
 plan skip_all => 'REDIS_HOST not set' unless $ENV{REDIS_HOST};
 
 # If the reader task dies with an unhandled exception (a coding bug that
-# bypasses _run_reader's explicit _reader_fatal paths), the failure MUST
+# bypasses the reader's explicit stream-failure paths), the failure MUST
 # reach awaiting callers as a typed error. Otherwise inflight response
 # futures are never failed and the caller waits forever while the client
-# still reports connected=1. _ensure_reader routes a failed reader into
-# _reader_fatal, which fails every inflight entry.
+# still reports connected=1. The connection routes a failed reader into
+# its own close, which fails every inflight entry.
 
 subtest 'reader unhandled exception propagates to awaiting caller' => sub {
     my @reader_warnings;
@@ -33,7 +33,7 @@ subtest 'reader unhandled exception propagates to awaiting caller' => sub {
 
         # Monkey-patch _decode_response_result to die unhandled on its next
         # call. Simulates an arbitrary coding bug in the reader's frame
-        # processing that escapes _reader_fatal routing.
+        # processing that escapes the reader's failure routing.
         my $orig  = \&Async::Redis::_decode_response_result;
         my $armed = 1;
         {

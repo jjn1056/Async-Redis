@@ -1,10 +1,5 @@
 # t/10-connection/socket-cleanup.t
 # Tests for proper socket cleanup and future cancellation
-#
-# NOTE: Future::IO::Impl::IOAsync has known issues with cancellation that cause
-# warnings and incomplete cleanup. LeoNerd is aware and working on fixes.
-# These tests verify basic functionality and document expected behavior.
-# Once upstream is fixed, we can tighten assertions.
 use strict;
 use warnings;
 use Test::Lib;
@@ -88,12 +83,7 @@ subtest 'rapid connect disconnect cycles' => sub {
     # Give event loop a chance to process
     run { Future::IO->sleep(0.05) };
 
-    # Filter known warnings from Future::IO backend issues
-    my @unexpected = grep {
-        !/Unhandled rejection|cancelled|lost its returning future|uninitialized/
-    } @warnings;
-
-    is(\@unexpected, [], 'no unexpected warnings after rapid connect/disconnect cycles');
+    is(\@warnings, [], 'no warnings after rapid connect/disconnect cycles');
 };
 
 subtest 'disconnect cancels inflight futures' => sub {
@@ -151,12 +141,7 @@ subtest 'object destruction without pending commands' => sub {
     # Give event loop a chance to process
     run { Future::IO->sleep(0.05) };
 
-    # Filter known warnings
-    my @unexpected = grep {
-        !/Unhandled rejection|cancelled|DESTROY|lost its returning future|uninitialized/
-    } @warnings;
-
-    is(\@unexpected, [], 'no unexpected warnings on object destruction');
+    is(\@warnings, [], 'no warnings on object destruction');
 };
 
 done_testing;

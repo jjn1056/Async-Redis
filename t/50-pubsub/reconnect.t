@@ -5,7 +5,7 @@
 use strict;
 use warnings;
 use Test::Lib;
-use Test::Async::Redis qw(run skip_without_redis await_f);
+use Test::Async::Redis qw(run skip_without_redis await_f fake_connection);
 use Future::AsyncAwait;
 use Test2::V0;
 use Async::Redis;
@@ -38,16 +38,15 @@ subtest 'get_replay_commands returns correct commands' => sub {
     is($psub_cmd->[1], 'events.*', 'PSUBSCRIBE has correct pattern');
 };
 
-subtest '_reset_connection clears in_pubsub flag' => sub {
+subtest 'a lost connection clears in_pubsub' => sub {
     my $redis = Async::Redis->new(host => 'localhost');
+    my ($conn) = fake_connection($redis);
+    $redis->_set_in_pubsub(1);
+    ok($redis->in_pubsub, 'in_pubsub set on the current connection');
 
-    $redis->{in_pubsub} = 1;
-    $redis->{connected} = 1;
-    $redis->{socket} = undef;
+    $conn->_fail(Async::Redis::Error::Connection->new(message => 'test'));
 
-    $redis->_reset_connection('test');
-
-    is($redis->{in_pubsub}, 0, 'in_pubsub cleared after reset');
+    is($redis->in_pubsub, 0, 'in_pubsub cleared once the connection is lost');
 };
 
 subtest 'on_reconnect accessor' => sub {
@@ -147,7 +146,7 @@ subtest '_reconnect cap is per reconnect cycle, not permanent client poison' => 
 };
 
 # Reconnect exhaustion routing lives in t/50-pubsub/reconnect-handoff.t,
-# which drives it through _reader_fatal and _reconnect_async.
+# which drives it through a failing connection and _reconnect_async.
 
 # --- Integration tests (require Redis) ---
 
@@ -167,9 +166,9 @@ SKIP: {
 
     # Helper: simulate a dropped connection by having the publisher
     # CLIENT KILL the subscriber. Server-side close → kernel delivers
-    # EOF on our still-valid fd → reader sees 0 bytes → _reader_fatal
-    # fires cleanly. Matches how a real peer-initiated disconnect works,
-    # whereas `close $sub_redis->{socket}` leaves a stale poller in
+    # EOF on our still-valid fd → reader sees 0 bytes → the connection
+    # fails cleanly. Matches how a real peer-initiated disconnect works,
+    # whereas close() on the socket leaves a stale poller in
     # Future::IO's select loop with undef fileno, which gets coerced to
     # fd 0 (STDIN) and deadlocks select in a TTY context.
     #

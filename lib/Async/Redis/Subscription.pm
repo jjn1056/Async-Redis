@@ -515,7 +515,7 @@ async sub _resume_after_reconnect {
 
     # Set in_pubsub before issuing any commands so the unified reader
     # classifies incoming message frames correctly (mirrors subscribe timing).
-    $redis->{in_pubsub} = 1;
+    $redis->_set_in_pubsub(1);
 
     my @channels = keys %{$self->{channels}};
     my @patterns = keys %{$self->{patterns}};

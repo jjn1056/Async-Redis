@@ -95,7 +95,7 @@ subtest 'synthetic EOF mid-pipeline fails all pipeline entries with typed error'
         my $ok = eval { await $pipe_f; 1 };
         ok !$ok || _array_has_error(($pipe_f->is_done ? [$pipe_f->get] : [])),
             'pipeline ended with failure or inline error objects';
-        is $r->{connected}, 0, 'connection marked disconnected';
+        is $r->is_connected, 0, 'connection marked disconnected';
     })->()->get;
 };
 

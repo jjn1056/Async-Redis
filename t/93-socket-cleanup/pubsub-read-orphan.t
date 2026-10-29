@@ -3,8 +3,8 @@
 # Guards socket teardown for a connection parked in a pub/sub read.
 #
 # Under the unified single-reader model, Subscription::next does not read the
-# socket itself: it awaits _dequeue on a queue fed by _run_reader, and
-# _run_reader registers its Future::IO->read in _current_read_future.
+# socket itself: it awaits _dequeue on a queue fed by the connection's reader,
+# and the reader registers its Future::IO->read on the connection (read_f).
 # disconnect() depends on that registration to cancel the in-flight read
 # BEFORE closing the socket, while fileno is still valid. Closing first would
 # leave Future::IO holding a watcher on a dead descriptor, which corrupts the
@@ -25,7 +25,7 @@ use strict;
 use warnings;
 use Test2::V0;
 use Test::Lib;
-use Test::Async::Redis qw(skip_without_redis run);
+use Test::Async::Redis qw(skip_without_redis run current_connection);
 use Future::AsyncAwait;
 
 # This test deliberately closes a socket with a pending read.
@@ -52,17 +52,19 @@ SKIP: {
         my $next_f = $sub->next;
         ok(!$next_f->is_ready, 'pub/sub next() is pending before disconnect');
 
-        my $fileno_before = fileno($r->{socket});
+        my $conn = current_connection($r);
+        my $fileno_before = fileno($conn->socket);
         ok(defined $fileno_before, "socket has valid fileno before disconnect");
 
         # The read disconnect() must cancel while the fileno is still valid.
-        my $read_f = $r->{_current_read_future};
+        my $read_f = $conn->{read_f};
         ok($read_f && !$read_f->is_ready,
            'reader registered its in-flight read for disconnect to cancel');
 
         # Disconnect while the read is in flight.
         $r->disconnect;
-        ok(!defined $r->{socket}, 'socket undef after disconnect');
+        ok(!current_connection($r), 'the client holds no connection after disconnect');
+        ok($conn->is_closed, 'the old connection is closed');
         ok($read_f->is_cancelled, 'in-flight read cancelled before socket close');
 
         # Drive the loop so any cleanup / watcher teardown propagates.

@@ -72,7 +72,7 @@ subtest 'NULL handling' => sub {
 
 subtest 'disconnect' => sub {
     $redis->disconnect;
-    ok !$redis->{connected}, 'disconnected';
+    ok !$redis->is_connected, 'disconnected';
 };
 
 done_testing;

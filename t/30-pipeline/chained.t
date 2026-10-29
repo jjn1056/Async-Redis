@@ -55,10 +55,10 @@ SKIP: {
         my $pipe = $redis->pipeline;
 
         my $ret = $pipe->set('chain:x', 1);
-        is($ret, $pipe, 'set returns pipeline');
+        ref_is($ret, $pipe, 'set returns pipeline');
 
         $ret = $pipe->get('chain:x');
-        is($ret, $pipe, 'get returns pipeline');
+        ref_is($ret, $pipe, 'get returns pipeline');
 
         run { $pipe->execute };
         run { $redis->del('chain:x') };

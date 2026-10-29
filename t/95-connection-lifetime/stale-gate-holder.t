@@ -27,55 +27,53 @@ sub new_reconnecting {
 SKIP: {
     my $redis = skip_without_redis();
 
-    todo 'connection lifetime (Plan B)' => sub {
-        subtest 'B3: a stale write holder cannot fail the new connection' => sub {
-            my @failures;
-            for my $i (1 .. 15) {
-                my $r = new_reconnecting();
-                run { $r->connect };
-                my $fa = $r->command('SET', 'lt:a', 'a');   # holds the gate
-                $r->disconnect;
-                my $fb = $r->command('SET', 'lt:b', 'b');   # reconnects
-                settle($fa);
-                push @failures, "iteration $i: " . failure_of($fb)
-                    unless settle($fb) eq 'done';
-                eval { $r->disconnect };
-            }
-            is \@failures, [], 'the new connection\'s command succeeds every time';
-        };
-
-        subtest 'B4: write gate stays exclusive across disconnect' => sub {
-            my @log;
-            no warnings 'redefine';
-            my $orig = \&Async::Redis::_send;
-            local *Async::Redis::_send = sub {
-                my (undef, $data) = @_;
-                my ($tag) = $data =~ /(lt:gate:[abc])/;
-                $tag //= 'other';
-                push @log, "enter $tag";
-                my $f = $orig->(@_);
-                $f->on_ready(sub { push @log, "exit $tag" });
-                return $f;
-            };
-
+    subtest 'B3: a stale write holder cannot fail the new connection' => sub {
+        my @failures;
+        for my $i (1 .. 15) {
             my $r = new_reconnecting();
             run { $r->connect };
-            my $fa = $r->command('SET', 'lt:gate:a', 'a');   # in progress
+            my $fa = $r->command('SET', 'lt:a', 'a');   # holds the gate
             $r->disconnect;
-            my $fb = $r->command('SET', 'lt:gate:b', 'b');   # takes the gate, reconnects
-            Future::IO->sleep(0)->get;                        # one loop turn
-            my $fc = $r->command('SET', 'lt:gate:c', 'c');   # must queue behind B
-            settle($_) for $fa, $fb, $fc;
-
-            my ($b_exit)  = grep { $log[$_] eq 'exit lt:gate:b'  } 0 .. $#log;
-            my ($c_enter) = grep { $log[$_] eq 'enter lt:gate:c' } 0 .. $#log;
-            ok defined $b_exit && defined $c_enter, 'both B and C wrote'
-                or diag "send log: @log";
-            ok defined $b_exit && defined $c_enter && $c_enter > $b_exit,
-                'C did not start writing until B finished'
-                or diag "send log: @log";
+            my $fb = $r->command('SET', 'lt:b', 'b');   # reconnects
+            settle($fa);
+            push @failures, "iteration $i: " . failure_of($fb)
+                unless settle($fb) eq 'done';
             eval { $r->disconnect };
+        }
+        is \@failures, [], 'the new connection\'s command succeeds every time';
+    };
+
+    subtest 'B4: write gate stays exclusive across disconnect' => sub {
+        my @log;
+        no warnings 'redefine';
+        my $orig = \&Async::Redis::Connection::_send;
+        local *Async::Redis::Connection::_send = sub {
+            my (undef, $data) = @_;
+            my ($tag) = $data =~ /(lt:gate:[abc])/;
+            $tag //= 'other';
+            push @log, "enter $tag";
+            my $f = $orig->(@_);
+            $f->on_ready(sub { push @log, "exit $tag" });
+            return $f;
         };
+
+        my $r = new_reconnecting();
+        run { $r->connect };
+        my $fa = $r->command('SET', 'lt:gate:a', 'a');   # in progress
+        $r->disconnect;
+        my $fb = $r->command('SET', 'lt:gate:b', 'b');   # takes the gate, reconnects
+        Future::IO->sleep(0)->get;                        # one loop turn
+        my $fc = $r->command('SET', 'lt:gate:c', 'c');   # must queue behind B
+        settle($_) for $fa, $fb, $fc;
+
+        my ($b_exit)  = grep { $log[$_] eq 'exit lt:gate:b'  } 0 .. $#log;
+        my ($c_enter) = grep { $log[$_] eq 'enter lt:gate:c' } 0 .. $#log;
+        ok defined $b_exit && defined $c_enter, 'both B and C wrote'
+            or diag "send log: @log";
+        ok defined $b_exit && defined $c_enter && $c_enter > $b_exit,
+            'C did not start writing until B finished'
+            or diag "send log: @log";
+        eval { $r->disconnect };
     };
 
     cleanup_keys($redis, 'lt:*');
