@@ -96,6 +96,19 @@ SKIP: {
         eval { $r->disconnect };
     };
 
+    subtest 'disconnect aborts a connect in progress' => sub {
+        my $connects = 0;
+        my $r = Async::Redis->new(%base, on_connect => sub { $connects++ });
+        my $c = $r->connect;
+        $r->disconnect;                     # no loop turn in between
+        is settle($c), 'failed', 'the connect fails';
+        isa_ok failure_of($c), 'Async::Redis::Error::Disconnected';
+        run { Future::IO->sleep(0.1) };     # time for a stray attempt to finish
+        ok !$r->is_connected, 'the client stays disconnected';
+        is $connects, 0, 'on_connect never fired';
+        eval { $r->disconnect };
+    };
+
     eval { $admin->disconnect };
     cleanup_keys($redis, 'lt:*');
 }

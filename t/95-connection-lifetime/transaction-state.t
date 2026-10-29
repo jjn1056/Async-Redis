@@ -17,7 +17,7 @@ $SIG{PIPE} = 'IGNORE';
 SKIP: {
     my $redis = skip_without_redis();
 
-    todo 'connection lifetime (Plan B)' => sub {
+    todo 'connection lifetime (Plan C)' => sub {
         subtest 'B7: transaction flags reset on a new connection' => sub {
             my $r = Async::Redis->new(host => $ENV{REDIS_HOST} // 'localhost');
             run { $r->connect };

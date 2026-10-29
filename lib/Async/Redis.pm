@@ -242,12 +242,28 @@ async sub connect {
         $attempt = $self->{_connect_future} = $self->_open_connection;
         weaken(my $weak_self = $self);
         $attempt->on_ready(sub {
-            $weak_self->{_connect_future} = undef if $weak_self;
+            $weak_self->{_connect_future} = undef
+                if $weak_self && $weak_self->{_connect_future}
+                && refaddr($weak_self->{_connect_future}) == refaddr($attempt);
         });
     }
-    await $attempt;
+    await _await_attempt($attempt);
 
     return $self;
+}
+
+# Free function. Wait for a shared attempt (a connect or a reconnect)
+# without letting this waiter's cancellation cancel it for everyone else.
+# An attempt cancelled by disconnect is reported as the client's error.
+async sub _await_attempt {
+    my ($attempt) = @_;
+    my $ok  = eval { await $attempt->without_cancel; 1 };
+    my $err = $@;
+    return if $ok;
+    die Async::Redis::Error::Disconnected->new(
+        message => "Client disconnect",
+    ) if $attempt->is_cancelled;
+    die $err;
 }
 
 async sub _open_connection {
@@ -446,9 +462,7 @@ sub is_connected {
 # rather than failed; and there is no reconnect handoff.
 sub disconnect {
     my ($self) = @_;
-    my $conn = $self->{_connection};
-    return $self unless $conn || $self->{connected};
-
+    my $conn          = $self->{_connection};
     my $was_connected = $self->{connected};
 
     # Close the subscription first, so nothing reached while closing the
@@ -457,9 +471,11 @@ sub disconnect {
         $sub->_close unless $sub->is_closed;
     }
 
-    # A reconnect must not bring the client back up after this.
-    if (my $rf = delete $self->{_reconnect_future}) {
-        $rf->cancel unless $rf->is_ready;
+    # A reconnect or connect still in progress must not bring the client
+    # back up after this. Their waiters fail with "Client disconnect".
+    for my $slot (qw(_reconnect_future _connect_future)) {
+        my $attempt = delete $self->{$slot} or next;
+        $attempt->cancel unless $attempt->is_ready;
     }
 
     $self->{_connection} = undef;
@@ -841,7 +857,7 @@ async sub _ensure_connected {
                 && refaddr($self->{_reconnect_future}) == refaddr($f);
         });
     }
-    await $f;
+    await _await_attempt($f);
 }
 
 # Asynchronously reconnect after a pubsub connection drop. Called by
