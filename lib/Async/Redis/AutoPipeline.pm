@@ -137,9 +137,9 @@ sub _send_batch {
         }
     });
 
-    # Ownership: the client's Future::Selector (_tasks) owns this submit
-    # task. Any caller currently awaiting inside run_until_ready sees a
-    # submit failure propagated via the selector. No ->retain needed.
+    # Ownership: the client's Future::Selector (_tasks) holds this submit
+    # task, so no ->retain is needed. A submit failure reaches callers
+    # through the on_fail above, which fails every future in the batch.
     $redis->{_tasks}->add(data => 'autopipe-submit', f => $submit);
 }
 

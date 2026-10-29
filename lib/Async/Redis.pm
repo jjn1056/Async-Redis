@@ -779,16 +779,29 @@ async sub _run_reader {
 # a second source of truth about ownership, only a "is one already running?"
 # flag that's cheap to check without peeking at selector internals.
 #
-# Failure propagation: because the reader is in the selector, any awaiting
-# caller using $self->{_tasks}->run_until_ready($their_future) will see the
-# reader's failure propagated to them. That's the structured-concurrency
-# guarantee — no hanging callers when the reader dies unhandled.
+# Failure propagation: every handled failure inside _run_reader already goes
+# through _reader_fatal. A reader that dies unhandled (a coding bug) is
+# routed there too, so whatever kind of submission is waiting — a command,
+# a pipeline, an auto-pipelined command, a pubsub command — sees a typed
+# error rather than waiting forever.
 sub _ensure_reader {
     my ($self) = @_;
     return if $self->{_reader_running};
     $self->{_reader_running} = 1;
     my $f = $self->_run_reader;
     $f->on_ready(sub { $self->{_reader_running} = 0 });
+    $f->on_fail(sub {
+        my ($err) = @_;
+        chomp(my $reason = "$err");
+        my $typed = (ref $err && eval { $err->isa('Async::Redis::Error') })
+            ? $err
+            : Async::Redis::Error::Connection->new(
+                message => "Reader failed: $reason",
+                host    => $self->{host},
+                port    => $self->{port},
+            );
+        $self->_reader_fatal($typed);
+    });
     $self->{_tasks}->add(data => 'reader', f => $f);
     return;
 }
@@ -1040,9 +1053,9 @@ async sub _reconnect {
 # reconnect. Concurrent callers share it. The slot is the shared-await
 # signal, NOT the ownership — ownership lives in $self->{_tasks}.
 #
-# Structured-concurrency: the reconnect task is added to the selector
-# so any caller currently awaiting via run_until_ready sees reconnect
-# failures propagated.
+# Failure reporting: every caller awaits the shared reconnect future
+# directly, so a failed reconnect reaches each of them. The selector only
+# holds the task.
 #
 # NOTE: dedup is race-safe only when called from inside the write
 # gate (which serialises callers). Outside the gate, a failed reconnect
@@ -1181,12 +1194,12 @@ async sub command {
         # _with_write_gate already called _reader_fatal on write failure.
     } else {
         $self->_ensure_reader;
-        # run_until_ready awaits $response while the selector pumps the
-        # reader (and any other adopted tasks). If any selector task fails
-        # unhandled — in particular, the reader — the failure propagates
-        # here, so callers never hang waiting on a dead reader.
+        # Wait on this command's own reply only, so no other command's
+        # outcome can reach this caller. A reader that dies, for any
+        # reason, fails every inflight entry (see _ensure_reader), so this
+        # never waits on a dead reader.
         my $await_ok = eval {
-            $result = await $self->{_tasks}->run_until_ready($response);
+            $result = await $response;
             1;
         };
         if (!$await_ok) { $error = $@ }
@@ -3060,43 +3073,21 @@ allow more messages to buffer locally before the reader pauses.
 
 =head1 TASK LIFECYCLE
 
-Async::Redis organizes all fire-and-forget background work (the socket
+Async::Redis holds all fire-and-forget background work (the socket
 reader, reconnect attempts, auto-pipeline submit batches, the pubsub
-callback driver) under a single per-client L<Future::Selector> instance,
-following Paul Evans's client pattern from L<Sys::Async::Virt> and
-L<IPC::MicroSocket>.
+callback driver) in a per-client L<Future::Selector> instance, so no
+background task can be garbage-collected while it is still running.
 
-Each background task is registered with the selector via
-C<< $selector->add(data => $label, f => $task_future) >>. Command
-execution awaits responses via
-C<< $selector->run_until_ready($response_future) >>, which pumps the
-selector and propagates any task failure to the awaiting caller. The
-practical guarantee: if a background task dies (including from a
-coding bug that escapes explicit fatal-error handling), awaiting
-callers see a typed failure rather than hanging forever.
+Each caller waits on the future for its own request and nothing else. A
+Redis error in one command's reply is reported to that command alone; it
+never reaches another command, a pipeline, or a later connection.
 
-This structure provides the five structured-concurrency properties
-articulated by the L<trio|https://trio.readthedocs.io/> /
-L<asyncio.TaskGroup|https://docs.python.org/3/library/asyncio-task.html#task-groups>
-ecosystems:
-
-=over
-
-=item * GC safety - every background task is held by the selector.
-
-=item * Error propagation - any task's failure reaches callers awaiting
-the selector via C<run_until_ready>.
-
-=item * Cancellation - socket closure propagates to pending I/O, which
-fails the owning task, which the selector propagates.
-
-=item * Scope cleanup - C<disconnect> tears down state; remaining selector
-tasks unwind via their existing on_fail handlers.
-
-=item * Local reasoning - all concurrent work on one connection is owned
-by one place.
-
-=back
+Failures that end the connection reach every request still waiting on it.
+When the reader hits a read error, a timeout, a protocol error, or dies
+from an unexpected exception, every request awaiting a reply on that
+connection fails with a typed L<Async::Redis::Error>. Pipelines report it
+in each result slot; subscriptions report it through C<next> or
+C<on_error>, or reconnect when C<reconnect> is enabled.
 
 There is no user-facing API for the selector; it is internal
 machinery. Clients should not call C<< $redis->{_tasks} >> directly.
@@ -3104,8 +3095,8 @@ machinery. Clients should not call C<< $redis->{_tasks} >> directly.
 I<Note:> the only use of C<< Future->retain >> in this codebase is
 avoided in favor of selector ownership. Any patch that introduces
 C<< ->retain >> on an Async::Redis-owned Future should instead add
-the task to C<< $self->{_tasks} >> so failure propagation and lifetime
-ownership are consistent.
+the task to C<< $self->{_tasks} >> so task lifetimes stay owned in one
+place.
 
 =head1 KNOWN LIMITATIONS
 

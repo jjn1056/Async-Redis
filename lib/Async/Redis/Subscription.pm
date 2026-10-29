@@ -297,8 +297,8 @@ sub _dispatch_frame {
 #
 # Exits cleanly when _dequeue returns undef (subscription closed or
 # paused for reconnect). Dies with the typed error if _dequeue dies
-# (fatal); _run_driver's Future failure is visible through the
-# client's Future::Selector to any caller using run_until_ready.
+# (fatal); by then _fail_fatal has already reported that error through
+# on_error, or died, so the driver's own failure carries nothing new.
 #
 # Periodic sleep(0) yield every MAX_SYNC_DEPTH iterations prevents
 # stack growth when messages are pre-queued and await returns

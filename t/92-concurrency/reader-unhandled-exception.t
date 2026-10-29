@@ -11,19 +11,12 @@ use Async::Redis;
 
 plan skip_all => 'REDIS_HOST not set' unless $ENV{REDIS_HOST};
 
-# Regression guard for the structured-concurrency contract: if the reader
-# task dies with an unhandled exception (a coding bug that bypasses
-# _run_reader's explicit _reader_fatal paths), the failure MUST propagate
-# to awaiting callers.
-#
-# Before the selector adoption: the reader Future failed, _ensure_reader's
-# on_ready cleared _reader_future silently, inflight response futures were
-# never failed, and await $response hung forever with connected=1.
-#
-# After: the reader task is owned by $self->{_tasks} (Future::Selector).
-# _execute_command awaits responses via $tasks->run_until_ready, which
-# propagates any in-scope task failure to the caller. A reader crash
-# becomes a caller-visible typed error.
+# If the reader task dies with an unhandled exception (a coding bug that
+# bypasses _run_reader's explicit _reader_fatal paths), the failure MUST
+# reach awaiting callers as a typed error. Otherwise inflight response
+# futures are never failed and the caller waits forever while the client
+# still reports connected=1. _ensure_reader routes a failed reader into
+# _reader_fatal, which fails every inflight entry.
 
 subtest 'reader unhandled exception propagates to awaiting caller' => sub {
     (async sub {
@@ -53,9 +46,8 @@ subtest 'reader unhandled exception propagates to awaiting caller' => sub {
         }
 
         # Issue a command. The reader will try to decode its response,
-        # hit the injected die, and the reader task in the selector will
-        # fail. run_until_ready inside _execute_command propagates that
-        # failure to the awaiting caller.
+        # hit the injected die, and fail; the reader's failure fails this
+        # command's inflight entry.
         my $set_f = $r->set('reader_exc_test', 'after');
 
         # Callback-based outcome capture (avoid rethrow via await).

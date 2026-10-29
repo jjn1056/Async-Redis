@@ -63,75 +63,93 @@ SKIP: {
         return ($hold, $lpush, $ping);
     }
 
-    todo 'replies share the client selector' => sub {
-        subtest "B9: one command's Redis error does not fail a concurrent command" => sub {
-            my $r = new_client(); run { $r->connect };
-            my ($hold, $lpush, $ping) = issue_error_with_bystander($r);
-            settle($_) for $hold, $lpush, $ping;
+    subtest "B9: one command's Redis error does not fail a concurrent command" => sub {
+        my $r = new_client(); run { $r->connect };
+        my ($hold, $lpush, $ping) = issue_error_with_bystander($r);
+        settle($_) for $hold, $lpush, $ping;
 
-            is settle($lpush), 'failed', 'LPUSH on a string fails';
-            like "" . (failure_of($lpush) // ''), qr/WRONGTYPE/, 'with WRONGTYPE';
-            is settle($ping), 'done', 'the concurrent PING is unaffected';
-            is scalar($ping->is_done ? $ping->get : undef), 'PONG', 'and returns PONG';
-            eval { $r->disconnect };
-        };
-
-        subtest "B8: a disconnect's leftover failure does not reach the next connection" => sub {
-            my $r = new_client(); run { $r->connect };
-            run { $r->del('iso:missing:a', 'iso:missing:b') };
-            my $fa = $r->command('BLPOP', 'iso:missing:a', '5');
-            my $fb = $r->command('BLPOP', 'iso:missing:b', '5');
-            run { Future::IO->sleep(0.2) };
-            $r->disconnect;
-            is settle($fa), 'failed', 'first BLPOP fails on disconnect';
-            is settle($fb), 'failed', 'second BLPOP fails on disconnect';
-
-            run { $r->connect };
-            my $ping = $r->command('PING');
-            is settle($ping), 'done', 'PING on the new connection succeeds';
-            note 'PING failed with: ' . failure_of($ping) if $ping->is_failed;
-            eval { $r->disconnect };
-        };
-
-        subtest 'one failure among many' => sub {
-            my $r = new_client(); run { $r->connect };
-            run { $r->set('iso:str', 'x') };
-            run { $r->del('iso:none') };
-            my $hold = $r->command('BLPOP', 'iso:none', '0.2');
-            my $lpush = $r->command('LPUSH', 'iso:str', 'y');
-            my @pings = map { $r->command('PING') } 1 .. 49;
-
-            settle($_) for $hold, $lpush, @pings;
-            is settle($lpush), 'failed', 'the LPUSH fails';
-            is scalar(grep { $_->is_done } @pings), 49, 'all 49 PINGs succeed';
-            eval { $r->disconnect };
-        };
-
-        subtest 'B11: reader crash fails a pipeline instead of hanging' => sub {
-            my $r = new_client(); run { $r->connect };
-            run { $r->set('iso:k', 'v') };
-            my $guard = arm_reader_bug();
-            my $pipe = $r->pipeline;
-            $pipe->get('iso:k');
-            my $f = $pipe->execute;
-            is settle($f), 'failed', 'pipeline fails (not hung, not done)';
-            undef $guard;
-            eval { $r->disconnect };
-        };
-
-        subtest 'B11: reader crash fails an auto-pipelined command instead of hanging' => sub {
-            my $r = new_client(auto_pipeline => 1); run { $r->connect };
-            run { $r->set('iso:k', 'v') };
-            my $guard = arm_reader_bug();
-            my $f = $r->get('iso:k');
-            is settle($f), 'failed', 'auto-pipelined GET fails (not hung, not done)';
-            undef $guard;
-            eval { $r->disconnect };
-        };
+        is settle($lpush), 'failed', 'LPUSH on a string fails';
+        like "" . (failure_of($lpush) // ''), qr/WRONGTYPE/, 'with WRONGTYPE';
+        is settle($ping), 'done', 'the concurrent PING is unaffected';
+        is scalar($ping->is_done ? $ping->get : undef), 'PONG', 'and returns PONG';
+        eval { $r->disconnect };
     };
 
-    # Guards: these hold today and must keep holding once replies stop going
-    # through the selector.
+    subtest "B8: a disconnect's leftover failure does not reach the next connection" => sub {
+        my $r = new_client(); run { $r->connect };
+        run { $r->del('iso:missing:a', 'iso:missing:b') };
+        my $fa = $r->command('BLPOP', 'iso:missing:a', '5');
+        my $fb = $r->command('BLPOP', 'iso:missing:b', '5');
+        run { Future::IO->sleep(0.2) };
+        $r->disconnect;
+        is settle($fa), 'failed', 'first BLPOP fails on disconnect';
+        is settle($fb), 'failed', 'second BLPOP fails on disconnect';
+
+        run { $r->connect };
+        my $ping = $r->command('PING');
+        is settle($ping), 'done', 'PING on the new connection succeeds';
+        note 'PING failed with: ' . failure_of($ping) if $ping->is_failed;
+        eval { $r->disconnect };
+    };
+
+    subtest 'one failure among many' => sub {
+        my $r = new_client(); run { $r->connect };
+        run { $r->set('iso:str', 'x') };
+        run { $r->del('iso:none') };
+        my $hold = $r->command('BLPOP', 'iso:none', '0.2');
+        my $lpush = $r->command('LPUSH', 'iso:str', 'y');
+        my @pings = map { $r->command('PING') } 1 .. 49;
+
+        settle($_) for $hold, $lpush, @pings;
+        is settle($lpush), 'failed', 'the LPUSH fails';
+        is scalar(grep { $_->is_done } @pings), 49, 'all 49 PINGs succeed';
+        eval { $r->disconnect };
+    };
+
+    subtest 'B11: reader crash ends a pipeline instead of hanging' => sub {
+        my $r = new_client(); run { $r->connect };
+        run { $r->set('iso:k', 'v') };
+        my $guard = arm_reader_bug();
+        my $pipe = $r->pipeline;
+        $pipe->get('iso:k');
+        $pipe->get('iso:k');
+        my $f = $pipe->execute;
+        # A pipeline reports transport failures per slot and still completes.
+        is settle($f), 'done', 'pipeline completes instead of hanging';
+        my $slots = $f->is_done ? $f->get : [];
+        is scalar(@$slots), 2, 'one result per command';
+        isa_ok $_, 'Async::Redis::Error::Connection' for @$slots;
+        undef $guard;
+        eval { $r->disconnect };
+    };
+
+    subtest 'B11: reader crash fails an auto-pipelined command instead of hanging' => sub {
+        my $r = new_client(auto_pipeline => 1); run { $r->connect };
+        run { $r->set('iso:k', 'v') };
+        my $guard = arm_reader_bug();
+        my $f = $r->get('iso:k');
+        is settle($f), 'failed', 'auto-pipelined GET fails (not hung, not done)';
+        undef $guard;
+        eval { $r->disconnect };
+    };
+
+    subtest 'reader crash while subscribed does not hang' => sub {
+        my $sub_redis = new_client(reconnect => 0); run { $sub_redis->connect };
+        my $pub = new_client(); run { $pub->connect };
+        my $sub = run { $sub_redis->subscribe('iso:chan') };
+
+        my $guard = arm_reader_bug();
+        my $next  = $sub->next;
+        my $published = $pub->publish('iso:chan', 'hello');
+        is settle($next), 'failed', 'blocked next() fails (not hung, not delivered)';
+        isa_ok failure_of($next), 'Async::Redis::Error';
+        settle($published);
+        undef $guard;
+        eval { $pub->disconnect };
+        eval { $sub_redis->disconnect };
+    };
+
+    # Errors stay with the caller that owns them.
 
     subtest 'own error is unchanged' => sub {
         my $r = new_client(); run { $r->connect };

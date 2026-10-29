@@ -1,6 +1,21 @@
 Revision history for Async-Redis
 
 Unreleased
+    - Bug Fix: one command's error could fail other commands
+        - A Redis error in one command's reply (for example WRONGTYPE)
+          could fail an unrelated command in flight at the same time
+        - A failure left over from a closed connection could fail the
+          first command on the next connection
+        - Each command now waits on its own reply. Replies no longer go
+          through the client-wide Future::Selector, which reverses that
+          part of 0.002000's structured-concurrency contract (signed off
+          by John 2026-10-29)
+    - Bug Fix: a reader crash no longer leaves requests waiting forever
+        - If the reader died from an unexpected exception, pipelines,
+          auto-pipelined commands and a blocked subscription next() never
+          completed; only plain commands saw the error
+        - The reader's failure now fails every request still waiting on
+          that connection with a typed Async::Redis::Error::Connection
     - Test suite: runs on Future::IO::Impl::IOAsync (reverses 0.001006)
         - 0.001006 moved the suite onto Future::IO's built-in default impl
           because load_impl('IOAsync') failed on Future::IO 0.22+. That

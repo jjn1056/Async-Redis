@@ -15,11 +15,10 @@ local $SIG{PIPE} = 'IGNORE';
 
 plan skip_all => 'REDIS_HOST not set' unless $ENV{REDIS_HOST};
 
-# Structured-concurrency invariants for the Future::Selector-backed
-# task ownership model. Complements reader-unhandled-exception.t and
-# existing pubsub/reconnect tests by covering whole-lifecycle
-# properties: task failure reaches awaiting callers, disconnect under
-# load closes cleanly, reconnect cycles don't leak state.
+# Whole-lifecycle invariants for background-task ownership. Complements
+# reader-unhandled-exception.t and the pubsub/reconnect tests: a reader
+# failure reaches the callers waiting on that connection, disconnect under
+# load closes cleanly, and reconnect cycles don't leak state.
 
 sub new_redis {
     Async::Redis->new(
@@ -28,16 +27,10 @@ sub new_redis {
     );
 }
 
-subtest 'task failure reaches awaiting caller (generic structured-concurrency property)' => sub {
-    # This is the broader sibling of reader-unhandled-exception.t: any
-    # fire-and-forget task failure, not just reader bugs, should reach
-    # a concurrent caller that's inside run_until_ready.
-    #
-    # We drive this by monkey-patching _decode_response_result (same
-    # as the reader test) but verify against a COMMAND that doesn't
-    # need the reader to respond — a pure write-only submit. The
-    # selector propagates the reader task's failure to the command's
-    # awaiting future via run_until_ready.
+subtest 'reader failure reaches the waiting caller' => sub {
+    # Drives a reader failure by monkey-patching _decode_response_result
+    # (same as reader-unhandled-exception.t) and checks the GET waiting on
+    # that reply fails rather than hanging or completing.
 
     (async sub {
         my $r = new_redis();
@@ -58,8 +51,7 @@ subtest 'task failure reaches awaiting caller (generic structured-concurrency pr
         }
 
         # Issue a read (GET); the reader will try to decode the response,
-        # hit the trap, and fail. The selector propagates that failure
-        # to our awaiting run_until_ready.
+        # hit the trap, and fail; that fails this GET's inflight entry.
         my $outcome;
         my $done = Future->new;
         my $get_f = $r->get('sel_inv_key');
