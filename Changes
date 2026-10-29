@@ -1,5 +1,30 @@
 Revision history for Async-Redis
 
+Unreleased
+    - Test suite: runs on Future::IO::Impl::IOAsync (reverses 0.001006)
+        - 0.001006 moved the suite onto Future::IO's built-in default impl
+          because load_impl('IOAsync') failed on Future::IO 0.22+. That
+          failure no longer occurs: IO-Async 0.805 implements poll and
+          load_impl('IOAsync') succeeds on Future::IO 0.23.
+        - Future::IO documents its default impl as supporting a single
+          filehandle; the suite opens several connections at once, and
+          the default impl's poll loop in 0.23 crashes when a completing
+          read cancels its siblings. t/03-pubsub.t failed 25-43% of runs.
+        - New test-phase requirement: Future::IO::Impl::IOAsync 0.805
+          (ships in IO-Async). Async::Redis itself stays loop-agnostic.
+        - Reversal signed off by John 2026-10-29.
+    - Docs: the default Future::IO impl is described as suitable for a
+      single connection only; pub/sub, pools and multiple clients should
+      load a real implementation
+    - Docs: reconnect_max_attempts no longer refers to an internal path
+      that was removed; exhaustion reaches subscribers as a fatal
+      subscription error
+    - Internal: removed the superseded pub/sub read path
+      (_read_response, _read_pubsub_frame, _read_pubsub_message,
+      _reconnect_pubsub, _send_command, _read_frame_with_reconnect)
+    - Tests: reconnect handoff coverage (reconnect-handoff.t) and a
+      regression test for disconnect with a pending pub/sub read
+
 0.002000  2026-04-26
     - Architectural: unified single-reader socket ownership model
         - One reader loop dispatches frames to inflight queue or active
