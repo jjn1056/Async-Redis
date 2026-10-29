@@ -1,6 +1,8 @@
 use strict;
 use warnings;
 use Test2::V0;
+use Test::Lib;
+use Test::Async::Redis ();   # selects the suite's Future::IO event loop
 use Scalar::Util qw(refaddr);
 use Future::AsyncAwait;
 use Async::Redis;

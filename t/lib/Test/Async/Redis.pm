@@ -6,6 +6,13 @@ use parent 'Exporter';
 use Future::AsyncAwait;
 use Test2::V0;
 use Future::IO;
+
+# Run the suite on a real event loop. Future::IO's built-in default impl
+# documents support for a single filehandle only, and these tests open
+# several connections at once. An impl the caller already chose (for
+# example via PERL5OPT) is left in place.
+require Future::IO::Impl::IOAsync unless defined $Future::IO::IMPL;
+
 use Async::Redis;
 
 our @EXPORT_OK = qw(

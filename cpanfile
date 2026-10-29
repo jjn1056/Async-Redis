@@ -19,6 +19,7 @@ suggests 'OpenTelemetry::SDK';     # Observability integration
 on 'test' => sub {
     requires 'Test2::V0';
     requires 'Test::Lib';
+    requires 'Future::IO::Impl::IOAsync', '0.805';  # ships in IO-Async
 };
 
 # Development dependencies

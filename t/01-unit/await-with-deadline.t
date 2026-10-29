@@ -1,6 +1,8 @@
 use strict;
 use warnings;
 use Test2::V0;
+use Test::Lib;
+use Test::Async::Redis ();   # selects the suite's Future::IO event loop
 use Future::AsyncAwait;
 use Future::IO;
 use Future;
