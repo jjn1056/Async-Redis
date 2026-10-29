@@ -38,7 +38,10 @@ Unreleased
           blocked on the server (BLPOP with no timeout) left the subscribe
           call itself hanging
         - The subscribe call now fails with
-          Async::Redis::Error::Disconnected ("Not connected")
+          Async::Redis::Error::Disconnected ("Not connected"), with or
+          without reconnect enabled; call subscribe again to retry
+        - Closing the connection fires on_disconnect, with the timeout
+          error as the reason (previously nothing fired)
         - Signed off by John 2026-10-29
     - Bug Fix: one command's error could fail other commands
         - A Redis error in one command's reply (for example WRONGTYPE)

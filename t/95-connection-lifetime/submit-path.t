@@ -8,7 +8,8 @@ use strict;
 use warnings;
 use Test2::V0;
 use Test::Lib;
-use Test::Async::Redis qw(run settle failure_of skip_without_redis cleanup_keys);
+use Test::Async::Redis qw(run settle failure_of inject_eof skip_without_redis cleanup_keys);
+use Future::IO;
 use Scalar::Util qw(refaddr);
 use Async::Redis;
 
@@ -106,6 +107,51 @@ SKIP: {
         run { Future::IO->sleep(0.1) };     # time for a stray attempt to finish
         ok !$r->is_connected, 'the client stays disconnected';
         is $connects, 0, 'on_connect never fired';
+        eval { $r->disconnect };
+    };
+
+    # A failed command's continuation runs while the connection is being
+    # torn down. By then the client must already be disconnected, so that
+    # a retry or a connect from there makes a new connection.
+    subtest 'a retry from a failed command\'s continuation reconnects' => sub {
+        my $r = Async::Redis->new(%base, reconnect => 1, reconnect_delay => 0.01);
+        run { $r->connect };
+        run { $r->set('lt:sp:retry', 'v') };
+        run { $r->del('lt:missing') };
+
+        my ($seen_connected, $retry);
+        my $blpop = $r->command('BLPOP', 'lt:missing', '1');
+        $blpop->on_fail(sub {
+            $seen_connected = $r->is_connected;
+            $retry          = $r->get('lt:sp:retry');
+        });
+        run { Future::IO->sleep(0.05) };
+        inject_eof($r);
+
+        is settle($blpop), 'failed', 'the command fails with the connection';
+        is $seen_connected, 0, 'the client is already disconnected in the continuation';
+        is settle($retry), 'done', 'the retry succeeds'
+            or diag 'retry failed with: ' . failure_of($retry);
+        is $retry->get, 'v', 'on a new connection' if $retry->is_done;
+        eval { $r->disconnect };
+    };
+
+    subtest 'connect from a failure callback makes a new connection' => sub {
+        my $r = Async::Redis->new(%base, reconnect => 0);
+        run { $r->connect };
+        run { $r->del('lt:missing') };
+
+        my $reconnect;
+        my $blpop = $r->command('BLPOP', 'lt:missing', '1');
+        $blpop->on_fail(sub { $reconnect = $r->connect });
+        run { Future::IO->sleep(0.05) };
+        inject_eof($r);
+
+        is settle($blpop), 'failed', 'the command fails with the connection';
+        is settle($reconnect), 'done', 'connect completes';
+        ok $r->is_connected, 'the client is connected again';
+        my $ping = $r->command('PING');
+        is settle($ping), 'done', 'and usable';
         eval { $r->disconnect };
     };
 

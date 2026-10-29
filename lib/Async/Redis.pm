@@ -525,9 +525,11 @@ async sub _connection {
         // die Async::Redis::Error::Disconnected->new(message => "Not connected");
 }
 
-# A connection reports that it failed and has closed itself. Only the
-# current connection's loss changes the client; a connection that is no
-# longer current already belongs to the past.
+# A connection reports that it failed. Only the current connection's loss
+# changes the client; a connection that is no longer current already
+# belongs to the past. The client is disconnected before the connection is
+# closed, so the callers that closing wakes see it disconnected, as they do
+# after disconnect().
 sub _connection_lost {
     my ($self, $conn, $err) = @_;
     my $current = $self->{_connection};
@@ -538,6 +540,7 @@ sub _connection_lost {
 
     $self->{_connection} = undef;
     $self->{connected}   = 0;
+    $conn->close($err);
 
     if ($conn->in_pubsub && $subscription) {
         if ($self->_reconnect_enabled) {

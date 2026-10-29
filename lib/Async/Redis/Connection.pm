@@ -153,14 +153,17 @@ sub close {
     return;
 }
 
-# Close with $err and tell the client this connection is gone. The client
-# is told once, by whichever failure closed the connection.
+# Tell the client this connection is gone, and close it with $err. The
+# client is told once, by whichever failure ends the connection, and is
+# told before the close: closing runs the waiting callers' code, which must
+# already see the client disconnected (so a retry there reconnects).
 sub _fail {
     my ($self, $err) = @_;
     return if $self->{closed};
+    if (my $client = $self->{client}) {
+        $client->_connection_lost($self, $err);
+    }
     $self->close($err);
-    my $client = $self->{client} or return;
-    $client->_connection_lost($self, $err);
     return;
 }
 
@@ -460,8 +463,10 @@ In order, it:
 
 =back
 
-C<_fail($err)> closes the connection and then reports the loss to the
-client, once. The reader uses it for every stream failure (EOF, read
+C<_fail($err)> reports the loss to the client, once, and closes the
+connection. The client disconnects itself and then closes the
+connection, so the callers that closing wakes already see the client
+disconnected. The reader uses it for every stream failure (EOF, read
 error, deadline, protocol error), and C<submit> for a write failure.
 
 =head2 Fork
