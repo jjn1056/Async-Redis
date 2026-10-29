@@ -2529,10 +2529,16 @@ Operation attempted on disconnected client.
 
 =head1 FORK SAFETY
 
-Async::Redis is fork-safe. When a fork is detected, the child
-process will automatically invalidate its connection state and
-reconnect when needed. The parent retains ownership of the original
-connection.
+Async::Redis is fork-safe. A connection belongs to the process that
+made it. When a child uses an inherited client, it drops the parent's
+connection without touching it and, with C<reconnect> enabled, makes a
+new connection of its own; without C<reconnect> the command fails with
+L<Async::Redis::Error::Disconnected>.
+
+A child that never uses the client cannot affect the parent's
+connection either: when the child exits, or drops its copy of the
+client, the inherited socket is left alone. A pre-fork server can
+connect in the parent and fork workers freely.
 
 =head1 EVENT LOOP CONFIGURATION
 
@@ -2641,10 +2647,19 @@ allow more messages to buffer locally before the reader pauses.
 
 =head1 TASK LIFECYCLE
 
-Async::Redis holds all fire-and-forget background work (the socket
-reader, reconnect attempts, auto-pipeline submit batches, the pubsub
-callback driver) in a per-client L<Future::Selector> instance, so no
-background task can be garbage-collected while it is still running.
+Each connection owns the work started on it: its socket reader, its
+pending read and write, its write queue and its auto-pipeline. When a
+connection ends, for any reason, one close ends all of that work and
+fails every request still waiting on it. Work left over from a closed
+connection holds that closed connection, so it cannot affect a later
+one: an old reader cannot time out a new connection, and an interrupted
+write cannot fail a new connection's commands.
+
+Background work that spans connections (reconnect attempts,
+auto-pipeline submit batches, the pubsub callback driver) is held in a
+per-client L<Future::Selector> instance, so no background task can be
+garbage-collected while it is still running. C<disconnect> cancels a
+reconnect or connect that is still in progress.
 
 Each caller waits on the future for its own request and nothing else. A
 Redis error in one command's reply is reported to that command alone; it

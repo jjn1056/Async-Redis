@@ -1,6 +1,44 @@
 Revision history for Async-Redis
 
 Unreleased
+    - Bug Fix: a reconnected client could be broken by its old connection
+        - A reader left over from before a disconnect could fire its old
+          timeout on the new connection, failing its next command with
+          "Not connected"
+        - A write still in progress at disconnect could later fail the new
+          connection's commands, or let two writers interleave on it
+        - Each connection now owns its reader, its pending read and write
+          and its write queue, and one close ends all of them. Work left
+          over from a closed connection can no longer touch the next one
+    - Bug Fix: disconnect() during a reconnect or connect stays disconnected
+        - Previously a reconnect already under way carried on, and the
+          client came back up after a deliberate disconnect
+        - Commands waiting on that reconnect, and a connect() still in
+          progress, now fail with Async::Redis::Error::Disconnected
+          ("Client disconnect")
+    - Bug Fix: a command interrupted mid-write by disconnect() reports
+      Async::Redis::Error::Disconnected ("Client disconnect"), as
+      documented, instead of Connection "Write failed: Broken pipe"; and
+      dropping such a command's future no longer warns "lost its
+      returning future"
+    - Bug Fix: a forked child no longer breaks the parent's connection
+        - A child that exited, or dropped its copy of the client, without
+          using it shut down the shared socket; the parent's next command
+          failed with "Write failed: syswrite: Broken pipe". This affected
+          pre-fork servers that connect before forking
+    - Bug Fix: concurrent connect() calls share one attempt
+        - Previously each call opened its own connection and on_connect
+          fired once per call
+    - Behaviour change: if subscribe(), psubscribe() or ssubscribe() times
+      out waiting for in-flight commands to finish, those commands now
+      fail with Async::Redis::Error::Timeout and the connection is closed
+        - Previously they failed with a plain string error and the
+          connection stayed open while their replies were still due, so
+          those replies arrived with nothing to match them. A command
+          blocked on the server (BLPOP with no timeout) left the subscribe
+          call itself hanging
+        - The subscribe call now fails with
+          Async::Redis::Error::Disconnected ("Not connected")
     - Bug Fix: one command's error could fail other commands
         - A Redis error in one command's reply (for example WRONGTYPE)
           could fail an unrelated command in flight at the same time

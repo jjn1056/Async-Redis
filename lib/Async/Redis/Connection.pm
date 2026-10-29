@@ -415,4 +415,59 @@ Async::Redis::Connection - One Redis connection and everything started on it
 
 Internal to L<Async::Redis>; not a public API.
 
+A connection owns one socket and all the state and work that exist only
+while that socket does: the RESP parser, the inflight queue, the write
+gate, the reader task, the reader's pending read, the pending write,
+whether it is in pub/sub mode, the pid of the process that made it, and
+(when C<auto_pipeline> is on) its auto-pipeline.
+
+The client holds at most one current connection and reaches the network
+only through it. A submitter takes the current connection once and does
+all its work on that object, so work left over from a closed connection
+can only ever act on that closed connection.
+
+The connection holds its client weakly. It uses the client to decode
+replies, to dispatch pub/sub messages, and to report its own loss
+(C<_connection_lost>), which the client ignores for any connection that
+is no longer current.
+
+=head2 Submitting
+
+C<submit($raw, \@entries)> waits for the write gate, registers the
+entries in the inflight queue, writes C<$raw>, and starts the reader.
+Registering before writing keeps inflight order equal to wire order,
+which is how each reply is matched to its caller. If the connection is
+closed before or during the write, C<submit> fails with the close error.
+
+=head2 Closing
+
+C<close($err)> is the only teardown. It is idempotent and never throws.
+In order, it:
+
+=over 4
+
+=item 1. marks the connection closed, so every later C<submit> fails with C<$err>;
+
+=item 2. detaches the inflight entries and the auto-pipeline's queued commands;
+
+=item 3. cancels the pending read, the pending write and the reader, while the socket's fileno is still valid;
+
+=item 4. fails the write gate, so submitters holding or waiting on it unwind with C<$err>;
+
+=item 5. shuts the socket down (never C<close()>; the handle closes when it is freed);
+
+=item 6. fails every detached entry with C<$err>.
+
+=back
+
+C<_fail($err)> closes the connection and then reports the loss to the
+client, once. The reader uses it for every stream failure (EOF, read
+error, deadline, protocol error), and C<submit> for a write failure.
+
+=head2 Fork
+
+In a process other than the one that made it, C<close> and C<DESTROY>
+only drop references: no cancel, no shutdown. The socket is shared with
+the parent, and shutting it down would end the parent's connection.
+
 =cut
