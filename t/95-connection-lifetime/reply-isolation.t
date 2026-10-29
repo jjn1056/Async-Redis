@@ -10,32 +10,25 @@ use strict;
 use warnings;
 use Test2::V0;
 use Test::Lib;
-use Test::Async::Redis qw(run with_timeout skip_without_redis cleanup_keys);
+use Test::Async::Redis qw(run settle failure_of skip_without_redis cleanup_keys);
 use Future::AsyncAwait;
 use Future::IO;
 use Future;
 use Async::Redis;
+use Scalar::Util qw(refaddr);
 
 $SIG{PIPE} = 'IGNORE';
 
-# Wait up to $secs for $f without cancelling it; report how it ended.
-sub settle {
-    my ($f, $secs) = @_;
-    eval { run { with_timeout($secs // 2, $f->without_cancel) } };
-    return 'timeout' unless $f->is_ready;
-    return $f->is_failed ? 'failed' : 'done';
-}
-
-sub failure_of { my ($f) = @_; return $f->is_failed ? ($f->failure)[0] : undef }
-
-# Make the reader's next decode die, as an unhandled coding bug would.
-# Returns a guard that restores the original when it goes out of scope.
+# Make $target's reader die on its next decode, as an unhandled coding bug
+# would. Other clients are unaffected, so a publisher in the same test cannot
+# consume the trap. Returns a guard that restores the original when it goes out of scope.
 sub arm_reader_bug {
+    my ($target) = @_;
     my $orig  = \&Async::Redis::_decode_response_result;
     my $armed = 1;
     no warnings 'redefine';
     *Async::Redis::_decode_response_result = sub {
-        if ($armed) { $armed = 0; die "INJECTED_READER_BUG\n" }
+        if ($armed && refaddr($_[0]) == refaddr($target)) { $armed = 0; die "INJECTED_READER_BUG\n" }
         return $orig->(@_);
     };
     return bless sub { no warnings 'redefine'; *Async::Redis::_decode_response_result = $orig },
@@ -109,7 +102,7 @@ SKIP: {
     subtest 'B11: reader crash ends a pipeline instead of hanging' => sub {
         my $r = new_client(); run { $r->connect };
         run { $r->set('iso:k', 'v') };
-        my $guard = arm_reader_bug();
+        my $guard = arm_reader_bug($r);
         my $pipe = $r->pipeline;
         $pipe->get('iso:k');
         $pipe->get('iso:k');
@@ -126,7 +119,7 @@ SKIP: {
     subtest 'B11: reader crash fails an auto-pipelined command instead of hanging' => sub {
         my $r = new_client(auto_pipeline => 1); run { $r->connect };
         run { $r->set('iso:k', 'v') };
-        my $guard = arm_reader_bug();
+        my $guard = arm_reader_bug($r);
         my $f = $r->get('iso:k');
         is settle($f), 'failed', 'auto-pipelined GET fails (not hung, not done)';
         undef $guard;
@@ -138,7 +131,7 @@ SKIP: {
         my $pub = new_client(); run { $pub->connect };
         my $sub = run { $sub_redis->subscribe('iso:chan') };
 
-        my $guard = arm_reader_bug();
+        my $guard = arm_reader_bug($sub_redis);
         my $next  = $sub->next;
         my $published = $pub->publish('iso:chan', 'hello');
         is settle($next), 'failed', 'blocked next() fails (not hung, not delivered)';

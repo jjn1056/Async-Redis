@@ -21,6 +21,8 @@ our @EXPORT_OK = qw(
     skip_without_redis
     cleanup_keys
     with_timeout
+    settle
+    failure_of
     fails_with
     delay
     redis_host
@@ -153,6 +155,21 @@ async sub with_timeout {
         Future->fail("Test timeout after ${timeout}s");
     });
     return await Future->wait_any($future, $timeout_f);
+}
+
+# Wait up to $secs (default 2) for $f without cancelling it, and report how
+# it ended: 'done', 'failed', or 'timeout'.
+sub settle {
+    my ($f, $secs) = @_;
+    eval { run { with_timeout($secs // 2, $f->without_cancel) } };
+    return 'timeout' unless $f->is_ready;
+    return $f->is_failed ? 'failed' : 'done';
+}
+
+# The failure value of a failed future, else undef.
+sub failure_of {
+    my ($f) = @_;
+    return $f->is_failed ? ($f->failure)[0] : undef;
 }
 
 # Assert Future fails with specific error type
