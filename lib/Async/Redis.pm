@@ -405,11 +405,8 @@ async sub _redis_handshake {
         push @auth_args, $self->{username} if defined $self->{username};
         push @auth_args, $self->{password};
 
-        my $cmd = $self->_build_command(@auth_args);
-        await $conn->_send($cmd);
-
-        my $response = await $self->_read_response_with_deadline($conn, $deadline, ['AUTH']);
-        my $result = $self->_decode_response($response);
+        my $result = await $self->_handshake_command(
+            $conn, $deadline, 'fail', ['AUTH'], @auth_args);
 
         # AUTH returns OK on success, throws on failure
         unless ($result && $result eq 'OK') {
@@ -422,11 +419,9 @@ async sub _redis_handshake {
 
     # SELECT database
     if ($self->{database} && $self->{database} != 0) {
-        my $cmd = $self->_build_command('SELECT', $self->{database});
-        await $conn->_send($cmd);
-
-        my $response = await $self->_read_response_with_deadline($conn, $deadline, ['SELECT', $self->{database}]);
-        my $result = $self->_decode_response($response);
+        my $result = await $self->_handshake_command(
+            $conn, $deadline, 'fail', ['SELECT', $self->{database}],
+            'SELECT', $self->{database});
 
         unless ($result && $result eq 'OK') {
             die Async::Redis::Error::Redis->new(
@@ -436,14 +431,29 @@ async sub _redis_handshake {
         }
     }
 
-    # CLIENT SETNAME
+    # CLIENT SETNAME. Its result is ignored: a failed SETNAME shouldn't
+    # prevent the connection.
     if (defined $self->{client_name} && length $self->{client_name}) {
-        my $cmd = $self->_build_command('CLIENT', 'SETNAME', $self->{client_name});
-        await $conn->_send($cmd);
-
-        my $response = await $self->_read_response_with_deadline($conn, $deadline, ['CLIENT', 'SETNAME']);
-        # Ignore result - SETNAME failing shouldn't prevent connection
+        await $self->_handshake_command(
+            $conn, $deadline, 'capture', ['CLIENT', 'SETNAME'],
+            'CLIENT', 'SETNAME', $self->{client_name});
     }
+}
+
+# Send one handshake command on $conn and return its reply, read by the
+# connection's own reader. $shown is what a timeout reports as the
+# command, so a password never appears in an error.
+async sub _handshake_command {
+    my ($self, $conn, $deadline, $redis_error, $shown, @command) = @_;
+    my $reply = Future->new;
+    await $conn->submit($self->_build_command(@command), [{
+        future      => $reply,
+        cmd         => $command[0],
+        args        => $shown,
+        deadline    => $deadline,
+        redis_error => $redis_error,
+    }]);
+    return await $reply;
 }
 
 # Check if connected to Redis
@@ -994,121 +1004,10 @@ async sub command {
     return $result;
 }
 
-# Read one handshake reply from $conn, by $deadline. On any failure the
-# connection is closed with the error, then the error is thrown.
-async sub _read_response_with_deadline {
-    my ($self, $conn, $deadline, $cmd_ref) = @_;
-
-    my $parser = $conn->parser;
-
-    # First check if parser already has a complete message
-    if (my $msg = $parser->get_message) {
-        return $msg;
-    }
-
-    my $fail = sub {
-        my ($err) = @_;
-        $conn->close($err);
-        die $err;
-    };
-    my $timeout_error = sub {
-        Async::Redis::Error::Timeout->new(
-            message        => "Request timed out after $self->{request_timeout}s",
-            command        => $cmd_ref,
-            timeout        => $self->{request_timeout},
-            maybe_executed => 1,  # already sent the command
-        );
-    };
-
-    # Read until we get a complete message
-    while (1) {
-        my $remaining = $deadline - Time::HiRes::time();
-        $fail->($timeout_error->()) if $remaining <= 0;
-
-        # Tracked on the connection so close can cancel it.
-        my $read_f = Future::IO->read($conn->socket, 65536);
-        $conn->{read_f} = $read_f;
-
-        my $timeout_f = Future::IO->sleep($remaining)->then(sub {
-            return Future->fail('read_timeout');
-        });
-
-        my $wait_f = Future->wait_any($read_f, $timeout_f);
-        await $wait_f;
-
-        $conn->{read_f} = undef;
-
-        # Check if read was cancelled (by disconnect)
-        if ($read_f->is_cancelled) {
-            die Async::Redis::Error::Disconnected->new(
-                message => "Disconnected during read",
-            );
-        }
-
-        if ($wait_f->is_failed) {
-            my ($error) = $wait_f->failure;
-            $fail->($timeout_error->()) if $error eq 'read_timeout';
-            $fail->(Async::Redis::Error::Connection->new(
-                message => "$error",
-            ));
-        }
-
-        # Get the read result
-        my $buf = $wait_f->get;
-
-        # EOF
-        if (!defined $buf || length($buf) == 0) {
-            $fail->(Async::Redis::Error::Connection->new(
-                message => "Connection closed by server",
-            ));
-        }
-
-        $parser->parse($buf);
-
-        if (my $msg = $parser->get_message) {
-            return $msg;
-        }
-    }
-}
-
 # Is reconnect enabled for this client?
 sub _reconnect_enabled {
     my ($self) = @_;
     return !!$self->{reconnect};
-}
-
-# Decode Protocol::Redis response to Perl value
-sub _decode_response {
-    my ($self, $msg) = @_;
-
-    return undef unless $msg;
-
-    my $type = $msg->{type};
-    my $data = $msg->{data};
-
-    # Simple string (+)
-    if ($type eq '+') {
-        return $data;
-    }
-    # Error (-)
-    elsif ($type eq '-') {
-        die Async::Redis::Error::Redis->from_message($data);
-    }
-    # Integer (:)
-    elsif ($type eq ':') {
-        return 0 + $data;
-    }
-    # Bulk string ($)
-    elsif ($type eq '$') {
-        return $data;  # undef for null bulk
-    }
-    # Array (*)
-    elsif ($type eq '*') {
-        return undef unless defined $data;  # null array
-        return [ map { $self->_decode_response($_) } @$data ];
-    }
-
-    return $data;
 }
 
 # Non-throwing decoder used by the unified reader. Classifies each frame
