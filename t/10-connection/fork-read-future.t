@@ -86,4 +86,17 @@ subtest 'stale future not cancelled after fork' => sub {
     stop($s);
 };
 
+subtest 'a fork releases a transaction pin' => sub {
+    my $c = Async::Redis->new(host => 'localhost');
+    my ($conn, $peer) = fake_connection($c);
+    $conn->{in_multi}              = 1;
+    $c->{_transaction_connection}  = $conn;
+    ok $c->in_multi, 'in MULTI on the parent\'s connection';
+    $conn->{pid} = $$ + 99999;
+
+    ok $c->_check_fork, '_check_fork detected the fork';
+    ok !$c->{_transaction_connection}, 'the child is no longer pinned';
+    is $c->in_multi, 0, 'and not in MULTI';
+};
+
 done_testing;

@@ -6,6 +6,7 @@ use Test::Async::Redis ':redis';
 use Future::AsyncAwait;
 use Test2::V0;
 use Async::Redis::Pool;
+use Future::IO;
 use Future;
 
 SKIP: {
@@ -153,6 +154,51 @@ SKIP: {
         ok(!$conn->is_dirty, 'connection is clean');
 
         $pool->release($conn);
+    };
+
+    subtest 'cleanup mode discards a transaction and keeps the client' => sub {
+        my $pool = Async::Redis::Pool->new(
+            host     => $ENV{REDIS_HOST} // 'localhost',
+            on_dirty => 'cleanup',
+        );
+
+        my $conn = run { $pool->acquire };
+        run { $conn->multi_start };
+        $pool->release($conn);
+        run { Future::IO->sleep(0.2) };     # cleanup runs asynchronously
+
+        is($pool->stats->{destroyed}, 0, 'nothing destroyed');
+        my $again = run { $pool->acquire };
+        ref_is($again, $conn, 'the same client comes back');
+        ok(!$again->in_multi, 'not in MULTI');
+        is(run { $again->ping }, 'PONG', 'and usable');
+        $pool->release($again);
+    };
+
+    subtest 'pool discards a client whose transaction connection dropped' => sub {
+        for my $mode (qw(destroy cleanup)) {
+            my $pool = Async::Redis::Pool->new(
+                host     => $ENV{REDIS_HOST} // 'localhost',
+                on_dirty => $mode,
+            );
+            my $admin = Async::Redis->new(host => $ENV{REDIS_HOST} // 'localhost');
+            run { $admin->connect };
+
+            my $conn = run { $pool->acquire };
+            my $id   = run { $conn->client('ID') };
+            run { $conn->multi_start };
+            run { $admin->client('KILL', 'ID', $id) };
+            eval { run { $conn->ping } };    # notices the drop
+            $pool->release($conn);
+            run { Future::IO->sleep(0.2) };
+
+            is($pool->stats->{destroyed}, 1, "$mode: the client is destroyed");
+            my $next = run { $pool->acquire };
+            ok(!$next->in_multi, "$mode: the next client is not in MULTI");
+            is(run { $next->ping }, 'PONG', "$mode: and usable");
+            $pool->release($next);
+            $admin->disconnect;
+        }
     };
 }
 

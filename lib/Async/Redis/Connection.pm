@@ -28,6 +28,11 @@ sub new {
         close_error   => undef,
         in_pubsub     => 0,
 
+        # Server-side transaction state of this connection: MULTI open,
+        # keys watched. A new connection starts with neither.
+        in_multi      => 0,
+        watching      => 0,
+
         # Entry: { future, cmd, args, deadline, redis_error, sent_at }
         inflight      => [],
 

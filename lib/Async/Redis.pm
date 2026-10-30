@@ -194,9 +194,10 @@ sub new {
             $d;
         },
 
-        # Transaction state
-        in_multi => 0,
-        watching => 0,
+        # The connection an open WATCH/MULTI is pinned to (see _connection),
+        # and whether multi() is collecting commands.
+        _transaction_connection => undef,
+        _collecting_transaction => 0,
 
         # PubSub state
         _subscription => undef,
@@ -481,6 +482,9 @@ sub disconnect {
         $sub->_close unless $sub->is_closed;
     }
 
+    # disconnect ends any open transaction.
+    delete $self->{_transaction_connection};
+
     # A reconnect or connect still in progress must not bring the client
     # back up after this. Their waiters fail with "Client disconnect".
     for my $slot (qw(_reconnect_future _connect_future)) {
@@ -519,9 +523,17 @@ sub _current_connection {
 
 # The connection to submit on: the current one, reconnecting first if
 # reconnect is enabled.
+#
+# A transaction stays on the connection it started on: while WATCH or
+# MULTI is open, commands go to that connection even after it has closed,
+# and fail with its close error rather than running on a reconnected one.
 async sub _connection {
     my ($self) = @_;
 
+    $self->_check_fork;
+    if (my $pinned = $self->{_transaction_connection}) {
+        return $pinned;
+    }
     if (my $conn = $self->_current_connection) {
         return $conn;
     }
@@ -579,6 +591,9 @@ sub _set_in_pubsub {
 # Check if fork occurred and drop the parent's connection. Returns 1 if so.
 sub _check_fork {
     my ($self) = @_;
+
+    my $pinned = $self->{_transaction_connection};
+    delete $self->{_transaction_connection} if $pinned && $pinned->pid != $$;
 
     my $conn = $self->{_connection} or return 0;
     return 0 if $conn->pid == $$;
@@ -1318,10 +1333,11 @@ async sub multi {
 
     # Prevent nested multi() calls
     die "Cannot nest multi() calls - already in a transaction"
-        if $self->{in_multi};
+        if $self->in_multi;
 
-    # Mark that we're collecting transaction commands
-    $self->{in_multi} = 1;
+    # The callback only collects commands; nothing is sent until it
+    # returns. in_multi reads true meanwhile.
+    $self->{_collecting_transaction} = 1;
 
     my @commands;
     eval {
@@ -1335,30 +1351,22 @@ async sub multi {
     };
     my $collect_error = $@;
 
-    if ($collect_error) {
-        $self->{in_multi} = 0;
-        die $collect_error;
-    }
+    $self->{_collecting_transaction} = 0;
+
+    die $collect_error if $collect_error;
 
     # If no commands queued, return empty result
-    unless (@commands) {
-        $self->{in_multi} = 0;
-        return [];
-    }
+    return [] unless @commands;
 
-    # Execute transaction (in_multi already set)
     return await $self->_execute_transaction(\@commands);
 }
 
 async sub _execute_transaction {
     my ($self, $commands) = @_;
 
-    # in_multi should already be set by caller
-
     my $results;
     eval {
-        # Send MULTI
-        await $self->command('MULTI');
+        await $self->multi_start;
 
         # Queue all commands (they return +QUEUED)
         for my $cmd (@$commands) {
@@ -1366,25 +1374,38 @@ async sub _execute_transaction {
         }
 
         # Execute and get results
-        $results = await $self->command('EXEC');
+        $results = await $self->exec;
     };
     my $error = $@;
 
-    # Always clear transaction state
-    $self->{in_multi} = 0;
-
     if ($error) {
         # Try to clean up
-        eval { await $self->command('DISCARD') };
+        eval { await $self->discard };
         die $error;
     }
 
     return $results;
 }
 
-# Accessor for pool cleanliness tracking
-sub in_multi { shift->{in_multi} }
-sub watching { shift->{watching} }
+# The connection holding this client's transaction state: the one an open
+# transaction is pinned to, else the current one.
+sub _transaction_state_connection {
+    my ($self) = @_;
+    return $self->{_transaction_connection} // $self->{_connection};
+}
+
+# Accessors for pool cleanliness tracking
+sub in_multi {
+    my ($self) = @_;
+    return 1 if $self->{_collecting_transaction};
+    my $conn = $self->_transaction_state_connection;
+    return $conn && $conn->{in_multi} ? 1 : 0;
+}
+sub watching {
+    my ($self) = @_;
+    my $conn = $self->_transaction_state_connection;
+    return $conn && $conn->{watching} ? 1 : 0;
+}
 sub in_pubsub {
     my $conn = $_[0]{_connection};
     return $conn ? $conn->in_pubsub : 0;
@@ -1398,49 +1419,79 @@ sub inflight_count {
 sub is_dirty {
     my ($self) = @_;
 
-    return 1 if $self->{in_multi};
-    return 1 if $self->{watching};
+    return 1 if $self->in_multi;
+    return 1 if $self->watching;
     return 1 if $self->in_pubsub;
     return 1 if $self->inflight_count > 0;
 
     return 0;
 }
 
+# WATCH and MULTI open server-side state on one connection, so the client
+# pins that connection (see _connection) until the state is ended. The
+# connection is taken just before the command is issued, with no loop turn
+# in between, so it is the one the command runs on.
 async sub watch {
     my ($self, @keys) = @_;
+    my $conn   = await $self->_connection;
     my $result = await $self->command('WATCH', @keys);
-    $self->{watching} = 1;
-    return $result;
-}
-
-async sub unwatch {
-    my ($self) = @_;
-    my $result = await $self->command('UNWATCH');
-    $self->{watching} = 0;
+    $conn->{watching} = 1;
+    $self->{_transaction_connection} = $conn;
     return $result;
 }
 
 async sub multi_start {
     my ($self) = @_;
+    my $conn   = await $self->_connection;
     my $result = await $self->command('MULTI');
-    $self->{in_multi} = 1;
+    $conn->{in_multi} = 1;
+    $self->{_transaction_connection} = $conn;
     return $result;
+}
+
+# EXEC, DISCARD and UNWATCH end the state they name whatever their outcome:
+# Redis has left MULTI after any EXEC or DISCARD reply, and a connection
+# that failed has lost its state with it.
+async sub unwatch {
+    my ($self) = @_;
+    return await $self->_ending_transaction(['UNWATCH'], watch => 1);
 }
 
 async sub exec {
     my ($self) = @_;
-    my $result = await $self->command('EXEC');
-    $self->{in_multi} = 0;
-    $self->{watching} = 0;  # EXEC clears watches
-    return $result;
+    return await $self->_ending_transaction(['EXEC'], multi => 1, watch => 1);
 }
 
 async sub discard {
     my ($self) = @_;
-    my $result = await $self->command('DISCARD');
-    $self->{in_multi} = 0;
-    $self->{watching} = 0;  # DISCARD clears watches
+    return await $self->_ending_transaction(['DISCARD'], multi => 1, watch => 1);
+}
+
+async sub _ending_transaction {
+    my ($self, $command, %ends) = @_;
+    # Taken before the command: after a drop the pin is the only reference
+    # left to the connection that holds the state.
+    my $conn = $self->_transaction_state_connection;
+    my $result;
+    my $ok  = eval { $result = await $self->command(@$command); 1 };
+    my $err = $@;
+    $self->_end_transaction($conn, %ends);
+    die $err unless $ok;
     return $result;
+}
+
+# Clear the named transaction state on $conn, and release the pin once
+# $conn holds none.
+sub _end_transaction {
+    my ($self, $conn, %ends) = @_;
+    return unless $conn;
+    $conn->{in_multi} = 0 if $ends{multi};
+    $conn->{watching} = 0 if $ends{watch};
+    my $pinned = $self->{_transaction_connection};
+    delete $self->{_transaction_connection}
+        if $pinned && refaddr($pinned) == refaddr($conn)
+        && !$conn->{in_multi} && !$conn->{watching};
+    return;
 }
 
 async sub watch_multi {
@@ -1503,8 +1554,8 @@ async sub watch_multi {
 
         # Cleanup can fail on a dead socket; keep local state conservative
         # and preserve the original caller-facing error.
-        $self->{in_multi} = 0;
-        $self->{watching} = 0;
+        $self->_end_transaction($self->_transaction_state_connection,
+            multi => 1, watch => 1);
 
         die $error;
     }

@@ -364,21 +364,19 @@ async sub _cleanup_connection {
     eval {
         # Reset transaction state
         if ($conn->in_multi) {
-            my $discard_f = $conn->command('DISCARD');
+            my $discard_f = $conn->discard;
             my $timeout_f = Future::IO->sleep($self->{cleanup_timeout})->then(sub {
                 Future->fail('cleanup_timeout');
             });
             await Future->wait_any($discard_f, $timeout_f);
-            $conn->{in_multi} = 0;
         }
 
         if ($conn->watching) {
-            my $unwatch_f = $conn->command('UNWATCH');
+            my $unwatch_f = $conn->unwatch;
             my $timeout_f = Future::IO->sleep($self->{cleanup_timeout})->then(sub {
                 Future->fail('cleanup_timeout');
             });
             await Future->wait_any($unwatch_f, $timeout_f);
-            $conn->{watching} = 0;
         }
     };
 
