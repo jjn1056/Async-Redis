@@ -1,0 +1,14 @@
+# Prerequisites for the pagi-chat example. Install with:
+#   cpanm --installdeps ./examples/pagi-chat
+# Async::Redis itself is loaded from this checkout (app.pl adds ../../lib);
+# install its own prerequisites from the repository root with
+#   cpanm --installdeps .
+
+requires 'PAGI::Server';        # provides pagi-server, which runs app.pl
+requires 'PAGI::WebSocket';
+requires 'Future';
+requires 'Future::AsyncAwait';
+requires 'Future::IO';
+requires 'Future::Selector', '0.05';
+requires 'JSON::MaybeXS';
+requires 'URI::Escape';

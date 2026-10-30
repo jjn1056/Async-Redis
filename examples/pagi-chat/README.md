@@ -148,7 +148,11 @@ examples/pagi-chat/
 
 ## Requirements
 
-- PAGI (0.001+)
-- Async::Redis
-- Redis server
-- JSON::MaybeXS
+- A Redis server
+- The Perl modules listed in `cpanfile` (PAGI::Server, PAGI::WebSocket,
+  Future::Selector, JSON::MaybeXS and others):
+
+      cpanm --installdeps ./examples/pagi-chat
+
+- Async::Redis is loaded from this checkout; install its prerequisites
+  from the repository root with `cpanm --installdeps .`
