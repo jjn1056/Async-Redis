@@ -32,7 +32,9 @@ sub forked_client {
         read_f => $conn->{read_f},
         reader => $conn->{reader},
     );
-    $conn->{pid} = $$ + 99999;
+    # As after a fork: the connection and the client both belong to
+    # another process.
+    $conn->{pid} = $c->{_pid} = $$ + 99999;
     return \%s;
 }
 
@@ -92,7 +94,7 @@ subtest 'a fork releases a transaction pin' => sub {
     $conn->{in_multi}              = 1;
     $c->{_transaction_connection}  = $conn;
     ok $c->in_multi, 'in MULTI on the parent\'s connection';
-    $conn->{pid} = $$ + 99999;
+    $conn->{pid} = $c->{_pid} = $$ + 99999;
 
     ok $c->_check_fork, '_check_fork detected the fork';
     ok !$c->{_transaction_connection}, 'the child is no longer pinned';

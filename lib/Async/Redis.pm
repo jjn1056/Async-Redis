@@ -603,21 +603,34 @@ sub _set_in_pubsub {
     return;
 }
 
-# Check if fork occurred and drop the parent's connection. Returns 1 if so.
+# In a forked child, give up everything inherited from the parent, once:
+# the parent's connection and any connection a transaction pinned are
+# abandoned (their commands fail with the forked error; nothing touches the
+# socket), and the child's next use makes a connection of its own. No user
+# callback fires for any of it. Returns 1 the first time it runs in a new
+# process, else 0.
 sub _check_fork {
     my ($self) = @_;
+    return 0 if $self->{_pid} == $$;
 
-    my $pinned = $self->{_transaction_connection};
-    delete $self->{_transaction_connection} if $pinned && $pinned->pid != $$;
+    # First, so that code run by failing the inherited work sees the
+    # client already checked.
+    my $old_pid = $self->{_pid};
+    $self->{_pid} = $$;
 
-    my $conn = $self->{_connection} or return 0;
-    return 0 if $conn->pid == $$;
-
-    my $old_pid = $conn->pid;
-    $conn->abandon;
-    $self->{_connection} = undef;
-    $self->{connected}   = 0;
-    $self->{_child_without_connection} = 1;
+    my $inherited = 0;
+    if (my $pinned = delete $self->{_transaction_connection}) {
+        $pinned->abandon;
+        $inherited = 1;
+    }
+    if (my $conn = $self->{_connection}) {
+        $self->{_connection} = undef;
+        $conn->abandon;
+        $inherited = 1;
+    }
+    $self->{connected}      = 0;
+    $self->{_running_multi} = 0;
+    $self->{_child_without_connection} = 1 if $inherited;
 
     if ($self->{_telemetry}) {
         $self->{_telemetry}->log_event('fork_detected', "old PID: $old_pid, new PID: $$");
@@ -1416,8 +1429,8 @@ sub _transaction_state_connection {
 # Accessors for pool cleanliness tracking
 sub in_multi {
     my ($self) = @_;
-    return 1 if $self->{_running_multi};
     my $conn = $self->_transaction_state_connection;
+    return 1 if $self->{_running_multi};
     return $conn && $conn->{in_multi} ? 1 : 0;
 }
 sub watching {
