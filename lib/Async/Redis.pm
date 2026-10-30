@@ -233,6 +233,8 @@ sub new {
 async sub connect {
     my ($self) = @_;
 
+    # In a forked child the inherited connection is the parent's.
+    $self->_check_fork;
     return $self if $self->{connected};
 
     my $attempt = $self->{_connect_future};
@@ -364,6 +366,7 @@ async sub _open_connection {
     }
 
     $self->{connected} = 1;
+    delete $self->{_child_without_connection};
 
     if ($self->{auto_pipeline}) {
         $conn->{auto_pipeline} = Async::Redis::AutoPipeline->new(
@@ -457,6 +460,7 @@ async sub _handshake_command {
 # Check if connected to Redis
 sub is_connected {
     my ($self) = @_;
+    $self->_check_fork;
     return $self->{connected} ? 1 : 0;
 }
 
@@ -479,8 +483,10 @@ sub disconnect {
         $sub->_close unless $sub->is_closed;
     }
 
-    # disconnect ends any open transaction.
+    # disconnect ends any open transaction, and in a forked child it means
+    # staying disconnected.
     delete $self->{_transaction_connection};
+    delete $self->{_child_without_connection};
 
     # A reconnect or connect still in progress must not bring the client
     # back up after this. Their waiters fail with "Client disconnect".
@@ -534,11 +540,20 @@ async sub _connection {
     if (my $conn = $self->_current_connection) {
         return $conn;
     }
-    die Async::Redis::Error::Disconnected->new(
-        message => "Not connected",
-    ) unless $self->_reconnect_enabled;
 
-    await $self->_ensure_connected;
+    # A forked child has no connection of its own yet. Its first use makes
+    # one, whatever reconnect is set to: reconnect is about recovering a
+    # dropped connection, and this process never had one.
+    if ($self->{_child_without_connection} && !$self->_reconnect_enabled) {
+        await $self->connect;
+    }
+    else {
+        die Async::Redis::Error::Disconnected->new(
+            message => "Not connected",
+        ) unless $self->_reconnect_enabled;
+
+        await $self->_ensure_connected;
+    }
 
     return $self->_current_connection
         // die Async::Redis::Error::Disconnected->new(message => "Not connected");
@@ -599,6 +614,7 @@ sub _check_fork {
     $conn->abandon;
     $self->{_connection} = undef;
     $self->{connected}   = 0;
+    $self->{_child_without_connection} = 1;
 
     if ($self->{_telemetry}) {
         $self->{_telemetry}->log_event('fork_detected', "old PID: $old_pid, new PID: $$");
@@ -1390,6 +1406,7 @@ async sub _execute_transaction {
 # transaction is pinned to, else the current one.
 sub _transaction_state_connection {
     my ($self) = @_;
+    $self->_check_fork;
     return $self->{_transaction_connection} // $self->{_connection};
 }
 
@@ -1406,10 +1423,12 @@ sub watching {
     return $conn && $conn->{watching} ? 1 : 0;
 }
 sub in_pubsub {
+    $_[0]->_check_fork;
     my $conn = $_[0]{_connection};
     return $conn ? $conn->in_pubsub : 0;
 }
 sub inflight_count {
+    $_[0]->_check_fork;
     my $conn = $_[0]{_connection};
     return $conn ? $conn->inflight_count : 0;
 }
@@ -1607,7 +1626,7 @@ async sub subscribe {
 
     die Async::Redis::Error::Disconnected->new(
         message => "Not connected",
-    ) unless $self->{connected};
+    ) unless $self->is_connected;
 
     # Wait for pending commands before entering PubSub mode
     await $self->_wait_for_inflight_drain;
@@ -1641,7 +1660,7 @@ async sub psubscribe {
 
     die Async::Redis::Error::Disconnected->new(
         message => "Not connected",
-    ) unless $self->{connected};
+    ) unless $self->is_connected;
 
     # Wait for pending commands before entering PubSub mode
     await $self->_wait_for_inflight_drain;
@@ -1669,7 +1688,7 @@ async sub ssubscribe {
 
     die Async::Redis::Error::Disconnected->new(
         message => "Not connected",
-    ) unless $self->{connected};
+    ) unless $self->is_connected;
 
     # Wait for pending commands before entering PubSub mode
     await $self->_wait_for_inflight_drain;
@@ -2504,10 +2523,11 @@ Operation attempted on disconnected client.
 =head1 FORK SAFETY
 
 Async::Redis is fork-safe. A connection belongs to the process that
-made it. When a child uses an inherited client, it drops the parent's
-connection without touching it and, with C<reconnect> enabled, makes a
-new connection of its own; without C<reconnect> the command fails with
-L<Async::Redis::Error::Disconnected>.
+made it. When a forked child uses an inherited client (a command,
+C<connect>, or C<is_connected>), it drops the parent's connection
+without touching it, and its first command or C<connect> makes a new
+connection of its own, whether or not C<reconnect> is enabled. A child
+that calls C<disconnect> stays disconnected, as any client does.
 
 A child that never uses the client cannot affect the parent's
 connection either: when the child exits, or drops its copy of the

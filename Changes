@@ -1,6 +1,18 @@
 Revision history for Async-Redis
 
 Unreleased
+    - Bug Fix: a forked child makes its own connection, as documented
+        - FORK SAFETY has always said a child "will automatically
+          invalidate its connection state and reconnect when needed".
+          With reconnect off (the default) it did not: in a child,
+          connect() returned at once because the parent's connection
+          looked live, is_connected reported 1, and the first command
+          failed with "Not connected"
+        - A child's first command or connect() now makes a new
+          connection whether or not reconnect is enabled, and
+          is_connected reports 0 until it does. A child that calls
+          disconnect stays disconnected
+        - Signed off by John 2026-10-29
     - Bug Fix: watch_multi could commit after its WATCH was lost
         - With reconnect enabled, a connection that dropped inside the
           callback took its WATCH with it; the transaction then ran on the
