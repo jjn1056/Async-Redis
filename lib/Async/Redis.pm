@@ -146,6 +146,9 @@ sub new {
         _connection        => undef,
         connected          => 0,
 
+        # The process this client last checked it was running in.
+        _pid               => $$,
+
         # In-progress attempts, shared by everyone waiting on them.
         _connect_future    => undef,
         _reconnect_future  => undef,

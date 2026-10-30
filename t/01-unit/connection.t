@@ -224,7 +224,7 @@ subtest 'reader failure closes the connection and reports to the client once' =>
     is \@warnings, [], 'no warnings';
 };
 
-subtest 'close in another pid drops references only' => sub {
+subtest 'close in another pid fails the work and leaves the socket alone' => sub {
     my ($client, $conn, $peer, $mine) = pair();
     my $e = entry();
     settle($conn->submit($PING, [$e]));
@@ -233,7 +233,8 @@ subtest 'close in another pid drops references only' => sub {
     $conn->{pid} = $$ + 99999;
     $conn->close(disconnected());
     ok !$read_f->is_cancelled, 'the read was not cancelled';
-    ok !$e->{future}->is_ready, 'the entry was not failed';
+    isa_ok failure_of($e->{future}), 'Async::Redis::Error::Disconnected';
+    like failure_of($e->{future}) // '', qr/fork/, 'the entry fails with the forked error';
     my (undef, $eof) = peer_reads($peer, 0.1);
     ok !$eof, 'the peer sees no EOF';
     $reader->cancel;

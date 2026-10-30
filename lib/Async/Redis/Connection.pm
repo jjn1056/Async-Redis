@@ -6,7 +6,8 @@ use 5.018;
 
 use Future;
 use Future::AsyncAwait;
-use Future::IO;
+use Future::IO qw(POLLIN POLLOUT);
+use Errno qw(EAGAIN EWOULDBLOCK);
 use Scalar::Util qw(blessed refaddr weaken);
 use Time::HiRes ();
 use Carp ();
@@ -23,7 +24,7 @@ sub new {
         client        => $args{client},
         socket        => $args{socket},
         parser        => Async::Redis::_parser_class()->new(api => 1),
-        pid           => $$,
+        pid           => $args{pid} // $$,   # the process that opened the socket
         closed        => 0,
         close_error   => undef,
         in_pubsub     => 0,
@@ -70,6 +71,10 @@ sub in_pubsub {
 async sub submit {
     my ($self, $raw, $entries) = @_;
 
+    if ($self->{pid} != $$) {
+        $self->_forked;
+        die $self->{close_error};
+    }
     die $self->{close_error} if $self->{closed};
 
     my $lock = await $self->_acquire_gate;
@@ -114,16 +119,17 @@ sub close {
     my ($self, $err) = @_;
     return if $self->{closed};
 
-    # 1. Every later submit fails with $err.
-    $self->{closed}      = 1;
-    $self->{close_error} = $err;
-
     # A forked child shares the parent's socket. Cancelling or shutting it
-    # down here would act on the parent's connection.
+    # down here would act on the parent's connection, and the work it holds
+    # fails with the forked error whatever closed it.
     if ($self->{pid} != $$) {
         $self->abandon;
         return;
     }
+
+    # 1. Every later submit fails with $err.
+    $self->{closed}      = 1;
+    $self->{close_error} = $err;
 
     # 2. Detach inflight entries so they fail with $err, not a cancellation.
     my @detached = @{$self->{inflight}};
@@ -165,6 +171,14 @@ sub close {
 sub _fail {
     my ($self, $err) = @_;
     return if $self->{closed};
+
+    # In a forked child this is not a lost connection: no on_disconnect,
+    # no reconnect, no resubscribe.
+    if ($self->{pid} != $$) {
+        $self->_forked;
+        return;
+    }
+
     if (my $client = $self->{client}) {
         $client->_connection_lost($self, $err);
     }
@@ -172,16 +186,48 @@ sub _fail {
     return;
 }
 
-# Drop everything without cancelling or shutting down: the socket and the
-# tasks waiting on it belong to the process that made this connection.
+# The teardown in a process that did not open the socket: the client
+# drops what it inherited, and this connection fails the work it holds.
+sub _forked {
+    my ($self) = @_;
+    if (my $client = $self->{client}) {
+        $client->_check_fork;
+    }
+    $self->abandon;
+    return;
+}
+
+sub _forked_error {
+    return Async::Redis::Error::Disconnected->new(
+        message => "Connection belongs to the process that forked this one",
+    );
+}
+
+# Fail the commands this connection holds with the forked error, and drop
+# everything without cancelling or shutting down: the socket and the
+# event-loop watches on it belong to the process that made this connection.
+# Idempotent.
 sub abandon {
     my ($self) = @_;
     $self->{closed}        = 1;
-    $self->{close_error} //= Async::Redis::Error::Disconnected->new(
-        message => "Not connected",
-    );
-    delete @{$self}{qw(socket parser reader read_f write_f gate auto_pipeline)};
+    $self->{close_error} //= _forked_error();
+    my $err = $self->{close_error};
+
+    my @detached = @{ $self->{inflight} // [] };
     $self->{inflight} = [];
+    if (my $ap = $self->{auto_pipeline}) {
+        push @detached, @{ $ap->_detach_queued };
+    }
+    my $lock = $self->{gate};
+    delete @{$self}{qw(socket parser reader read_f write_f gate auto_pipeline)};
+
+    # Submitters waiting on the gate unwind with $err.
+    _reporting_exceptions(sub { $lock->fail($err) unless $lock->is_ready })
+        if $lock;
+    for my $entry (@detached) {
+        my $f = $entry->{future};
+        _reporting_exceptions(sub { $f->fail($err) unless $f->is_ready });
+    }
     return;
 }
 
@@ -230,9 +276,79 @@ sub _release_gate {
     return;
 }
 
+# Future::IO reports readiness; the connection does the socket I/O itself,
+# after checking it is in the process that opened the socket. A forked
+# child's event loop holds the parent's pending polls, and I/O done inside
+# Future::IO's own readiness callback would let the child take the
+# parent's reply or send the parent's command a second time.
+
+# Wait until the socket is ready for $events, then run $io->($self, $f).
+# In another process, take the forked teardown and fail $f with the close
+# error instead. Cancelling $f cancels the poll.
+sub _when_ready {
+    my ($self, $events, $f, $io) = @_;
+    my $poll = Future::IO->poll($self->{socket}, $events);
+    $f //= $poll->new;
+    $f->on_cancel($poll);
+
+    weaken(my $weak_self = $self);
+    $poll->on_done(sub {
+        return if $f->is_ready;
+        my $self = $weak_self or return;
+        if ($self->{pid} != $$) {
+            $self->_forked;
+            $f->fail($self->{close_error});
+            return;
+        }
+        $io->($self, $f);
+    });
+    return $f;
+}
+
+# Up to $length bytes, as Future::IO->read gives them: the bytes, an empty
+# done on EOF, or a failure.
+sub _read_some {
+    my ($self, $length, $f) = @_;
+    my $socket = $self->{socket};
+    return $self->_when_ready(POLLIN, $f, sub {
+        my ($self, $f) = @_;
+        my $n = $socket->sysread(my $buf, $length);
+        if ($n) {
+            $f->done($buf);
+        }
+        elsif (defined $n) {
+            $f->done;
+        }
+        elsif ($! == EAGAIN || $! == EWOULDBLOCK) {
+            $self->_read_some($length, $f);
+        }
+        else {
+            $f->fail("sysread: $!\n", sysread => $socket, $!);
+        }
+    });
+}
+
+# Write all of $data, as Future::IO->write_exactly does.
+sub _write_all {
+    my ($self, $data, $f) = @_;
+    my $socket = $self->{socket};
+    return $self->_when_ready(POLLOUT, $f, sub {
+        my ($self, $f) = @_;
+        my $n = $socket->syswrite($data);
+        if (defined $n) {
+            substr($data, 0, $n, '');
+            return $f->done unless length $data;
+        }
+        elsif ($! != EAGAIN && $! != EWOULDBLOCK) {
+            return $f->fail("syswrite: $!\n", syswrite => $socket, $!);
+        }
+        $self->_write_all($data, $f);
+    });
+}
+
 sub _send {
     my ($self, $data) = @_;
-    my $write_f = Future::IO->write_exactly($self->{socket}, $data);
+    my $write_f = $self->_write_all($data);
     $self->{write_f} = $write_f;
     weaken(my $weak_self = $self);
     $write_f->on_ready(sub {
@@ -307,7 +423,7 @@ async sub _run_reader {
         my $head     = $self->{inflight}[0];
         my $deadline = $head ? $head->{deadline} : undef;
 
-        my $read_f = Future::IO->read($self->{socket}, 65536);
+        my $read_f = $self->_read_some(65536);
         $self->{read_f} = $read_f;
 
         my ($returned_f, $timed_out)
@@ -490,8 +606,21 @@ callers only once the handshake has succeeded.
 
 =head2 Fork
 
-In a process other than the one that made it, C<close> and C<DESTROY>
-only drop references: no cancel, no shutdown. The socket is shared with
-the parent, and shutting it down would end the parent's connection.
+The connection belongs to the process that opened its socket (C<pid>).
+A forked child shares that socket, and its event loop holds every poll
+and timer the parent had pending. So Future::IO only reports readiness,
+and the connection reads and writes the socket itself after checking the
+process: Future::IO, doing the I/O in its own readiness callback, would
+let the child take the parent's replies and send the parent's commands a
+second time.
+
+In another process, every entry point (a read or write becoming ready,
+C<submit>, C<_fail>, C<close>) takes the same teardown, C<abandon>: the
+commands this connection holds, including queued auto-pipeline ones,
+fail with an L<Async::Redis::Error::Disconnected> naming the fork, and
+references are dropped. Nothing is done on the socket: no read, write,
+cancel or shutdown. C<DESTROY> there does nothing. Losing the connection
+in a child is not a disconnect: the client's C<on_disconnect>, reconnect
+and resubscribe never run for it.
 
 =cut
