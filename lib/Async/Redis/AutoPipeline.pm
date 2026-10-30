@@ -7,7 +7,7 @@ use 5.018;
 use Future;
 use Future::AsyncAwait;
 use Future::IO;
-use Scalar::Util qw(weaken);
+use Scalar::Util qw(refaddr weaken);
 use Async::Redis::Error::Disconnected;
 
 sub new {
@@ -20,6 +20,7 @@ sub new {
         _queue        => [],
         _flush_pending => 0,
         _flushing     => 0,
+        _submits      => {},   # in-flight submit futures, by refaddr
     }, $class;
 
     # The connection owns this auto-pipeline, and the client owns the
@@ -134,9 +135,13 @@ sub _send_batch {
         }
     });
 
-    # Ownership: the client's Future::Selector (_tasks) holds this submit
-    # task, so no ->retain is needed.
-    $redis->{_tasks}->add(data => 'autopipe-submit', f => $submit) if $redis;
+    # Nobody else holds the submit while it runs, so this auto-pipeline
+    # does, until it is ready; otherwise it would be freed mid-write and
+    # its commands would never complete.
+    my $key = refaddr($submit);
+    $self->{_submits}{$key} = $submit;
+    weaken(my $weak_self = $self);
+    $submit->on_ready(sub { delete $weak_self->{_submits}{$key} if $weak_self });
 }
 
 1;

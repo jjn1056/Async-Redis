@@ -9,7 +9,6 @@ our $VERSION = '0.002000';
 use Future;
 use Future::AsyncAwait;
 use Future::IO 0.23;
-use Future::Selector 0.05;
 use Scalar::Util qw(blessed refaddr weaken);
 use Socket qw(pack_sockaddr_in pack_sockaddr_un inet_aton AF_INET AF_UNIX SOCK_STREAM);
 use IO::Handle ();
@@ -150,8 +149,6 @@ sub new {
         # In-progress attempts, shared by everyone waiting on them.
         _connect_future    => undef,
         _reconnect_future  => undef,
-
-        _tasks             => Future::Selector->new,
 
         # Timeout settings
         connect_timeout         => $args{connect_timeout} // 10,
@@ -871,18 +868,19 @@ async sub _reconnect {
 # concurrent callers share a single reconnect and each sees its outcome.
 # Only the attempt's own on_ready clears the slot, and a caller never
 # re-reads the slot after awaiting, so a finished attempt can never be
-# mistaken for "no attempt yet". The selector (_tasks) holds the task.
+# mistaken for "no attempt yet". The slot holds the task until it is ready.
 async sub _ensure_connected {
     my ($self) = @_;
     return if $self->_current_connection;
     my $f = $self->{_reconnect_future};
     if (!$f) {
         $f = $self->{_reconnect_future} = $self->_reconnect;
-        $self->{_tasks}->add(data => 'reconnect', f => $f);
+        my $key = refaddr($f);
+        weaken(my $weak_self = $self);
         $f->on_ready(sub {
-            $self->{_reconnect_future} = undef
-                if $self->{_reconnect_future}
-                && refaddr($self->{_reconnect_future}) == refaddr($f);
+            $weak_self->{_reconnect_future} = undef
+                if $weak_self && $weak_self->{_reconnect_future}
+                && refaddr($weak_self->{_reconnect_future}) == $key;
         });
     }
     await _await_attempt($f);
@@ -919,14 +917,14 @@ sub _reconnect_async {
         }
     })->();
 
-    # Ownership: the selector owns the task; the slot is the dedup signal.
-    # No ->retain — the selector holds the strong reference.
+    # The slot owns the task and is the dedup signal.
     $self->{_reconnect_future} = $f;
-    $self->{_tasks}->add(data => 'pubsub-reconnect', f => $f);
 
+    my $key = refaddr($f);
     $f->on_ready(sub {
-        return unless $weak_self;
-        $weak_self->{_reconnect_future} = undef;
+        $weak_self->{_reconnect_future} = undef
+            if $weak_self && $weak_self->{_reconnect_future}
+            && refaddr($weak_self->{_reconnect_future}) == $key;
     });
     $f->on_fail(sub {
         my $err = shift;
@@ -2608,11 +2606,11 @@ connection holds that closed connection, so it cannot affect a later
 one: an old reader cannot time out a new connection, and an interrupted
 write cannot fail a new connection's commands.
 
-Background work that spans connections (reconnect attempts,
-auto-pipeline submit batches, the pubsub callback driver) is held in a
-per-client L<Future::Selector> instance, so no background task can be
-garbage-collected while it is still running. C<disconnect> cancels a
-reconnect or connect that is still in progress.
+Every background task has one owner that holds it while it runs, so none
+can be freed mid-flight: a reconnect or connect attempt is held by the
+client until it finishes (and C<disconnect> cancels it), an
+auto-pipeline batch by its connection's auto-pipeline, and a
+subscription's callback driver by the subscription.
 
 Each caller waits on the future for its own request and nothing else. A
 Redis error in one command's reply is reported to that command alone; it
@@ -2624,15 +2622,6 @@ from an unexpected exception, every request awaiting a reply on that
 connection fails with a typed L<Async::Redis::Error>. Pipelines report it
 in each result slot; subscriptions report it through C<next> or
 C<on_error>, or reconnect when C<reconnect> is enabled.
-
-There is no user-facing API for the selector; it is internal
-machinery. Clients should not call C<< $redis->{_tasks} >> directly.
-
-I<Note:> the only use of C<< Future->retain >> in this codebase is
-avoided in favor of selector ownership. Any patch that introduces
-C<< ->retain >> on an Async::Redis-owned Future should instead add
-the task to C<< $self->{_tasks} >> so task lifetimes stay owned in one
-place.
 
 =head1 KNOWN LIMITATIONS
 

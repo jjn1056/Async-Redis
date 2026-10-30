@@ -31,7 +31,7 @@ sub new {
         _on_reconnect     => undef,   # Callback for reconnect notification
         _on_message       => undef,   # Message-arrived callback (callback mode)
         _on_error         => undef,   # Fatal-error callback
-        _driver_step      => undef,   # Running driver loop Future (owned by _tasks selector)
+        _driver_step      => undef,   # Running driver loop Future; this slot owns it
         _closed           => 0,
         _paused           => 0,       # Set during reconnect; clears in _resume_after_reconnect
     }, $class;
@@ -356,10 +356,8 @@ async sub _run_driver {
 # Only starts when _on_message is set (callback mode). Iterator mode
 # consumers call next() directly — no driver loop needed.
 #
-# Ownership: the driver Future is added to the client's Future::Selector
-# ($redis->{_tasks}) and stored in $self->{_driver_step}. The selector
-# owns the task; the slot is the dedup signal. on_ready clears the slot
-# regardless of outcome. No ->retain.
+# Ownership: $self->{_driver_step} holds the driver Future while it runs,
+# and is the dedup signal. on_ready clears the slot regardless of outcome.
 sub _start_driver {
     my ($self, $force) = @_;
     return if $self->{_driver_step} && !$self->{_driver_step}->is_ready;
@@ -368,11 +366,10 @@ sub _start_driver {
     return if $self->{_paused};
     return unless $self->channel_count > 0;
 
-    my $redis = $self->{redis} or return;
+    return unless $self->{redis};
 
     my $f = $self->_run_driver;
     $self->{_driver_step} = $f;
-    $redis->{_tasks}->add(data => 'subscription-driver', f => $f);
     $f->on_ready(sub { $self->{_driver_step} = undef });
     return;
 }
@@ -494,8 +491,7 @@ sub _pause_for_reconnect {
     }
 
     # Cancel the driver Future. F::AA's continuation stops; the Future
-    # becomes cancelled; the selector's on_ready fires and removes the
-    # item; our on_ready fires and clears _driver_step.
+    # becomes cancelled; our on_ready fires and clears _driver_step.
     if (my $f = delete $self->{_driver_step}) {
         $f->cancel unless $f->is_ready;
     }
