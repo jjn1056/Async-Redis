@@ -10,6 +10,8 @@ use Future::AsyncAwait;
 use Future::IO;
 use Scalar::Util qw(blessed refaddr weaken);
 
+use Async::Redis::Connection ();
+
 
 # Threshold for periodic event-loop yield inside the callback driver
 # loop. Prevents stack growth when many messages are pre-queued and
@@ -34,6 +36,7 @@ sub new {
         _driver_step      => undef,   # Running driver loop Future; this slot owns it
         _closed           => 0,
         _paused           => 0,       # Set during reconnect; clears in _resume_after_reconnect
+        _pid              => $$,      # The process that subscribed
     }, $class;
 }
 
@@ -210,6 +213,7 @@ async sub _dequeue {
 # close; dies with the typed error on fatal close.
 async sub next {
     my ($self) = @_;
+    $self->_check_fork;
 
     # Exclusivity check: callback mode disables iterator mode.
     if ($self->{_on_message}) {
@@ -428,7 +432,43 @@ sub _close {
 # In callback mode, fires on_error if registered; warns otherwise.
 sub _fail_fatal {
     my ($self, $typed_error) = @_;
-    return if $self->{_closed};
+    $self->_end_with_error($typed_error) or return;
+
+    # Notify callback-mode consumers of the fatal error. In iterator mode
+    # the caller detects it via die from next(). With no on_error in
+    # callback mode, warn so silent death of a listener is impossible.
+    if ($self->{_on_error}) {
+        $self->_call_on_error($typed_error);
+        return;
+    }
+    if ($self->{_on_message}) {
+        _report_unhandled_fatal($typed_error);
+    }
+}
+
+# A subscription inherited by a forked child fails there with the forked
+# error. It is the parent's subscription, so nothing is reported for it:
+# an iterator's next() dies with the error, and only a callback-mode
+# consumer, which has no next() to see it, gets on_error (once, if set).
+sub _fail_forked {
+    my ($self) = @_;
+    my $err = Async::Redis::Connection::_forked_error();
+    $self->_end_with_error($err) or return;
+    $self->_call_on_error($err) if $self->{_on_message} && $self->{_on_error};
+}
+
+sub _check_fork {
+    my ($self) = @_;
+    return if $self->{_pid} == $$;
+    $self->{_pid} = $$;
+    $self->_fail_forked;
+}
+
+# Close with $typed_error: a blocked next() dies with it, and so does any
+# later one. Returns false if already closed.
+sub _end_with_error {
+    my ($self, $typed_error) = @_;
+    return 0 if $self->{_closed};
     $self->{_closed}      = 1;
     $self->{_fatal_error} = $typed_error;
 
@@ -454,20 +494,15 @@ sub _fail_fatal {
     if (my $f = delete $self->{_driver_step}) {
         $f->cancel unless $f->is_ready;
     }
+    return 1;
+}
 
-    # Notify callback-mode consumers of the fatal error. In iterator mode
-    # the caller detects it via die from next(). With no on_error in
-    # callback mode, warn so silent death of a listener is impossible.
-    if (my $cb = $self->{_on_error}) {
-        local $@;
-        my $ok = eval { $cb->($self, $typed_error); 1 };
-        unless ($ok) {
-            Carp::carp("on_error callback died: " . ($@ // 'unknown error'));
-        }
-        return;
-    }
-    if ($self->{_on_message}) {
-        _report_unhandled_fatal($typed_error);
+sub _call_on_error {
+    my ($self, $err) = @_;
+    local $@;
+    my $ok = eval { $self->{_on_error}->($self, $err); 1 };
+    unless ($ok) {
+        Carp::carp("on_error callback died: " . ($@ // 'unknown error'));
     }
 }
 
@@ -534,6 +569,7 @@ async sub _resume_after_reconnect {
 # Unsubscribe from specific channels
 async sub unsubscribe {
     my ($self, @channels) = @_;
+    $self->_check_fork;
 
     return if $self->{_closed};
 
@@ -560,6 +596,7 @@ async sub unsubscribe {
 # Unsubscribe from patterns
 async sub punsubscribe {
     my ($self, @patterns) = @_;
+    $self->_check_fork;
 
     return if $self->{_closed};
 
@@ -582,6 +619,7 @@ async sub punsubscribe {
 # Unsubscribe from sharded channels
 async sub sunsubscribe {
     my ($self, @channels) = @_;
+    $self->_check_fork;
 
     return if $self->{_closed};
 
@@ -844,6 +882,13 @@ C<< $sub->on_error(sub { }) >>.
 Callback exceptions (dying inside C<on_message>) are also routed to
 C<on_error>; the callback-died message is prepended to the error
 string.
+
+A subscription inherited by a forked child is the parent's. In the
+child it fails at the child's first use of the client or subscription,
+with an L<Async::Redis::Error::Disconnected> naming the fork: C<next>
+dies with it, and in callback mode C<on_error>, if registered, is
+called once with it. Nothing is warned. The child must subscribe again
+on its own client connection; the parent's subscription is unaffected.
 
 =head2 Ordering guarantee
 

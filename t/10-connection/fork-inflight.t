@@ -7,7 +7,7 @@
 use strict;
 use warnings;
 use Test::Lib;
-use Test::Async::Redis qw(run settle failure_of skip_without_redis inject_eof redis_host);
+use Test::Async::Redis qw(run settle failure_of skip_without_redis inject_eof redis_host with_timeout);
 use Test2::V0;
 use Async::Redis;
 use Future;
@@ -173,6 +173,38 @@ subtest 'a child that declines a read does not spin' => sub {
     my ($cpu) = $line =~ /cpu ([\d.]+)/;
     # A spinning loop uses close to the whole second.
     ok defined $cpu && $cpu < 0.3, "the child used little CPU ($line)";
+    $r->disconnect;
+};
+
+subtest 'an inherited subscription fails in the child' => sub {
+    my $r = fresh_client();
+    run { $r->connect };
+    my $sub = run { $r->subscribe('fi:c2') };
+    my $line = in_child {
+        # No message is ever published; give up after 2s.
+        my $ok = eval { run { with_timeout(2, $sub->next) }; 1 };
+        $ok ? 'returned' : 'failed: ' . ("$@" =~ s/\n.*//sr);
+    };
+    like $line, qr/^failed: .*fork/, 'next() fails with the forked error';
+    $r->disconnect;
+};
+
+subtest 'callback-mode on_error is called once in the child, no warning' => sub {
+    my $r = fresh_client();
+    run { $r->connect };
+    my $sub = run { $r->subscribe('fi:c3') };
+    my @errors;
+    $sub->on_message(sub {});
+    $sub->on_error(sub { push @errors, $_[1] });
+    my $line = in_child {
+        my @warn;
+        local $SIG{__WARN__} = sub { push @warn, @_ };
+        $r->is_connected;
+        $r->is_connected;
+        sprintf 'errors=%d warn=%d %s', scalar @errors, scalar @warn,
+            ("" . ($errors[0] // '')) =~ s/\n.*//sr;
+    };
+    like $line, qr/^errors=1 warn=0 .*fork/, 'on_error once, with the forked error';
     $r->disconnect;
 };
 

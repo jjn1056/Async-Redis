@@ -604,11 +604,12 @@ sub _set_in_pubsub {
 }
 
 # In a forked child, give up everything inherited from the parent, once:
-# the parent's connection and any connection a transaction pinned are
-# abandoned (their commands fail with the forked error; nothing touches the
-# socket), and the child's next use makes a connection of its own. No user
-# callback fires for any of it. Returns 1 the first time it runs in a new
-# process, else 0.
+# the parent's subscription fails, and the parent's connection and any
+# connection a transaction pinned are abandoned (their commands fail with
+# the forked error; nothing touches the socket). The child's next use
+# makes a connection of its own. No user callback fires for any of it,
+# except a callback-mode subscription's on_error. Returns 1 the first time
+# it runs in a new process, else 0.
 sub _check_fork {
     my ($self) = @_;
     return 0 if $self->{_pid} == $$;
@@ -619,6 +620,9 @@ sub _check_fork {
     $self->{_pid} = $$;
 
     my $inherited = 0;
+    if (my $sub = $self->{_subscription}) {
+        $sub->_fail_forked;
+    }
     if (my $pinned = delete $self->{_transaction_connection}) {
         $pinned->abandon;
         $inherited = 1;
