@@ -51,6 +51,26 @@ SKIP: {
         like("$error", qr/already in a transaction/i, 'correct error message for nested multi()');
     };
 
+    # The guard covers the whole of multi(), not only its callback: a second
+    # multi() issued while the first is still sending its MULTI must not
+    # interleave with it.
+    subtest 'concurrent multi() calls do not interleave' => sub {
+        run { $redis->del('nested:c1', 'nested:c2') };
+        my $first  = $redis->multi(async sub { $_[0]->set('nested:c1', 'one') });
+        my $second = $redis->multi(async sub { $_[0]->set('nested:c2', 'two') });
+        my $first_ok  = eval { await_f($first); 1 };
+        my $second_ok = eval { await_f($second); 1 };
+        my $second_error = $@;
+
+        ok($first_ok, 'the first transaction commits');
+        is(run { $redis->get('nested:c1') }, 'one', 'its write is on the server');
+        ok(!$second_ok, 'the second is refused');
+        like("$second_error", qr/already in a transaction/i, 'as a nested multi()');
+        is(run { $redis->get('nested:c2') }, undef, 'and wrote nothing');
+        ok(!$redis->in_multi, 'not in MULTI afterwards');
+        run { $redis->del('nested:c1', 'nested:c2') };
+    };
+
     subtest 'connection usable after nested error' => sub {
         # Connection should still work
         my $result = run { $redis->ping };

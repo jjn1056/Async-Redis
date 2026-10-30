@@ -101,16 +101,11 @@ async sub _setup_clients {
         reconnect       => 1,
     );
 
-    # Helper: build a client with a stress-* name that's re-applied
-    # automatically after each (re)connect via on_connect. The name is
-    # how Stress::Chaos identifies workload clients in CLIENT LIST and
-    # excludes everything else (controller, replication, external
-    # tools). on_connect is sync, but the SETNAME command is async —
-    # we hand the future to the client's own selector so it lives in
-    # the same structured-concurrency scope as the workload's
-    # commands. SETNAME failure surfaces to the next caller awaiting
-    # on this client, which is the correct propagation: if SETNAME
-    # failed, the connection is dead and the next command is dead too.
+    # Helper: build a client with a stress-* name. client_name is sent
+    # as CLIENT SETNAME by the handshake of every (re)connect. The name
+    # is how Stress::Chaos identifies workload clients in CLIENT LIST
+    # and excludes everything else (controller, replication, external
+    # tools).
     #
     # on_disconnect counts reconnect events. Setting it via the
     # constructor (rather than mutating $c->{on_disconnect} after the
@@ -119,17 +114,9 @@ async sub _setup_clients {
     my $on_disconnect = sub { $self->{reconnect_count}++ };
     my $named = sub {
         my ($role, %extra) = @_;
-        my $name = "stress-$role";
-        my $on_connect = sub {
-            my ($c) = @_;
-            $c->{_tasks}->add(
-                data => "setname-$name",
-                f    => $c->client('SETNAME', $name),
-            );
-        };
         return Async::Redis->new(
             %common, %extra,
-            on_connect    => $on_connect,
+            client_name   => "stress-$role",
             on_disconnect => $on_disconnect,
         );
     };
@@ -138,18 +125,11 @@ async sub _setup_clients {
     await $self->{controller}->connect;
 
     # Pool: each pool connection is also stress-named so chaos can pick
-    # them. Same on_connect mechanism via shared client args.
-    my $pool_on_connect = sub {
-        my ($c) = @_;
-        $c->{_tasks}->add(
-            data => 'setname-stress-pool',
-            f    => $c->client('SETNAME', 'stress-pool'),
-        );
-    };
+    # them; the pool forwards client_name to every client it makes.
     $self->{pool} = Async::Redis::Pool->new(
         %common,
         max           => $self->{pool_size},
-        on_connect    => $pool_on_connect,
+        client_name   => 'stress-pool',
         on_disconnect => $on_disconnect,
     );
 

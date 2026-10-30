@@ -192,9 +192,9 @@ sub new {
         },
 
         # The connection an open WATCH/MULTI is pinned to (see _connection),
-        # and whether multi() is collecting commands.
+        # and whether a multi() call is running.
         _transaction_connection => undef,
-        _collecting_transaction => 0,
+        _running_multi          => 0,
 
         # PubSub state
         _subscription => undef,
@@ -1333,30 +1333,31 @@ async sub multi {
     die "Cannot nest multi() calls - already in a transaction"
         if $self->in_multi;
 
-    # The callback only collects commands; nothing is sent until it
-    # returns. in_multi reads true meanwhile.
-    $self->{_collecting_transaction} = 1;
+    # in_multi reads true for the whole call: while the callback collects
+    # commands (nothing is sent until it returns) and until EXEC is done,
+    # so a second multi() cannot interleave with this one.
+    $self->{_running_multi} = 1;
 
-    my @commands;
-    eval {
+    my $results;
+    my $ok = eval {
         # Create transaction collector
         my $tx = Async::Redis::Transaction->new(redis => $self);
 
         # Run callback to collect commands
         await $callback->($tx);
 
-        @commands = $tx->commands;
+        my @commands = $tx->commands;
+
+        # If no commands queued, return empty result
+        $results = @commands ? await $self->_execute_transaction(\@commands) : [];
+        1;
     };
-    my $collect_error = $@;
+    my $error = $@;
 
-    $self->{_collecting_transaction} = 0;
+    $self->{_running_multi} = 0;
 
-    die $collect_error if $collect_error;
-
-    # If no commands queued, return empty result
-    return [] unless @commands;
-
-    return await $self->_execute_transaction(\@commands);
+    die $error unless $ok;
+    return $results;
 }
 
 async sub _execute_transaction {
@@ -1395,7 +1396,7 @@ sub _transaction_state_connection {
 # Accessors for pool cleanliness tracking
 sub in_multi {
     my ($self) = @_;
-    return 1 if $self->{_collecting_transaction};
+    return 1 if $self->{_running_multi};
     my $conn = $self->_transaction_state_connection;
     return $conn && $conn->{in_multi} ? 1 : 0;
 }
@@ -2378,9 +2379,10 @@ pool: active transaction, watched keys, pub/sub mode, or pending responses.
 =head2 in_multi / watching / in_pubsub / inflight_count
 
 State accessors used by L<Async::Redis::Pool> and useful for diagnostics.
-All four describe one connection: the one an open transaction is on (see
-L</Transactions and dropped connections>), else the current one. A new
-connection starts clean, so a reconnected client is not dirty.
+C<in_multi> and C<watching> describe the connection an open transaction
+is on (see L</Transactions and dropped connections>), else the current
+one; C<in_pubsub> and C<inflight_count> describe the current connection.
+A new connection starts clean, so a reconnected client is not dirty.
 
 =head1 LUA SCRIPTING
 
