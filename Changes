@@ -1,6 +1,45 @@
 Revision history for Async-Redis
 
 Unreleased
+    - Bug Fix: watch_multi could commit after its WATCH was lost
+        - With reconnect enabled, a connection that dropped inside the
+          callback took its WATCH with it; the transaction then ran on the
+          new connection unprotected and committed even though another
+          client had changed the watched key
+        - Now watch_multi fails and nothing is committed
+    - Bug Fix: a transaction never continues on a reconnected connection
+        - With reconnect enabled, a drop between MULTI and the queued
+          commands made them reconnect and run for real, outside any
+          transaction, while EXEC then failed
+        - While WATCH or MULTI is open, commands now stay on the connection
+          it started on and fail with its error once it has dropped. exec,
+          discard, unwatch or disconnect end the transaction, and the next
+          command reconnects as usual. Calling connect yourself does not
+        - Signed off by John 2026-10-29 (R6)
+    - Bug Fix: transaction state no longer survives a reconnect
+        - in_multi, watching and is_dirty stayed set after a disconnect and
+          reconnect although the server had dropped the transaction, so a
+          Pool discarded a good client. A new connection now starts clean
+        - Signed off by John 2026-10-29 (R2)
+    - Behaviour change: exec, discard and unwatch end the local transaction
+      state whatever their outcome
+        - Previously a failed EXEC (for example EXECABORT, after a command
+          was rejected while queuing) left in_multi and is_dirty set
+          although Redis had already left MULTI
+        - Signed off by John 2026-10-29
+    - Bug Fix: a handshake that times out fails with
+      Async::Redis::Error::Timeout ("Request timed out")
+        - Previously it failed with a plain string, "read_timeout at
+          .../Redis.pm line N"
+        - Signed off by John 2026-10-29
+    - Pool: on_dirty => 'cleanup' ends a client's transaction through
+      discard and unwatch rather than editing its fields
+    - Dependency: Future::Selector is no longer required
+    - Internal: each connection owns its reader task, rather than the
+      client-wide Future::Selector (signed off by John 2026-10-29, R1);
+      every background task now has its own owner and the selector is
+      gone (R5's condition). The handshake is read by the connection's
+      own reader, so each connection has one reader and one teardown
     - Bug Fix: a reconnected client could be broken by its old connection
         - A reader left over from before a disconnect could fire its old
           timeout on the new connection, failing its next command with

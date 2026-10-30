@@ -2013,7 +2013,10 @@ Callback when connection is established. Called as C<< $coderef->($redis) >>.
 =item on_disconnect => $coderef
 
 Callback when a live connection is intentionally closed or lost. Called as
-C<< $coderef->($redis, $reason) >>.
+C<< $coderef->($redis, $reason) >>. C<$reason> is C<'client disconnect'>
+after L</disconnect>, and the stringified error (an
+L<Async::Redis::Error>) when the connection was lost. It is not called
+for a connection that never finished connecting.
 
 =item on_error => $coderef
 
@@ -2243,7 +2246,7 @@ C<EXEC>, C<DISCARD>, or C<UNWATCH>.
 
     await $redis->unwatch;
 
-Clear all watched keys on the current connection.
+Clear all watched keys. Ends the watch even if the command fails.
 
 =head2 multi_start
 
@@ -2257,13 +2260,15 @@ C<exec> or C<discard>.
     my $results = await $redis->exec;
 
 Execute a manual transaction. Returns C<undef> if Redis aborts because a
-watched key changed.
+watched key changed. Ends the transaction and any watch, even if the
+command fails (for example with EXECABORT, or after a dropped connection).
 
 =head2 discard
 
     await $redis->discard;
 
 Abort a manual transaction. Redis also clears any active watched keys.
+Ends the transaction and any watch, even if the command fails.
 
 =head2 watch_multi
 
@@ -2274,6 +2279,19 @@ Abort a manual transaction. Redis also clears any active watched keys.
 
 Watch keys and execute transaction atomically. Returns undef if
 watched keys were modified by another client.
+
+=head2 Transactions and dropped connections
+
+WATCH and MULTI are state of one server connection. While either is
+open, the client sends its commands to that connection, even with
+C<reconnect> enabled. If the connection drops, they fail with its error
+instead of running on a new connection outside the transaction, so
+C<exec> and C<watch_multi> fail without committing anything.
+
+C<exec>, C<discard> and C<unwatch> end the transaction, whatever their
+outcome, and so does L</disconnect>; the next command then reconnects as
+usual. Calling C<connect> yourself does not end it: until one of those
+is called, commands keep failing with the dropped connection's error.
 
 =head2 script
 
@@ -2360,6 +2378,9 @@ pool: active transaction, watched keys, pub/sub mode, or pending responses.
 =head2 in_multi / watching / in_pubsub / inflight_count
 
 State accessors used by L<Async::Redis::Pool> and useful for diagnostics.
+All four describe one connection: the one an open transaction is on (see
+L</Transactions and dropped connections>), else the current one. A new
+connection starts clean, so a reconnected client is not dirty.
 
 =head1 LUA SCRIPTING
 

@@ -474,6 +474,20 @@ connection, so the callers that closing wakes already see the client
 disconnected. The reader uses it for every stream failure (EOF, read
 error, deadline, protocol error), and C<submit> for a write failure.
 
+=head2 Transaction state
+
+C<in_multi> and C<watching> record the server's MULTI and WATCH state for
+this connection; a new connection starts with neither. While either is
+set the client pins this connection (C<_transaction_connection>), so a
+transaction's commands can only ever go to the connection it started on.
+
+=head2 Handshake
+
+The client's handshake (AUTH, SELECT, CLIENT SETNAME) is submitted like
+any command and read by this connection's reader. The connection is the
+client's current one during the handshake, but the client hands it to
+callers only once the handshake has succeeded.
+
 =head2 Fork
 
 In a process other than the one that made it, C<close> and C<DESTROY>
