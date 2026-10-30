@@ -14,6 +14,7 @@ use Future;
 use Future::AsyncAwait;
 use Future::IO;
 use POSIX qw(_exit);
+use IO::Socket::INET;
 
 plan skip_all => 'fork() not supported on this platform' if $^O eq 'MSWin32';
 
@@ -208,6 +209,106 @@ subtest 'callback-mode on_error is called once in the child, no warning' => sub 
     $r->disconnect;
 };
 
-run { $check->del('fi:cnt', 'fi:p', 'fi:none') };
+# client_name makes the handshake send CLIENT SETNAME, so a connect that
+# resumed in the child would write to the socket.
+
+subtest 'a connect in progress at fork completes in the parent' => sub {
+    my $r = fresh_client(client_name => 'fi-parent');
+    my $c = $r->connect;                                # in progress
+    my $line = in_child {
+        child_runs_loop(0.5);
+        my $e = failure_of($c);
+        sprintf '%s %s', ref($e) // '', ("" . ($e // 'not failed')) =~ s/\n.*//sr;
+    };
+    like $line, qr/^Async::Redis::Error::Disconnected .*fork/,
+        'in the child the inherited attempt fails with the forked error';
+    is settle($c, 3), 'done', 'the parent connect completes';
+    is run { $r->ping }, 'PONG', 'and the connection works';
+    $r->disconnect;
+};
+
+# A port nothing listens on: a non-blocking connect to it is still in
+# progress when connect() returns, and fails when the socket is polled.
+sub refusing_port {
+    my $listener = IO::Socket::INET->new(Listen => 1, LocalAddr => '127.0.0.1')
+        or die "listen: $!";
+    my $port = $listener->sockport;
+    close $listener;
+    return $port;
+}
+
+subtest 'a connect being refused at fork fails in the parent' => sub {
+    my $r = fresh_client(host => '127.0.0.1', port => refusing_port());
+    my $c = $r->connect;
+    in_child { child_runs_loop(0.5); 'ok' };
+    is settle($c, 3), 'failed', 'the parent connect fails';
+    like failure_of($c) // '', qr/refused/i, 'refused, as without the fork';
+};
+
+subtest 'a child whose connect was inherited makes its own' => sub {
+    my $r = fresh_client(client_name => 'fi-parent');
+    my $c = $r->connect;
+    my $line = in_child {
+        run { $r->connect };
+        'connected ' . $r->is_connected . ' id ' . run { $r->client('ID') };
+    };
+    is settle($c, 3), 'done', 'the parent connect completes';
+    my $parent_id = run { $r->client('ID') };
+    like $line, qr/^connected 1 id \d+$/, 'the child is connected' or diag $line;
+    unlike $line, qr/ id $parent_id$/, 'on a connection of its own';
+    $r->disconnect;
+};
+
+# Drop $r's connection the way a server going away does: the reader sees
+# EOF while a command is in flight.
+sub drop_connection {
+    my ($r) = @_;
+    my $blpop = $r->command('BLPOP', 'fi:none', '5');
+    run { Future::IO->sleep(0.05) };
+    inject_eof($r);
+    settle($blpop, 1);
+}
+
+subtest 'a command waiting on a reconnect at fork runs once' => sub {
+    run { $check->del('fi:rc', 'fi:none') };
+    my $r = fresh_client(reconnect => 1);
+    run { $r->connect };
+    drop_connection($r);
+    my $incr = $r->incr('fi:rc');                       # waits on the reconnect
+    in_child { child_runs_loop(1); 'ok' };
+    is settle($incr, 3), 'done', 'the parent command completes';
+    is run { $check->get('fi:rc') }, 1, 'the server ran it once';
+    $r->disconnect;
+};
+
+subtest 'a command waiting out a reconnect backoff at fork runs once' => sub {
+    run { $check->del('fi:rc', 'fi:none') };
+    my @errors;
+    my $r = fresh_client(
+        reconnect        => 1,
+        reconnect_delay  => 0.3,
+        reconnect_jitter => 0,
+        on_error         => sub { push @errors, $_[1] },
+    );
+    run { $r->connect };
+    drop_connection($r);
+
+    # Redis is unreachable for the first attempt, and back by the retry.
+    my $refusing = refusing_port();
+    my ($host, $port) = @{$r}{qw(host port)};
+    @{$r}{qw(host port)} = ('127.0.0.1', $refusing);
+    my $incr = $r->incr('fi:rc');
+    run { Future::IO->sleep(0.1) };                     # the first attempt fails
+    @{$r}{qw(host port)} = ($host, $port);
+    is scalar @errors, 1, 'in backoff when the process forks';
+
+    my $line = in_child { child_runs_loop(1); 'errors=' . scalar @errors };
+    is $line, 'errors=1', 'the child reports nothing for the parent\'s attempt';
+    is settle($incr, 3), 'done', 'the parent command completes';
+    is run { $check->get('fi:rc') }, 1, 'the server ran it once';
+    $r->disconnect;
+};
+
+run { $check->del('fi:cnt', 'fi:p', 'fi:none', 'fi:rc') };
 
 done_testing;

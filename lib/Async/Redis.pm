@@ -8,9 +8,11 @@ our $VERSION = '0.002000';
 
 use Future;
 use Future::AsyncAwait;
-use Future::IO 0.23;
+use Future::IO 0.23 qw(POLLOUT);
+use Errno qw(EINPROGRESS EWOULDBLOCK);
 use Scalar::Util qw(blessed refaddr weaken);
-use Socket qw(pack_sockaddr_in pack_sockaddr_un inet_aton AF_INET AF_UNIX SOCK_STREAM);
+use Socket qw(pack_sockaddr_in pack_sockaddr_un inet_aton AF_INET AF_UNIX SOCK_STREAM
+              SOL_SOCKET SO_ERROR);
 use IO::Handle ();
 use IO::Socket::INET;
 use Time::HiRes ();
@@ -272,6 +274,10 @@ async sub _await_attempt {
 async sub _open_connection {
     my ($self) = @_;
 
+    # The process that opens the socket owns it. A forked child inherits
+    # this attempt part-way through; after each wait it stops there.
+    my $pid = $$;
+
     # Create socket — AF_UNIX for path, AF_INET for host:port
     my ($socket, $sockaddr);
 
@@ -305,7 +311,7 @@ async sub _open_connection {
     }
 
     # Connect with timeout using Future->wait_any
-    my $connect_f = Future::IO->connect($socket, $sockaddr);
+    my $connect_f = $self->_connect_socket($socket, $sockaddr, $pid);
     my $sleep_f = Future::IO->sleep($self->{connect_timeout});
 
     my $timeout_f = $sleep_f->then(sub {
@@ -321,6 +327,7 @@ async sub _open_connection {
     });
 
     my $completed_f = await $result_f;
+    $self->_die_if_forked($pid);
 
     # Now check the result
     if ($completed_f->is_failed) {
@@ -344,16 +351,21 @@ async sub _open_connection {
     # TLS upgrade if enabled
     if ($self->{tls}) {
         eval {
-            $socket = await $self->_tls_upgrade($socket);
+            $socket = await $self->_tls_upgrade($socket, $pid);
         };
         if ($@) {
             # Don't call close() - let $socket go out of scope when we die.
             # Perl's DESTROY will close it after the exception unwinds.
             die $@;
         }
+        $self->_die_if_forked($pid);
     }
 
-    my $conn = Async::Redis::Connection->new(client => $self, socket => $socket);
+    my $conn = Async::Redis::Connection->new(
+        client => $self,
+        socket => $socket,
+        pid    => $pid,
+    );
     $self->{_connection} = $conn;
 
     # Run Redis protocol handshake (AUTH, SELECT, CLIENT SETNAME).
@@ -603,6 +615,35 @@ sub _set_in_pubsub {
     return;
 }
 
+# Die with the forked error unless this is process $pid.
+sub _die_if_forked {
+    my ($self, $pid) = @_;
+    die Async::Redis::Connection::_forked_error() if $$ != $pid;
+    return;
+}
+
+# A non-blocking connect of $socket to $sockaddr, as Future::IO->connect
+# does it, but reading the result (SO_ERROR) only in process $pid: a
+# forked child holds the parent's poll on this socket, and reading SO_ERROR
+# there would clear a failing connect's error before the parent saw it.
+sub _connect_socket {
+    my ($self, $socket, $sockaddr, $pid) = @_;
+
+    return Future->done if CORE::connect($socket, $sockaddr);
+    return Future->fail("connect: $!\n", connect => $socket, $!)
+        unless $! == EINPROGRESS || $! == EWOULDBLOCK;
+
+    return Future::IO->poll($socket, POLLOUT)->then(sub {
+        return Future->fail(Async::Redis::Connection::_forked_error())
+            if $$ != $pid;
+        if (my $errno = unpack('i', getsockopt($socket, SOL_SOCKET, SO_ERROR))) {
+            $! = $errno;
+            return Future->fail("connect: $!\n", connect => $socket, $!);
+        }
+        return Future->done;
+    });
+}
+
 # In a forked child, give up everything inherited from the parent, once:
 # the parent's subscription fails, and the parent's connection and any
 # connection a transaction pinned are abandoned (their commands fail with
@@ -631,6 +672,13 @@ sub _check_fork {
         $self->{_connection} = undef;
         $conn->abandon;
         $inherited = 1;
+    }
+
+    # An attempt the parent started is the parent's: dropped, not
+    # cancelled. It fails in the child with the forked error if it resumes
+    # there, and the child's next use starts its own.
+    for my $slot (qw(_connect_future _reconnect_future)) {
+        $inherited = 1 if delete $self->{$slot};
     }
     $self->{connected}      = 0;
     $self->{_running_multi} = 0;
@@ -770,7 +818,7 @@ sub _build_tls_options {
 
 # Non-blocking TLS upgrade
 async sub _tls_upgrade {
-    my ($self, $socket) = @_;
+    my ($self, $socket, $pid) = @_;
 
     require IO::Socket::SSL;
 
@@ -788,6 +836,9 @@ async sub _tls_upgrade {
     my $deadline = Time::HiRes::time() + $self->{connect_timeout};
 
     while (1) {
+        # The handshake reads and writes the socket.
+        $self->_die_if_forked($pid);
+
         # Check timeout
         if (Time::HiRes::time() >= $deadline) {
             die Async::Redis::Error::Timeout->new(
@@ -857,6 +908,11 @@ async sub _tls_upgrade {
 async sub _reconnect {
     my ($self) = @_;
 
+    # A forked child inherits this task part-way through. It stops there
+    # rather than connect in the child: the commands waiting on it are the
+    # parent's, and would be sent a second time.
+    my $pid = $$;
+
     my $max = $self->{reconnect_max_attempts};
     my $attempt = 0;
 
@@ -868,6 +924,7 @@ async sub _reconnect {
             await $self->connect;
             1;
         };
+        $self->_die_if_forked($pid);
 
         if ($ok) {
             $self->{_reconnect_attempt} = 0;
@@ -892,6 +949,7 @@ async sub _reconnect {
 
         my $delay = $self->_calculate_backoff($attempt);
         await Future::IO->sleep($delay);
+        $self->_die_if_forked($pid);
     }
 
     # Reset attempt counter on success so subsequent reconnects start fresh.
@@ -936,6 +994,7 @@ sub _reconnect_async {
 
     weaken(my $weak_self = $self);
     weaken(my $weak_sub  = $sub);
+    my $pid = $$;
 
     my $f = (async sub {
         # Reconnect the socket. _reconnect handles retry/backoff and
@@ -965,6 +1024,10 @@ sub _reconnect_async {
     $f->on_fail(sub {
         my $err = shift;
         return unless $weak_sub;
+        if ($$ != $pid) {
+            $weak_sub->_fail_forked;
+            return;
+        }
         $weak_sub->_fail_fatal($err);
     });
 
