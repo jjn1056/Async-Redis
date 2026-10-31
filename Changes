@@ -1,6 +1,34 @@
 Revision history for Async-Redis
 
 Unreleased
+    - Bug Fix: a forked child running its event loop no longer acts on
+      the parent's connection
+        - fork copies the event loop's pending work into the child.
+          Future::IO did the socket read or write inside its own
+          readiness callback, so a child that ran its loop sent the
+          parent's unwritten commands a second time (an INCR counted 2,
+          with auto_pipeline on and off; a pipeline ran twice), took the
+          parent's pending replies (BLPOP failed "Request timed out")
+          and its pub/sub messages. A connect, reconnect or multi() in
+          progress at fork finished in the child, on the parent's
+          socket or by sending the parent's commands again, and a
+          parent whose connect was being refused at fork could take the
+          failure for success. Affected since at least v0.002000
+        - The connection now asks Future::IO only for readiness and does
+          the I/O, and the connect, itself, after checking it is in the
+          process that opened the socket
+        - In the child, work inherited from the parent fails with
+          Async::Redis::Error::Disconnected naming the fork, at the
+          child's first use of the client or when its loop wakes for
+          it, with no callbacks or warnings (a callback-mode
+          subscription's on_error is called once). Before, it was
+          dropped and stayed pending. Signed off by John 2026-10-30
+          (D-F1); a transaction's pinned connection is failed and then
+          released (D-F2, signed off by John 2026-10-30)
+        - Not covered by tests: Linux epoll loops (shared across fork),
+          UV, TLS. Future::IO's built-in implementation toggles an
+          inherited socket's blocking flag around its wait, which is
+          shared with the parent
     - Bug Fix: a forked child makes its own connection, as documented
         - FORK SAFETY has always said a child "will automatically
           invalidate its connection state and reconnect when needed".

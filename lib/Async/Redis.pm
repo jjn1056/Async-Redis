@@ -2639,6 +2639,32 @@ connection either: when the child exits, or drops its copy of the
 client, the inherited socket is left alone. A pre-fork server can
 connect in the parent and fork workers freely.
 
+Whatever the child does, including running its event loop with work
+still in flight from before the fork, the parent is unaffected: its
+commands are sent once, its replies and pub/sub messages reach it, and
+its connection stays healthy. The child never reads, writes, connects
+or shuts down a socket the parent opened.
+
+Work the child inherited from the parent is the parent's, and fails in
+the child with an L<Async::Redis::Error::Disconnected> whose message
+names the fork. That covers commands waiting for a reply or still
+queued (including auto-pipelined ones), a C<connect> or reconnect in
+progress, a subscription, and a C<multi> or C<watch_multi> still
+running. It fails the first time the child uses the client or the
+subscription, or when the child's event loop wakes for it, whichever
+comes first; nothing is sent again from the child. No callbacks fire
+for it in the child (no C<on_disconnect>, no C<on_error>, no warning),
+except that a subscription in callback mode calls its C<on_error>, if
+set, once. The child subscribes again on its own connection if it needs
+to.
+
+Known limits: this is tested with L<Future::IO::Impl::IOAsync> and
+Future::IO's built-in implementation, not with UV or a Linux epoll
+loop (whose kernel state is shared across fork), and not over TLS.
+Future::IO's built-in implementation switches each polled handle to
+blocking and back around its wait, which a child can do to an
+inherited socket, and so briefly to the parent's.
+
 =head1 EVENT LOOP CONFIGURATION
 
 Async::Redis uses L<Future::IO> for event loop abstraction, making it
