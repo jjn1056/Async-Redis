@@ -15,6 +15,7 @@ use Future::AsyncAwait;
 use Future::IO;
 use POSIX qw(_exit);
 use IO::Socket::INET;
+use Time::HiRes ();
 
 plan skip_all => 'fork() not supported on this platform' if $^O eq 'MSWin32';
 
@@ -286,7 +287,7 @@ subtest 'a command waiting out a reconnect backoff at fork runs once' => sub {
     my @errors;
     my $r = fresh_client(
         reconnect        => 1,
-        reconnect_delay  => 0.3,
+        reconnect_delay  => 0.5,
         reconnect_jitter => 0,
         on_error         => sub { push @errors, $_[1] },
     );
@@ -298,17 +299,79 @@ subtest 'a command waiting out a reconnect backoff at fork runs once' => sub {
     my ($host, $port) = @{$r}{qw(host port)};
     @{$r}{qw(host port)} = ('127.0.0.1', $refusing);
     my $incr = $r->incr('fi:rc');
-    run { Future::IO->sleep(0.1) };                     # the first attempt fails
+    # Wait for the first attempt to fail (about 30ms here); the retry is
+    # due 0.5s after that.
+    my $until = Time::HiRes::time() + 2;
+    run { Future::IO->sleep(0.01) } while !@errors && Time::HiRes::time() < $until;
     @{$r}{qw(host port)} = ($host, $port);
     is scalar @errors, 1, 'in backoff when the process forks';
 
-    my $line = in_child { child_runs_loop(1); 'errors=' . scalar @errors };
-    is $line, 'errors=1', 'the child reports nothing for the parent\'s attempt';
+    my $line = in_child {
+        child_runs_loop(1.5);
+        'errors=' . scalar(@errors) . ' connected=' . $r->is_connected;
+    };
+    is $line, 'errors=1 connected=0',
+        'the child neither reports nor retries the parent\'s attempt';
     is settle($incr, 3), 'done', 'the parent command completes';
     is run { $check->get('fi:rc') }, 1, 'the server ran it once';
     $r->disconnect;
 };
 
-run { $check->del('fi:cnt', 'fi:p', 'fi:none', 'fi:rc') };
+subtest 'a multi() still collecting at fork sends nothing from the child' => sub {
+    run { $check->del('fi:tx') };
+    my $r = fresh_client();
+    run { $r->connect };
+    my $gate = Future->new;
+    my $tx = $r->multi(async sub { await $gate; $_[0]->incr('fi:tx') });
+    my $line = in_child {
+        $gate->done;                                    # the callback finishes here
+        child_runs_loop(0.5);
+        my $e = failure_of($tx);
+        ($tx->is_failed ? 'failed: ' . ("$e" =~ s/\n.*//sr) : 'not failed')
+            . ' connected=' . $r->is_connected;
+    };
+    like $line, qr/^failed: .*fork.* connected=0$/,
+        'in the child it fails with the forked error, having connected nowhere';
+    $gate->done;
+    is settle($tx, 3), 'done', 'the parent transaction completes';
+    is run { $check->get('fi:tx') }, 1, 'the transaction ran once, in the parent';
+    $r->disconnect;
+};
+
+subtest 'a watch_multi() still collecting at fork sends nothing from the child' => sub {
+    run { $check->del('fi:wtx') };
+    my $r = fresh_client();
+    run { $r->connect };
+    my $gate = Future->new;
+    my $tx = $r->watch_multi(['fi:wtx'], async sub { await $gate; $_[0]->incr('fi:wtx') });
+    run { Future::IO->sleep(0.05) };                    # WATCH and GET are done
+    my $line = in_child {
+        $gate->done;
+        child_runs_loop(0.5);
+        my $e = failure_of($tx);
+        ($tx->is_failed ? 'failed: ' . ("$e" =~ s/\n.*//sr) : 'not failed')
+            . ' connected=' . $r->is_connected;
+    };
+    like $line, qr/^failed: .*fork.* connected=0$/,
+        'in the child it fails with the forked error, having connected nowhere';
+    $gate->done;
+    is settle($tx, 3), 'done', 'the parent transaction completes';
+    # Had the child run it, the parent's EXEC would abort (WATCH) with undef.
+    is $tx->is_done ? $tx->get : undef, [1], 'the parent\'s EXEC ran';
+    is run { $check->get('fi:wtx') }, 1, 'the transaction ran once';
+    $r->disconnect;
+};
+
+subtest 'disconnect in a child fires no on_disconnect' => sub {
+    my $n = 0;
+    my $r = fresh_client(on_disconnect => sub { $n++ });
+    run { $r->connect };
+    is in_child { $r->disconnect; "n=$n" }, 'n=0', 'not in the child';
+    is run { $r->ping }, 'PONG', 'and the parent connection works';
+    $r->disconnect;
+    is $n, 1, 'the parent\'s own disconnect fires it';
+};
+
+run { $check->del('fi:cnt', 'fi:p', 'fi:none', 'fi:rc', 'fi:tx', 'fi:wtx') };
 
 done_testing;

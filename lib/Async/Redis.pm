@@ -489,6 +489,10 @@ sub is_connected {
 # rather than failed; and there is no reconnect handoff.
 sub disconnect {
     my ($self) = @_;
+
+    # In a forked child the parent's connection is not this one to close.
+    $self->_check_fork;
+
     my $conn          = $self->{_connection};
     my $was_connected = $self->{connected};
 
@@ -1437,6 +1441,10 @@ async sub multi {
     # so a second multi() cannot interleave with this one.
     $self->{_running_multi} = 1;
 
+    # A transaction belongs to the process that began it. In a forked
+    # child it ends with the forked error and sends nothing.
+    my $pid = $$;
+
     my $results;
     my $ok = eval {
         # Create transaction collector
@@ -1444,31 +1452,35 @@ async sub multi {
 
         # Run callback to collect commands
         await $callback->($tx);
+        $self->_die_if_forked($pid);
 
         my @commands = $tx->commands;
 
         # If no commands queued, return empty result
-        $results = @commands ? await $self->_execute_transaction(\@commands) : [];
+        $results = @commands ? await $self->_execute_transaction(\@commands, $pid) : [];
         1;
     };
     my $error = $@;
 
-    $self->{_running_multi} = 0;
+    # In a child the flag is the child's own (cleared by its fork check).
+    $self->{_running_multi} = 0 if $$ == $pid;
 
     die $error unless $ok;
     return $results;
 }
 
 async sub _execute_transaction {
-    my ($self, $commands) = @_;
+    my ($self, $commands, $pid) = @_;
 
     my $results;
     eval {
         await $self->multi_start;
+        $self->_die_if_forked($pid);
 
         # Queue all commands (they return +QUEUED)
         for my $cmd (@$commands) {
             await $self->command(@$cmd);
+            $self->_die_if_forked($pid);
         }
 
         # Execute and get results
@@ -1477,8 +1489,8 @@ async sub _execute_transaction {
     my $error = $@;
 
     if ($error) {
-        # Try to clean up
-        eval { await $self->discard };
+        # Try to clean up, in the process the transaction belongs to.
+        eval { await $self->discard } if $$ == $pid;
         die $error;
     }
 
@@ -1602,16 +1614,22 @@ async sub watch_multi {
     my $multi_started = 0;
     my $results;
 
+    # As in multi(): in a forked child the transaction ends with the
+    # forked error and sends nothing, not even its cleanup.
+    my $pid = $$;
+
     my $ok = eval {
         # WATCH must be unwound on any pre-MULTI failure, including a
         # callback die, otherwise the connection remains poisoned.
         await $self->watch(@$keys);
+        $self->_die_if_forked($pid);
         $watch_active = 1;
 
         # Get current values of watched keys
         my %watched;
         for my $key (@$keys) {
             $watched{$key} = await $self->get($key);
+            $self->_die_if_forked($pid);
         }
 
         # Create transaction collector
@@ -1619,6 +1637,7 @@ async sub watch_multi {
 
         # Run callback with watched values
         await $callback->($tx, \%watched);
+        $self->_die_if_forked($pid);
 
         my @commands = $tx->commands;
 
@@ -1630,10 +1649,12 @@ async sub watch_multi {
         }
         else {
             await $self->multi_start;
+            $self->_die_if_forked($pid);
             $multi_started = 1;
 
             for my $cmd (@commands) {
                 await $self->command(@$cmd);
+                $self->_die_if_forked($pid);
             }
 
             $results = await $self->exec;
@@ -1646,10 +1667,11 @@ async sub watch_multi {
     my $error = $@;
 
     if (!$ok) {
-        if ($multi_started) {
+        # Cleanup is sent only by the process the transaction belongs to.
+        if ($multi_started && $$ == $pid) {
             eval { await $self->discard; 1 };
         }
-        elsif ($watch_active) {
+        elsif ($watch_active && $$ == $pid) {
             eval { await $self->unwatch; 1 };
         }
 
