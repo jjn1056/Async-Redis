@@ -372,6 +372,82 @@ subtest 'disconnect in a child fires no on_disconnect' => sub {
     is $n, 1, 'the parent\'s own disconnect fires it';
 };
 
-run { $check->del('fi:cnt', 'fi:p', 'fi:none', 'fi:rc', 'fi:tx', 'fi:wtx') };
+subtest 'code run by a failing inherited command sees the child disconnected' => sub {
+    my $r = fresh_client();
+    run { $r->connect };
+    run { $r->del('fi:none') };
+    my $blpop = $r->command('BLPOP', 'fi:none', '2');
+    run { Future::IO->sleep(0.05) };
+    my ($seen, $retry);
+    $blpop->on_fail(sub { $seen = $r->is_connected; $retry = $r->ping });
+    my $line = in_child {
+        $r->is_connected;
+        my $res = eval { run { $retry } } // 'failed: ' . ("$@" =~ s/\n.*//sr);
+        "connected=$seen retry=$res";
+    };
+    is $line, 'connected=0 retry=PONG', 'it sees no connection, and a retry makes one';
+    is settle($blpop, 4), 'done', 'the parent BLPOP is untouched';
+    $r->disconnect;
+};
+
+subtest 'a child whose loop failed an inherited connect makes its own on the next command' => sub {
+    my $r = fresh_client(client_name => 'fi-parent');
+    my $c = $r->connect;
+    my $line = in_child {
+        child_runs_loop(0.5);                           # the inherited attempt fails here
+        my $id = eval { run { $r->client('ID') } } // 'failed: ' . ("$@" =~ s/\n.*//sr);
+        "id=$id";
+    };
+    is settle($c, 3), 'done', 'the parent connect completes';
+    my $parent_id = run { $r->client('ID') };
+    like $line, qr/^id=\d+$/, 'the child\'s command succeeds' or diag $line;
+    unlike $line, qr/^id=$parent_id$/, 'on a connection of its own';
+    $r->disconnect;
+};
+
+subtest 'a subscribe waiting at fork fails in the child with the forked error' => sub {
+    my $r = fresh_client();
+    run { $r->connect };
+    run { $r->del('fi:none') };
+    my $blpop = $r->command('BLPOP', 'fi:none', '1');   # subscribe waits for it
+    run { Future::IO->sleep(0.05) };
+    my $sub_f = $r->subscribe('fi:c4');
+    my $line = in_child {
+        $r->is_connected;
+        child_runs_loop(0.2);
+        $sub_f->is_failed ? 'failed: ' . (failure_of($sub_f) =~ s/\n.*//sr)
+            : $sub_f->is_done ? 'done' : 'pending';
+    };
+    like $line, qr/^failed: .*fork/, 'it fails naming the fork';
+    is settle($sub_f, 3), 'done', 'the parent subscribe completes';
+    $r->disconnect;
+};
+
+subtest 'an inherited watch_multi() ending in the child leaves the child\'s own alone' => sub {
+    run { $check->del('fi:w1', 'fi:w2') };
+    my $r = fresh_client();
+    run { $r->connect };
+    my $gate1 = Future->new;
+    my $tx1 = $r->watch_multi(['fi:w1'], async sub { await $gate1; $_[0]->incr('fi:w1') });
+    run { Future::IO->sleep(0.05) };                    # WATCH and GET are done
+    my $line = in_child {
+        $r->is_connected;
+        my $gate2 = Future->new;
+        my $tx2 = $r->watch_multi(['fi:w2'], async sub { await $gate2; $_[0]->incr('fi:w2') });
+        child_runs_loop(0.2);                           # the child's own WATCH is in place
+        my $before = $r->watching;
+        $gate1->done;                                   # the inherited one ends here
+        my $after = $r->watching;
+        $gate2->done;
+        my $res = eval { run { $tx2 } } // 'failed';
+        sprintf 'watching %d/%d result=%s', $before, $after, ref $res ? "@$res" : $res;
+    };
+    is $line, 'watching 1/1 result=1', 'the child\'s WATCH survives and its transaction commits';
+    $gate1->done;
+    is settle($tx1, 3), 'done', 'the parent transaction completes';
+    $r->disconnect;
+};
+
+run { $check->del('fi:cnt', 'fi:p', 'fi:none', 'fi:rc', 'fi:tx', 'fi:wtx', 'fi:w1', 'fi:w2') };
 
 done_testing;

@@ -622,8 +622,11 @@ sub _set_in_pubsub {
 # Die with the forked error unless this is process $pid.
 sub _die_if_forked {
     my ($self, $pid) = @_;
-    die Async::Redis::Connection::_forked_error() if $$ != $pid;
-    return;
+    return if $$ == $pid;
+    # First, while any attempt slot still holds this attempt, so the child
+    # knows it inherited one and its next use connects.
+    $self->_check_fork;
+    die Async::Redis::Connection::_forked_error();
 }
 
 # A non-blocking connect of $socket to $sockaddr, as Future::IO->connect
@@ -638,8 +641,10 @@ sub _connect_socket {
         unless $! == EINPROGRESS || $! == EWOULDBLOCK;
 
     return Future::IO->poll($socket, POLLOUT)->then(sub {
-        return Future->fail(Async::Redis::Connection::_forked_error())
-            if $$ != $pid;
+        if ($$ != $pid) {
+            $self->_check_fork;
+            return Future->fail(Async::Redis::Connection::_forked_error());
+        }
         if (my $errno = unpack('i', getsockopt($socket, SOL_SOCKET, SO_ERROR))) {
             $! = $errno;
             return Future->fail("connect: $!\n", connect => $socket, $!);
@@ -664,29 +669,28 @@ sub _check_fork {
     my $old_pid = $self->{_pid};
     $self->{_pid} = $$;
 
-    my $inherited = 0;
-    if (my $sub = $self->{_subscription}) {
-        $sub->_fail_forked;
-    }
-    if (my $pinned = delete $self->{_transaction_connection}) {
-        $pinned->abandon;
-        $inherited = 1;
-    }
-    if (my $conn = $self->{_connection}) {
-        $self->{_connection} = undef;
-        $conn->abandon;
-        $inherited = 1;
-    }
+    # Then drop the parent's state, so that the code run by failing the
+    # inherited work below (callbacks, waiting callers) already sees a
+    # client with no connection and no attempt, whose next use makes its
+    # own.
+    my $sub    = $self->{_subscription};
+    my $pinned = delete $self->{_transaction_connection};
+    my $conn   = $self->{_connection};
+    $self->{_connection} = undef;
 
     # An attempt the parent started is the parent's: dropped, not
     # cancelled. It fails in the child with the forked error if it resumes
-    # there, and the child's next use starts its own.
-    for my $slot (qw(_connect_future _reconnect_future)) {
-        $inherited = 1 if delete $self->{$slot};
-    }
+    # there.
+    my $attempts = grep { defined } map { delete $self->{$_} }
+        qw(_connect_future _reconnect_future);
+
     $self->{connected}      = 0;
     $self->{_running_multi} = 0;
-    $self->{_child_without_connection} = 1 if $inherited;
+    $self->{_child_without_connection} = 1 if $pinned || $conn || $attempts;
+
+    $sub->_fail_forked if $sub;
+    $pinned->abandon   if $pinned;
+    $conn->abandon     if $conn;
 
     if ($self->{_telemetry}) {
         $self->{_telemetry}->log_event('fork_detected', "old PID: $old_pid, new PID: $$");
@@ -1676,9 +1680,10 @@ async sub watch_multi {
         }
 
         # Cleanup can fail on a dead socket; keep local state conservative
-        # and preserve the original caller-facing error.
+        # and preserve the original caller-facing error. In a forked child
+        # the state is the child's own, not this transaction's.
         $self->_end_transaction($self->_transaction_state_connection,
-            multi => 1, watch => 1);
+            multi => 1, watch => 1) if $$ == $pid;
 
         die $error;
     }
@@ -1734,7 +1739,11 @@ async sub subscribe {
     ) unless $self->is_connected;
 
     # Wait for pending commands before entering PubSub mode
+    # A subscribe begun in the parent is the parent's; in a forked child
+    # it ends here with the forked error.
+    my $pid = $$;
     await $self->_wait_for_inflight_drain;
+    $self->_die_if_forked($pid);
 
     # Clear a stale closed subscription so we allocate a fresh object.
     if ($self->{_subscription} && $self->{_subscription}->is_closed) {
@@ -1768,7 +1777,11 @@ async sub psubscribe {
     ) unless $self->is_connected;
 
     # Wait for pending commands before entering PubSub mode
+    # A subscribe begun in the parent is the parent's; in a forked child
+    # it ends here with the forked error.
+    my $pid = $$;
     await $self->_wait_for_inflight_drain;
+    $self->_die_if_forked($pid);
 
     # Clear a stale closed subscription so we allocate a fresh object.
     if ($self->{_subscription} && $self->{_subscription}->is_closed) {
@@ -1796,7 +1809,11 @@ async sub ssubscribe {
     ) unless $self->is_connected;
 
     # Wait for pending commands before entering PubSub mode
+    # A subscribe begun in the parent is the parent's; in a forked child
+    # it ends here with the forked error.
+    my $pid = $$;
     await $self->_wait_for_inflight_drain;
+    $self->_die_if_forked($pid);
 
     # Clear a stale closed subscription so we allocate a fresh object.
     if ($self->{_subscription} && $self->{_subscription}->is_closed) {
