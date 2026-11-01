@@ -241,6 +241,8 @@ sub refusing_port {
 subtest 'a connect being refused at fork fails in the parent' => sub {
     my $r = fresh_client(host => '127.0.0.1', port => refusing_port());
     my $c = $r->connect;
+    plan skip_all => 'this system refuses a loopback connect at once, so it is never in progress at fork'
+        if $c->is_ready;
     in_child { child_runs_loop(0.5); 'ok' };
     is settle($c, 3), 'failed', 'the parent connect fails';
     like failure_of($c) // '', qr/refused/i, 'refused, as without the fork';

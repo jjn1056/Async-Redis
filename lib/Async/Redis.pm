@@ -2672,8 +2672,8 @@ subscription, or when the child's event loop wakes for it, whichever
 comes first; nothing is sent again from the child. No callbacks fire
 for it in the child (no C<on_disconnect>, no C<on_error>, no warning),
 except that a subscription in callback mode calls its C<on_error>, if
-set, once. The child subscribes again on its own connection if it needs
-to.
+set, once. To subscribe in the child, first give it a connection of its
+own (C<connect>, or any command), then subscribe again.
 
 Known limits: this is tested with L<Future::IO::Impl::IOAsync> and
 Future::IO's built-in implementation, not with UV or a Linux epoll

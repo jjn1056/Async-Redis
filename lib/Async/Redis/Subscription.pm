@@ -887,8 +887,9 @@ A subscription inherited by a forked child is the parent's. In the
 child it fails at the child's first use of the client or subscription,
 with an L<Async::Redis::Error::Disconnected> naming the fork: C<next>
 dies with it, and in callback mode C<on_error>, if registered, is
-called once with it. Nothing is warned. The child must subscribe again
-on its own client connection; the parent's subscription is unaffected.
+called once with it. Nothing is warned. To subscribe in the child, give
+the client a connection of its own first (C<connect>, or any command),
+then subscribe again; the parent's subscription is unaffected.
 
 =head2 Ordering guarantee
 
