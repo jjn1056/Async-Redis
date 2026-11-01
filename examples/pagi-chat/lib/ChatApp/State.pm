@@ -40,8 +40,10 @@ our @EXPORT_OK = qw(
 
 my $JSON = JSON::MaybeXS->new->utf8->canonical;
 
-# Redis connections (per-worker)
+# Redis connections (per-worker). $pubsub_redis is the client $pubsub
+# subscribed on; it is kept for as long as $pubsub is used.
 my $redis;
+my $pubsub_redis;
 my $pubsub;
 my $pubsub_subscription;
 
@@ -75,7 +77,7 @@ async sub init_redis {
     await $redis->connect;
 
     # Separate connection for PubSub
-    my $pubsub_redis = Async::Redis->new(host => $host, port => $port);
+    $pubsub_redis = Async::Redis->new(host => $host, port => $port);
     await $pubsub_redis->connect;
     $pubsub = await $pubsub_redis->subscribe(BROADCAST_CHANNEL);
 

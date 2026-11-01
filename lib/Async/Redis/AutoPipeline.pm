@@ -154,6 +154,8 @@ Async::Redis::AutoPipeline - Automatic command batching
 
 =head1 DESCRIPTION
 
+Internal to L<Async::Redis>; not a public API: turn it on with Async::Redis's C<auto_pipeline> option.
+
 AutoPipeline transparently batches Redis commands issued in the same
 event loop tick into a single pipeline, reducing network round-trips
 without changing the caller's API.

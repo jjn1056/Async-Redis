@@ -1,6 +1,59 @@
 Revision history for Async-Redis
 
-Unreleased
+0.003000
+    - Docs: every public method is documented, checked by a release test
+      (t/00-pod/coverage.t, Test::Pod::Coverage)
+        - New POD: evalsha_or_eval, hscan_iter/sscan_iter/zscan_iter,
+          Async::Redis::Error's methods, Async::Redis::URI's accessors,
+          the Iterator and Transaction constructors, and
+          Subscription->get_replay_commands
+        - Async::Redis::AutoPipeline, ::KeyExtractor and ::Telemetry are
+          documented as internal (used through Async::Redis's options),
+          as Async::Redis::Connection already was
+    - Behaviour change: a client that has a subscription is freed when it
+      is dropped
+        - The client and its Subscription referred to each other, so
+          neither was ever freed: a program that made and dropped
+          subscribed clients leaked them
+        - A Subscription now holds its client weakly. Keep the client
+          while you use the subscription: when the client is destroyed,
+          it ends what it holds, as disconnect does (an attempt in
+          progress stops, the connection closes), and the subscription
+          fails with Async::Redis::Error::Disconnected ("Client
+          destroyed") instead of waiting forever
+        - examples/pagi-chat kept only the subscription and is updated.
+          Signed off by John 2026-11-01 (D-R4)
+    - Bug Fix: a subscription survives its connection dropping again while
+      it is being restored
+        - With reconnect on, if the new connection was lost before the
+          channels were subscribed again, the subscription failed for
+          good ("Not connected" or "Request timed out")
+        - It now reconnects again, with growing backoff. Such losses
+          count up to reconnect_max_attempts; when it is reached the
+          subscription fails with Async::Redis::Error::Disconnected
+          ("Reconnect gave up after N attempts"), as any exhausted
+          reconnect does. Signed off by John 2026-11-01 (D-R3)
+    - Bug Fix: code attached to a command's reply that dies no longer
+      takes the connection down
+        - A die in an on_done, on_fail or then callback on one command's
+          future stopped the reader and failed every other command on
+          the connection
+        - It is now reported as a warning ("Async::Redis: a callback on a
+          command's reply died: ...") and the other replies are
+          delivered. Signed off by John 2026-11-01 (D-R5)
+    - Bug Fix: TLS connections failed during the handshake
+        - It called an IO::Socket::SSL constant by a name that does not
+          exist (SSL_ERROR_WANT_READ, not SSL_WANT_READ), and Future::IO
+          methods that 0.23 does not have (waitfor_readable/writable)
+        - TLS is now tested against a local TLS Redis (t/README.md)
+    - Bug Fix: every module in the built dist carries the dist version
+      again (GitHub #14)
+        - 0.002000 kept a version only on Async::Redis, so CPAN.pm
+          refused to upgrade an existing 0.001007 install ("would
+          downgrade installed '0.001' to 'undef'")
+        - Dist::Zilla's PkgVersion now stamps the dist version into each
+          module at build; the source keeps one version, on
+          Async::Redis. Signed off by John 2026-11-01 (D-R1)
     - Bug Fix: a forked child running its event loop no longer acts on
       the parent's connection
         - fork copies the event loop's pending work into the child.

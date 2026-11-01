@@ -67,6 +67,31 @@ Tests automatically skip if Redis is not available.
 | `redis-cluster-1` | 7001 | Cluster node |
 | `redis-cluster-2` | 7002 | Cluster node |
 | `redis-cluster-3` | 7003 | Cluster node |
+| `redis-tls` | 6390 | TLS only (self-signed) |
+
+### AUTH tests
+
+`t/10-connection/auth.t` runs its password and ACL tests only when
+pointed at a Redis that requires a password. Against `redis-auth`:
+
+```bash
+docker compose up -d redis-auth
+REDIS_AUTH_HOST=localhost REDIS_AUTH_PORT=6381 REDIS_AUTH_PASS=testpassword \
+REDIS_ACL_HOST=localhost REDIS_ACL_PORT=6381 REDIS_ACL_USER=default REDIS_ACL_PASS=testpassword \
+REDIS_HOST=localhost prove -l t/10-connection/auth.t
+```
+
+### TLS tests
+
+`t/10-connection/tls.t` runs its live tests only when pointed at a TLS
+Redis. Make the certificate (once), start the service, and set the
+variables:
+
+```bash
+perl t/tls/make-certs.pl
+docker compose up -d redis-tls
+TLS_REDIS_HOST=localhost TLS_REDIS_PORT=6390 REDIS_HOST=localhost prove -l t/10-connection/tls.t
+```
 
 ## Stopping Redis
 

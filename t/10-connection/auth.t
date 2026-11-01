@@ -145,6 +145,7 @@ SKIP: {
     subtest 'password authentication works' => sub {
         my $redis = Async::Redis->new(
             host     => $ENV{REDIS_AUTH_HOST},
+            port     => $ENV{REDIS_AUTH_PORT} // 6379,
             password => $ENV{REDIS_AUTH_PASS},
         );
 
@@ -158,6 +159,7 @@ SKIP: {
     subtest 'wrong password fails' => sub {
         my $redis = Async::Redis->new(
             host     => $ENV{REDIS_AUTH_HOST},
+            port     => $ENV{REDIS_AUTH_PORT} // 6379,
             password => 'wrongpassword',
         );
 
@@ -178,6 +180,7 @@ SKIP: {
     subtest 'ACL authentication works' => sub {
         my $redis = Async::Redis->new(
             host     => $ENV{REDIS_ACL_HOST},
+            port     => $ENV{REDIS_ACL_PORT} // 6379,
             username => $ENV{REDIS_ACL_USER},
             password => $ENV{REDIS_ACL_PASS},
         );

@@ -4,11 +4,11 @@ use strict;
 use warnings;
 use 5.018;
 
-our $VERSION = '0.002000';
+our $VERSION = '0.003000';
 
 use Future;
 use Future::AsyncAwait;
-use Future::IO 0.23 qw(POLLOUT);
+use Future::IO 0.23 qw(POLLIN POLLOUT);
 use Errno qw(EINPROGRESS EWOULDBLOCK);
 use Scalar::Util qw(blessed refaddr weaken);
 use Socket qw(pack_sockaddr_in pack_sockaddr_un inet_aton AF_INET AF_UNIX SOCK_STREAM
@@ -619,6 +619,30 @@ sub _set_in_pubsub {
     return;
 }
 
+# A dropped client ends what it still holds, as disconnect does: an
+# attempt in progress stops, its subscription (which holds it weakly)
+# fails rather than wait on a connection that is gone, and its connection
+# closes. In a forked child those are the parent's, and the fork check
+# gives them up without touching them.
+sub DESTROY {
+    my ($self) = @_;
+    return if ${^GLOBAL_PHASE} eq 'DESTRUCT';
+    $self->_check_fork;
+
+    for my $slot (qw(_reconnect_future _connect_future)) {
+        my $attempt = delete $self->{$slot} or next;
+        $attempt->cancel unless $attempt->is_ready;
+    }
+
+    my $error = Async::Redis::Subscription::_client_destroyed();
+    if (my $sub = $self->{_subscription}) {
+        $sub->_fail_fatal($error) unless $sub->is_closed;
+    }
+    if (my $conn = delete $self->{_connection}) {
+        $conn->close($error);
+    }
+}
+
 # Die with the forked error unless this is process $pid.
 sub _die_if_forked {
     my ($self, $pid) = @_;
@@ -867,9 +891,9 @@ async sub _tls_upgrade {
         my $remaining = $deadline - Time::HiRes::time();
         $remaining = 0.1 if $remaining <= 0;
 
-        if ($IO::Socket::SSL::SSL_ERROR == IO::Socket::SSL::SSL_ERROR_WANT_READ()) {
+        if ($IO::Socket::SSL::SSL_ERROR == IO::Socket::SSL::SSL_WANT_READ()) {
             # Wait for socket to become readable with timeout
-            my $read_f = Future::IO->waitfor_readable($socket);
+            my $read_f = Future::IO->poll($socket, POLLIN);
             my $timeout_f = Future::IO->sleep($remaining)->then(sub {
                 return Future->fail('tls_timeout');
             });
@@ -884,9 +908,9 @@ async sub _tls_upgrade {
                 );
             }
         }
-        elsif ($IO::Socket::SSL::SSL_ERROR == IO::Socket::SSL::SSL_ERROR_WANT_WRITE()) {
+        elsif ($IO::Socket::SSL::SSL_ERROR == IO::Socket::SSL::SSL_WANT_WRITE()) {
             # Wait for socket to become writable with timeout
-            my $write_f = Future::IO->waitfor_writable($socket);
+            my $write_f = Future::IO->poll($socket, POLLOUT);
             my $timeout_f = Future::IO->sleep($remaining)->then(sub {
                 return Future->fail('tls_timeout');
             });
@@ -992,6 +1016,17 @@ async sub _ensure_connected {
 # _connection_lost when reconnect is enabled and a subscription is active.
 # Fires _resume_after_reconnect on the subscription on success, or
 # _fail_fatal on unrecoverable reconnect failure.
+# Is $error the loss of a connection (rather than, say, an error reply)?
+sub _is_connection_loss {
+    my ($error) = @_;
+    return 0 unless blessed($error);
+    return scalar grep { $error->isa($_) } qw(
+        Async::Redis::Error::Connection
+        Async::Redis::Error::Disconnected
+        Async::Redis::Error::Timeout
+    );
+}
+
 sub _reconnect_async {
     my ($self, $sub) = @_;
 
@@ -1005,18 +1040,39 @@ sub _reconnect_async {
     my $pid = $$;
 
     my $f = (async sub {
-        # Reconnect the socket. _reconnect handles retry/backoff and
-        # dies with Disconnected if reconnect_max_attempts is exhausted.
-        await $weak_self->_reconnect;
+        # Connections lost while resubscribing. Each counts as a failed
+        # reconnect attempt, against the same reconnect_max_attempts.
+        my $lost = 0;
 
-        # Delegate the replay, on_reconnect, and driver-restart work to
-        # the subscription's unified resume path. _resume_after_reconnect
-        # handles clearing _paused, setting in_pubsub, replaying all
-        # tracked channels/patterns, firing on_reconnect, and starting
-        # the driver. Keeps the "who restarts what after reconnect"
-        # logic in one place.
-        if ($weak_sub) {
-            await $weak_sub->_resume_after_reconnect;
+        while (1) {
+            # Reconnect the socket. _reconnect handles retry/backoff and
+            # dies with Disconnected if reconnect_max_attempts is exhausted.
+            await $weak_self->_reconnect;
+
+            # Delegate the replay, on_reconnect, and driver-restart work to
+            # the subscription's unified resume path. _resume_after_reconnect
+            # handles clearing _paused, setting in_pubsub, replaying all
+            # tracked channels/patterns, firing on_reconnect, and starting
+            # the driver. Keeps the "who restarts what after reconnect"
+            # logic in one place.
+            return unless $weak_sub;
+            my $ok = eval { await $weak_sub->_resume_after_reconnect; 1 };
+            return if $ok;
+            my $error = $@;
+
+            # The new connection was lost too (the drop that ended it could
+            # not start another reconnect: this one was still running).
+            # Anything else, or a spent budget, ends the subscription.
+            die $error unless $weak_self && !$weak_self->{connected}
+                && _is_connection_loss($error);
+            $lost++;
+            my $max = $weak_self->{reconnect_max_attempts};
+            die Async::Redis::Error::Disconnected->new(
+                message => "Reconnect gave up after $max attempts",
+            ) if $max && $lost >= $max;
+
+            await Future::IO->sleep($weak_self->_calculate_backoff($lost));
+            $weak_self->_die_if_forked($pid);
         }
     })->();
 
@@ -2510,6 +2566,14 @@ execution to ensure EVALSHA will succeed.
 
 Thin wrappers around Redis C<SCRIPT> subcommands.
 
+=head2 evalsha_or_eval
+
+    my $result = await $redis->evalsha_or_eval($sha, $lua, $numkeys, @keys_and_args);
+
+Run a script by its SHA1 with C<EVALSHA>; if Redis does not have it
+cached (C<NOSCRIPT>), run C<$lua> with C<EVAL>, which also caches it.
+Any other error is rethrown.
+
 =head2 is_dirty
 
     my $dirty = $redis->is_dirty;
@@ -2571,14 +2635,18 @@ and caches for future calls. This is transparent to your code.
         for my $key (@$keys) { ... }
     }
 
-Create an iterator for SCAN. Also available:
+Create an iterator for SCAN. Iterators return batches; see
+L<Async::Redis::Iterator>.
+
+=head2 hscan_iter / sscan_iter / zscan_iter
 
     my $hash_iter = $redis->hscan_iter('hash', match => 'field:*');
     my $set_iter  = $redis->sscan_iter('set', count => 100);
     my $zset_iter = $redis->zscan_iter('zset');
 
-Iterators return batches. C<ZSCAN> batches are the Redis flat
-member/score list.
+Iterators over one hash, set or sorted set (C<HSCAN>, C<SSCAN>,
+C<ZSCAN>), taking the key and then the same options as C<scan_iter>.
+C<ZSCAN> batches are the Redis flat member/score list.
 
 =head1 CONNECTION POOLING
 
@@ -2641,6 +2709,11 @@ Errors returned by Redis (WRONGTYPE, ERR, etc.)
 Operation attempted on disconnected client.
 
 =back
+
+A callback you attach to a command's future (C<on_done>, C<on_fail>,
+C<then> and so on) runs when its reply arrives. If it dies, the error is
+reported as a warning and the connection carries on: the other
+commands on it still get their replies.
 
 =head1 FORK SAFETY
 

@@ -31,7 +31,8 @@ SKIP: {
         eval { $r->disconnect };
     };
 
-    subtest 'B10: a transaction never commits writes after its connection drops' => sub {
+    for my $ap (0, 1) {
+    subtest "B10: a transaction never commits writes after its connection drops (auto_pipeline=$ap)" => sub {
         my $admin = Async::Redis->new(host => $ENV{REDIS_HOST} // 'localhost');
         run { $admin->connect };
         run { $admin->del('lt:tx') };
@@ -40,6 +41,7 @@ SKIP: {
             host            => $ENV{REDIS_HOST} // 'localhost',
             reconnect       => 1,
             reconnect_delay => 0.01,
+            auto_pipeline   => $ap,
         );
         run { $r->connect };
         my $id = run { $r->client('ID') };
@@ -62,6 +64,7 @@ SKIP: {
         eval { $r->disconnect };
         eval { $admin->disconnect };
     };
+    }
 
     my $admin = Async::Redis->new(host => $ENV{REDIS_HOST} // 'localhost');
     run { $admin->connect };

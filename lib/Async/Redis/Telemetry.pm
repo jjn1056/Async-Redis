@@ -456,6 +456,8 @@ Async::Redis::Telemetry - Observability for Redis client
 
 =head1 DESCRIPTION
 
+Internal to L<Async::Redis>; not a public API: configure it with Async::Redis's C<debug> and C<otel_*> options.
+
 Provides OpenTelemetry tracing, metrics collection, and debug logging
 with automatic credential redaction.
 

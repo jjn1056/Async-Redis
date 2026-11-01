@@ -32,3 +32,6 @@ TODO*.md
 .claude/
 .private-journal/
 docs/
+
+# Test TLS certificates (t/tls/make-certs.pl)
+t/tls/*.pem

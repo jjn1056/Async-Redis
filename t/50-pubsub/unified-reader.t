@@ -211,8 +211,8 @@ subtest '_dispatch_frame: queue bounded by message_queue_depth' => sub {
     # Simulates the reader dispatching frames into a subscription whose
     # consumer has not called next() yet.
     use Async::Redis::Subscription;
-    my $redis_mock = bless { message_queue_depth => 2 }, 'Async::Redis';
-    my $sub = Async::Redis::Subscription->new(redis => $redis_mock);
+    my $redis = Async::Redis->new(host => 'localhost', message_queue_depth => 2);
+    my $sub = Async::Redis::Subscription->new(redis => $redis);
 
     # Prime channels so _start_driver guard passes (not needed here, just state)
     $sub->{channels}{'test-ch'} = 1;

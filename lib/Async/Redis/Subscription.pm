@@ -11,6 +11,7 @@ use Future::IO;
 use Scalar::Util qw(blessed refaddr weaken);
 
 use Async::Redis::Connection ();
+use Async::Redis::Error::Disconnected;
 
 
 # Threshold for periodic event-loop yield inside the callback driver
@@ -21,7 +22,7 @@ use constant MAX_SYNC_DEPTH => 32;
 sub new {
     my ($class, %args) = @_;
 
-    return bless {
+    my $self = bless {
         redis             => $args{redis},
         channels          => {},      # channel => 1 (for regular subscribe)
         patterns          => {},      # pattern => 1 (for psubscribe)
@@ -38,6 +39,12 @@ sub new {
         _paused           => 0,       # Set during reconnect; clears in _resume_after_reconnect
         _pid              => $$,      # The process that subscribed
     }, $class;
+
+    # The client owns its subscription, not the other way round; when the
+    # client is destroyed, it fails this subscription (see its DESTROY).
+    weaken($self->{redis});
+
+    return $self;
 }
 
 # Set/get reconnect callback
@@ -457,6 +464,10 @@ sub _fail_forked {
     $self->_call_on_error($err) if $self->{_on_message} && $self->{_on_error};
 }
 
+sub _client_destroyed {
+    return Async::Redis::Error::Disconnected->new(message => 'Client destroyed');
+}
+
 sub _check_fork {
     my ($self) = @_;
     return if $self->{_pid} == $$;
@@ -573,7 +584,7 @@ async sub unsubscribe {
 
     return if $self->{_closed};
 
-    my $redis = $self->{redis};
+    my $redis = $self->{redis} or die _client_destroyed();
 
     # Resolve the list of channels to unsubscribe: explicit list or all.
     my @to_remove = @channels ? @channels : $self->channels;
@@ -600,7 +611,7 @@ async sub punsubscribe {
 
     return if $self->{_closed};
 
-    my $redis = $self->{redis};
+    my $redis = $self->{redis} or die _client_destroyed();
 
     my @to_remove = @patterns ? @patterns : $self->patterns;
 
@@ -623,7 +634,7 @@ async sub sunsubscribe {
 
     return if $self->{_closed};
 
-    my $redis = $self->{redis};
+    my $redis = $self->{redis} or die _client_destroyed();
 
     my @to_remove = @channels ? @channels : $self->sharded_channels;
 
@@ -768,6 +779,14 @@ Return the currently tracked regular channels, patterns, or sharded channels.
 
 Return the total number of tracked regular, pattern, and sharded subscriptions.
 
+=head2 get_replay_commands
+
+    my @commands = $sub->get_replay_commands;   # (['SUBSCRIBE', @channels], ...)
+
+The commands that subscribe to everything this subscription tracks: one
+array ref each for C<SUBSCRIBE>, C<PSUBSCRIBE> and C<SSUBSCRIBE>, for
+those that have entries. This is what is sent again after a reconnect.
+
 =head2 is_closed
 
 Return true after the subscription has been closed.
@@ -890,6 +909,12 @@ dies with it, and in callback mode C<on_error>, if registered, is
 called once with it. Nothing is warned. To subscribe in the child, give
 the client a connection of its own first (C<connect>, or any command),
 then subscribe again; the parent's subscription is unaffected.
+
+A subscription belongs to the client that made it, and holds it weakly.
+Keep the client for as long as you use the subscription: once the client
+is destroyed, the subscription fails with an
+L<Async::Redis::Error::Disconnected> ("Client destroyed"), so C<next>
+dies and, in callback mode, C<on_error> is called (or a warning given).
 
 =head2 Ordering guarantee
 

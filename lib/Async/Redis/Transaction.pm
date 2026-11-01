@@ -76,6 +76,13 @@ their actual results from C<EXEC>, in the same order the commands were queued.
 
 =head1 METHODS
 
+=head2 new
+
+    my $tx = Async::Redis::Transaction->new(redis => $redis);
+
+Made by C<multi> and C<watch_multi> in L<Async::Redis>, which pass it to
+your callback.
+
 =head2 command
 
     $tx->command('SET', 'key', 'value');

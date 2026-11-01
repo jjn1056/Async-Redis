@@ -493,6 +493,8 @@ Async::Redis::KeyExtractor - Key position detection for Redis commands
 
 =head1 DESCRIPTION
 
+Internal to L<Async::Redis>; not a public API: it applies Async::Redis's C<prefix> option.
+
 This module handles the complex task of identifying which arguments to Redis
 commands are keys (and should receive namespace prefixes) vs values/options
 (which should not be modified).
