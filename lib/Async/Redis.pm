@@ -8,7 +8,7 @@ our $VERSION = '0.003000';
 
 use Future;
 use Future::AsyncAwait;
-use Future::IO 0.23 qw(POLLOUT);
+use Future::IO 0.23 qw(POLLIN POLLOUT);
 use Errno qw(EINPROGRESS EWOULDBLOCK);
 use Scalar::Util qw(blessed refaddr weaken);
 use Socket qw(pack_sockaddr_in pack_sockaddr_un inet_aton AF_INET AF_UNIX SOCK_STREAM
@@ -867,9 +867,9 @@ async sub _tls_upgrade {
         my $remaining = $deadline - Time::HiRes::time();
         $remaining = 0.1 if $remaining <= 0;
 
-        if ($IO::Socket::SSL::SSL_ERROR == IO::Socket::SSL::SSL_ERROR_WANT_READ()) {
+        if ($IO::Socket::SSL::SSL_ERROR == IO::Socket::SSL::SSL_WANT_READ()) {
             # Wait for socket to become readable with timeout
-            my $read_f = Future::IO->waitfor_readable($socket);
+            my $read_f = Future::IO->poll($socket, POLLIN);
             my $timeout_f = Future::IO->sleep($remaining)->then(sub {
                 return Future->fail('tls_timeout');
             });
@@ -884,9 +884,9 @@ async sub _tls_upgrade {
                 );
             }
         }
-        elsif ($IO::Socket::SSL::SSL_ERROR == IO::Socket::SSL::SSL_ERROR_WANT_WRITE()) {
+        elsif ($IO::Socket::SSL::SSL_ERROR == IO::Socket::SSL::SSL_WANT_WRITE()) {
             # Wait for socket to become writable with timeout
-            my $write_f = Future::IO->waitfor_writable($socket);
+            my $write_f = Future::IO->poll($socket, POLLOUT);
             my $timeout_f = Future::IO->sleep($remaining)->then(sub {
                 return Future->fail('tls_timeout');
             });

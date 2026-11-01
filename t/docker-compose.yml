@@ -28,6 +28,21 @@ services:
       timeout: 3s
       retries: 3
 
+  # Redis over TLS only. Make its certificate first: perl t/tls/make-certs.pl
+  redis-tls:
+    image: redis:7-alpine
+    ports:
+      - "6390:6390"
+    volumes:
+      - ./tls:/tls:ro
+    command: >
+      redis-server
+      --port 0
+      --tls-port 6390
+      --tls-cert-file /tls/cert.pem
+      --tls-key-file /tls/key.pem
+      --tls-auth-clients no
+
   # Redis replica (for testing replica reads)
   redis-replica:
     image: redis:7-alpine

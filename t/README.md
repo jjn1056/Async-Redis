@@ -67,6 +67,19 @@ Tests automatically skip if Redis is not available.
 | `redis-cluster-1` | 7001 | Cluster node |
 | `redis-cluster-2` | 7002 | Cluster node |
 | `redis-cluster-3` | 7003 | Cluster node |
+| `redis-tls` | 6390 | TLS only (self-signed) |
+
+### TLS tests
+
+`t/10-connection/tls.t` runs its live tests only when pointed at a TLS
+Redis. Make the certificate (once), start the service, and set the
+variables:
+
+```bash
+perl t/tls/make-certs.pl
+docker compose up -d redis-tls
+TLS_REDIS_HOST=localhost TLS_REDIS_PORT=6390 REDIS_HOST=localhost prove -l t/10-connection/tls.t
+```
 
 ## Stopping Redis
 

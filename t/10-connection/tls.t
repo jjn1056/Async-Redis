@@ -2,7 +2,7 @@
 use strict;
 use warnings;
 use Test::Lib;
-use Test::Async::Redis ':redis';
+use Test::Async::Redis ':redis', 'settle', 'failure_of';
 use Test2::V0;
 use Async::Redis;
 use Time::HiRes qw(time);
@@ -68,11 +68,11 @@ SKIP: {
 
 # TLS tests with actual TLS Redis require specific setup
 SKIP: {
-    skip "Set TLS_REDIS_HOST and TLS_REDIS_PORT to test TLS", 3
+    skip "Set TLS_REDIS_HOST and TLS_REDIS_PORT to test TLS", 5
         unless $ENV{TLS_REDIS_HOST} && $ENV{TLS_REDIS_PORT};
 
     my $has_ssl = eval { require IO::Socket::SSL; 1 };
-    skip "IO::Socket::SSL not available", 3 unless $has_ssl;
+    skip "IO::Socket::SSL not available", 5 unless $has_ssl;
 
     subtest 'TLS connection works' => sub {
         my $redis = Async::Redis->new(
@@ -111,7 +111,7 @@ SKIP: {
     };
 
     subtest 'TLS with auth works' => sub {
-        skip "Set TLS_REDIS_PASS to test TLS+auth", 1
+        plan skip_all => "Set TLS_REDIS_PASS to test TLS+auth"
             unless $ENV{TLS_REDIS_PASS};
 
         my $redis = Async::Redis->new(
@@ -125,6 +125,40 @@ SKIP: {
         my $pong = run { $redis->ping };
         is($pong, 'PONG', 'TLS + auth works');
 
+        $redis->disconnect;
+    };
+
+    # The test server's certificate is self-signed, so verification
+    # (the default) must refuse it.
+    subtest 'verification on rejects the self-signed server' => sub {
+        my $redis = Async::Redis->new(
+            host            => $ENV{TLS_REDIS_HOST},
+            port            => $ENV{TLS_REDIS_PORT},
+            tls             => 1,
+            connect_timeout => 3,
+        );
+        my $t0 = time();
+        my $f  = $redis->connect;
+        is settle($f, 4), 'failed', 'the connect fails';
+        ok time() - $t0 < 4, 'promptly';
+        my $e = failure_of($f);
+        isa_ok $e, 'Async::Redis::Error::Connection';
+        like "$e", qr/certificate|verif/i, 'naming the certificate problem';
+    };
+
+    subtest 'a large value round-trips over TLS' => sub {
+        my $redis = Async::Redis->new(
+            host => $ENV{TLS_REDIS_HOST},
+            port => $ENV{TLS_REDIS_PORT},
+            tls  => { verify => 0 },
+        );
+        run { $redis->connect };
+        my $value = join '', map { chr(65 + $_ % 26) } 1 .. 200_000;
+        run { $redis->set('tls:big', $value) };
+        my $got = run { $redis->get('tls:big') };
+        is length($got // ''), 200_000, 'all of it arrives';
+        ok defined $got && $got eq $value, 'intact';
+        run { $redis->del('tls:big') };
         $redis->disconnect;
     };
 }

@@ -1,6 +1,11 @@
 Revision history for Async-Redis
 
 0.003000
+    - Bug Fix: TLS connections failed during the handshake
+        - It called an IO::Socket::SSL constant by a name that does not
+          exist (SSL_ERROR_WANT_READ, not SSL_WANT_READ), and Future::IO
+          methods that 0.23 does not have (waitfor_readable/writable)
+        - TLS is now tested against a local TLS Redis (t/README.md)
     - Bug Fix: every module in the built dist carries the dist version
       again (GitHub #14)
         - 0.002000 kept a version only on Async::Redis, so CPAN.pm
