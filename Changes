@@ -1,6 +1,14 @@
 Revision history for Async-Redis
 
 0.003000
+    - Bug Fix: code attached to a command's reply that dies no longer
+      takes the connection down
+        - A die in an on_done, on_fail or then callback on one command's
+          future stopped the reader and failed every other command on
+          the connection
+        - It is now reported as a warning ("Async::Redis: a callback on a
+          command's reply died: ...") and the other replies are
+          delivered. Signed off by John 2026-11-01 (D-R5)
     - Bug Fix: TLS connections failed during the handshake
         - It called an IO::Socket::SSL constant by a name that does not
           exist (SSL_ERROR_WANT_READ, not SSL_WANT_READ), and Future::IO

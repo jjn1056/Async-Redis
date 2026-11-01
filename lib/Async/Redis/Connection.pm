@@ -248,6 +248,20 @@ sub _reporting_exceptions {
     return;
 }
 
+# Resolve $entry's future with its reply. That runs the caller's code
+# attached to it (on_done, on_fail, then ...); if that code dies, the
+# error is the caller's, so it is reported and the reader carries on
+# with the other commands' replies.
+sub _deliver {
+    my ($entry, $method, @value) = @_;
+    my $f = $entry->{future};
+    return if $f->is_ready;
+    local $@;
+    eval { $f->$method(@value); 1 }
+        or Carp::carp("Async::Redis: a callback on a command's reply died: $@");
+    return;
+}
+
 sub _endpoint {
     my ($self) = @_;
     my $client = $self->{client};
@@ -516,12 +530,12 @@ async sub _run_reader {
             my $entry = shift @{$self->{inflight}};
             if ($kind eq 'redis_error') {
                 if (($entry->{redis_error} // 'fail') eq 'capture') {
-                    $entry->{future}->done($value) unless $entry->{future}->is_ready;
+                    _deliver($entry, done => $value);
                 } else {
-                    $entry->{future}->fail($value) unless $entry->{future}->is_ready;
+                    _deliver($entry, fail => $value);
                 }
             } else {
-                $entry->{future}->done($value) unless $entry->{future}->is_ready;
+                _deliver($entry, done => $value);
             }
         }
     }

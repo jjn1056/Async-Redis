@@ -174,6 +174,35 @@ SKIP: {
         eval { $r->disconnect };
     };
 
+    # Code attached to one command's future that dies must not cost the
+    # other commands on the connection their replies. It is reported.
+    for my $case (
+        [ on_done => sub { $_[0]->get('iso:a') } ],
+        [ on_fail => sub { $_[0]->command('LPUSH', 'iso:str') } ],   # wrong arity
+    ) {
+        my ($method, $start) = @$case;
+        subtest "a dying $method callback does not affect other commands" => sub {
+            my $r = new_client(); run { $r->connect };
+            run { $r->mset('iso:a', 1, 'iso:b', 2) };
+            my $id = run { $r->client('ID') };
+
+            my @warnings;
+            local $SIG{__WARN__} = sub { push @warnings, @_ };
+            my $first  = $start->($r);
+            my $second = $r->get('iso:b');
+            $first->$method(sub { die "boom\n" });
+
+            is settle($second), 'done', 'the other command completes';
+            is $second->get, 2, 'with its reply';
+            is run { $r->client('ID') }, $id, 'on the same connection';
+            is run { $r->ping }, 'PONG', 'which still works';
+            is scalar(@warnings), 1, 'one warning';
+            like $warnings[0] // '', qr/a callback on a command's reply died: boom/,
+                'reporting the callback';
+            eval { $r->disconnect };
+        };
+    }
+
     cleanup_keys($redis, 'iso:*');
 }
 

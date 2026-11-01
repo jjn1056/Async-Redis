@@ -2642,6 +2642,11 @@ Operation attempted on disconnected client.
 
 =back
 
+A callback you attach to a command's future (C<on_done>, C<on_fail>,
+C<then> and so on) runs when its reply arrives. If it dies, the error is
+reported as a warning and the connection carries on: the other
+commands on it still get their replies.
+
 =head1 FORK SAFETY
 
 Async::Redis is fork-safe. A connection belongs to the process that
