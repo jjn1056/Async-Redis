@@ -540,10 +540,49 @@ SKIP: {
         my $ok  = eval { run { with_timeout(3, $sub->next) }; 1 };
         my $err = $@;
         ok !$ok, 'next fails';
-        ok ref $err && $err->isa('Async::Redis::Error'), 'with an Async::Redis error'
-            or diag "$err";
+        ok ref $err && $err->isa('Async::Redis::Error::Disconnected'),
+            'with the documented give-up error' or diag "$err";
+        like "$err", qr/gave up after 2 attempts/, 'naming the cap';
         ok $sub->is_closed, 'the subscription is closed';
         eval { $r->disconnect };
+        eval { $admin->disconnect };
+    };
+
+    subtest 'with unlimited attempts, the wait between resubscribes grows' => sub {
+        my @lost;
+        my ($admin, $r, $id, $sub) = $resubscribing->(
+            reconnect_max_attempts => 0,
+            reconnect_delay        => 0.3,
+            reconnect_jitter       => 0,
+            on_disconnect          => sub { push @lost, Time::HiRes::time() },
+        );
+        # Losses come at about 0, 0.2, 0.7 and 1.5s (backoff 0.3 then 0.6,
+        # each plus the 0.2s request timeout); a fixed backoff would give
+        # gaps of 0.5 and 0.5.
+        $drop_then_stall->($admin, $id, 200_000_000);     # about 2.7s
+        ok @lost >= 4, 'the kill and three lost resubscribes (' . scalar(@lost) . ')';
+        if (@lost >= 4) {
+            my ($gap1, $gap2) = ($lost[2] - $lost[1], $lost[3] - $lost[2]);
+            cmp_ok $gap2 - $gap1, '>', 0.15,
+                sprintf('backoff grows (%.2fs then %.2fs)', $gap1, $gap2);
+        }
+        eval { $r->disconnect };
+        eval { $admin->disconnect };
+    };
+
+    subtest 'a client dropped while waiting to resubscribe goes quietly' => sub {
+        my @warnings;
+        local $SIG{__WARN__} = sub { push @warnings, @_ };
+        my ($admin, $r, $id, $sub) = $resubscribing->(
+            reconnect_delay  => 1,
+            reconnect_jitter => 0,
+        );
+        $drop_then_stall->($admin, $id, 60_000_000);      # one lost resubscribe
+        ok !$r->is_connected, 'waiting out the backoff';
+        undef $r;
+        undef $sub;
+        run { Future::IO->sleep(1.5) };
+        is \@warnings, [], 'no warnings';
         eval { $admin->disconnect };
     };
 }

@@ -152,7 +152,7 @@ subtest '_dispatch_frame queues message in callback mode (driver consumes)' => s
 subtest '_dispatch_frame: depth backpressure applies in callback mode too' => sub {
     # Backpressure Future is returned when queue is at depth — same path
     # in both modes since _dispatch_frame is now mode-agnostic.
-    my $redis = bless { message_queue_depth => 1 }, 'Async::Redis';
+    my $redis = Async::Redis->new(host => 'localhost', message_queue_depth => 1);
     my $sub = Async::Redis::Subscription->new(redis => $redis);
 
     $sub->on_message(sub { 1 });   # set callback mode

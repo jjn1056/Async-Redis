@@ -98,6 +98,22 @@ subtest 'a client and its subscription are freed together' => sub {
     ok !defined $weak_sub, 'the subscription is freed';
 };
 
+subtest 'a dropped subscribed client closes its connection' => sub {
+    my $admin = new_redis();
+    $admin->connect->get;
+    my $id;
+    {
+        my $r = new_redis();
+        $r->connect->get;
+        $id = $r->client('ID')->get;
+        my $sub = $r->subscribe('ch-life-closed')->get;
+    }
+    Future::IO->sleep(0.2)->get;
+    my $list = $admin->client('LIST')->get;
+    unlike $list, qr/^id=$id /m, 'the server no longer has it';
+    $admin->disconnect;
+};
+
 subtest 'a subscription whose client is destroyed fails instead of hanging' => sub {
     my $r = new_redis();
     $r->connect->get;

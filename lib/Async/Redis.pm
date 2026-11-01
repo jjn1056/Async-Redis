@@ -619,15 +619,28 @@ sub _set_in_pubsub {
     return;
 }
 
-# A subscription holds its client weakly. When the client goes, the
-# subscription fails rather than wait on a connection that is gone.
+# A dropped client ends what it still holds, as disconnect does: an
+# attempt in progress stops, its subscription (which holds it weakly)
+# fails rather than wait on a connection that is gone, and its connection
+# closes. In a forked child those are the parent's, and the fork check
+# gives them up without touching them.
 sub DESTROY {
     my ($self) = @_;
     return if ${^GLOBAL_PHASE} eq 'DESTRUCT';
-    my $sub = $self->{_subscription} or return;
-    $sub->_check_fork;    # a forked child's is the parent's: forked error
-    return if $sub->is_closed;
-    $sub->_fail_fatal(Async::Redis::Subscription::_client_destroyed());
+    $self->_check_fork;
+
+    for my $slot (qw(_reconnect_future _connect_future)) {
+        my $attempt = delete $self->{$slot} or next;
+        $attempt->cancel unless $attempt->is_ready;
+    }
+
+    my $error = Async::Redis::Subscription::_client_destroyed();
+    if (my $sub = $self->{_subscription}) {
+        $sub->_fail_fatal($error) unless $sub->is_closed;
+    }
+    if (my $conn = delete $self->{_connection}) {
+        $conn->close($error);
+    }
 }
 
 # Die with the forked error unless this is process $pid.
@@ -1052,10 +1065,13 @@ sub _reconnect_async {
             # Anything else, or a spent budget, ends the subscription.
             die $error unless $weak_self && !$weak_self->{connected}
                 && _is_connection_loss($error);
+            $lost++;
             my $max = $weak_self->{reconnect_max_attempts};
-            die $error if $max && ++$lost >= $max;
+            die Async::Redis::Error::Disconnected->new(
+                message => "Reconnect gave up after $max attempts",
+            ) if $max && $lost >= $max;
 
-            await Future::IO->sleep($weak_self->_calculate_backoff($lost || 1));
+            await Future::IO->sleep($weak_self->_calculate_backoff($lost));
             $weak_self->_die_if_forked($pid);
         }
     })->();
