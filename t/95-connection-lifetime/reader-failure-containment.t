@@ -12,7 +12,7 @@ use warnings;
 use Test2::V0;
 use Test::Lib;
 use Test::Async::Redis qw(run settle failure_of inject_reader_bug inject_eof
-                          skip_without_redis cleanup_keys);
+                          skip_without_redis cleanup_keys with_timeout);
 use Future::IO;
 use Async::Redis;
 
@@ -181,6 +181,38 @@ SKIP: {
         isa_ok failure_of($second), 'Async::Redis::Error::Disconnected';
         ok loop_still_works(), 'the event loop still runs afterwards';
         is \@warnings, [], 'the reader stops cleanly, with no warnings';
+    };
+
+    subtest 'a reader crash while subscribed, with reconnect on, resumes the subscription' => sub {
+        my @warnings;
+        local $SIG{__WARN__} = sub { push @warnings, @_ };
+        my $admin = Async::Redis->new(host => $ENV{REDIS_HOST} // 'localhost');
+        run { $admin->connect };
+        my $r = Async::Redis->new(
+            host            => $ENV{REDIS_HOST} // 'localhost',
+            reconnect       => 1,
+            reconnect_delay => 0.05,
+        );
+        run { $r->connect };
+        my $sub = run { $r->subscribe('lt:resume') };
+        my $resumed = 0;
+        $sub->on_reconnect(sub { $resumed++ });
+
+        my $guard = inject_reader_bug($r);
+        settle($admin->publish('lt:resume', 'lost'));       # crashes the reader
+        my $until = time + 3;
+        run { Future::IO->sleep(0.02) } while !$resumed && time < $until;
+        undef $guard;
+        is $resumed, 1, 'the subscription was restored';
+
+        settle($admin->publish('lt:resume', 'after'));
+        my $msg = eval { run { with_timeout(2, $sub->next) } };
+        is $msg && $msg->{data}, 'after', 'and receives messages' or diag $@;
+        ok !$sub->is_closed, 'it is still open';
+        is scalar(@warnings), 1, 'one warning';
+        like $warnings[0] // '', qr/reader stopped: INJECTED_READER_BUG/, 'reporting the crash';
+        eval { $r->disconnect };
+        eval { $admin->disconnect };
     };
 
     cleanup_keys($redis, 'lt:*');
