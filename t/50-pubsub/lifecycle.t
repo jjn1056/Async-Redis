@@ -3,7 +3,7 @@ use warnings;
 use Test2::V0;
 use Test::Lib;
 use Test::Async::Redis ();   # selects the suite's Future::IO event loop
-use Scalar::Util qw(refaddr);
+use Scalar::Util qw(refaddr weaken);
 use Future::AsyncAwait;
 use Async::Redis;
 use Async::Redis::Error::Connection;
@@ -80,6 +80,51 @@ subtest 'identity guard: stale _close does not clear a newer subscription' => su
         $sub2->_close;
         $r->disconnect;
     })->()->get;
+};
+
+# A client and its subscription refer to each other; dropping the client
+# must free both, and a subscription kept on its own must not hang.
+
+subtest 'a client and its subscription are freed together' => sub {
+    my ($weak_r, $weak_sub);
+    {
+        my $r = new_redis();
+        $r->connect->get;
+        my $sub = $r->subscribe('ch-life-free')->get;
+        weaken($weak_r   = $r);
+        weaken($weak_sub = $sub);
+    }
+    ok !defined $weak_r,   'the client is freed';
+    ok !defined $weak_sub, 'the subscription is freed';
+};
+
+subtest 'a subscription whose client is destroyed fails instead of hanging' => sub {
+    my $r = new_redis();
+    $r->connect->get;
+    my $sub = $r->subscribe('ch-life-gone')->get;
+    undef $r;
+    my $next = $sub->next;
+    my $timeout = Future::IO->sleep(2)->then(sub { Future->fail('timeout') });
+    Future->wait_any($next->without_cancel, $timeout)->await;
+    ok $next->is_failed, 'next fails';
+    my ($e) = $next->is_failed ? $next->failure : ();
+    isa_ok $e, 'Async::Redis::Error::Disconnected';
+    like "$e", qr/Client destroyed/, 'saying why';
+};
+
+subtest 'callback mode: a destroyed client calls on_error once, no warning' => sub {
+    my $r = new_redis();
+    $r->connect->get;
+    my $sub = $r->subscribe('ch-life-cb')->get;
+    my @errors;
+    $sub->on_message(sub {});
+    $sub->on_error(sub { push @errors, $_[1] });
+    my @warnings;
+    local $SIG{__WARN__} = sub { push @warnings, @_ };
+    undef $r;
+    is scalar @errors, 1, 'on_error once';
+    like $errors[0] // '', qr/Client destroyed/, 'with the reason';
+    is \@warnings, [], 'no warnings';
 };
 
 done_testing;

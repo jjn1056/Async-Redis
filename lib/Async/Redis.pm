@@ -619,6 +619,17 @@ sub _set_in_pubsub {
     return;
 }
 
+# A subscription holds its client weakly. When the client goes, the
+# subscription fails rather than wait on a connection that is gone.
+sub DESTROY {
+    my ($self) = @_;
+    return if ${^GLOBAL_PHASE} eq 'DESTRUCT';
+    my $sub = $self->{_subscription} or return;
+    $sub->_check_fork;    # a forked child's is the parent's: forked error
+    return if $sub->is_closed;
+    $sub->_fail_fatal(Async::Redis::Subscription::_client_destroyed());
+}
+
 # Die with the forked error unless this is process $pid.
 sub _die_if_forked {
     my ($self, $pid) = @_;

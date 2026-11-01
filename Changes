@@ -1,6 +1,17 @@
 Revision history for Async-Redis
 
 0.003000
+    - Behaviour change: a client that has a subscription is freed when it
+      is dropped
+        - The client and its Subscription referred to each other, so
+          neither was ever freed: a program that made and dropped
+          subscribed clients leaked them
+        - A Subscription now holds its client weakly. Keep the client
+          while you use the subscription: when the client is destroyed,
+          the subscription fails with Async::Redis::Error::Disconnected
+          ("Client destroyed") instead of waiting forever
+        - examples/pagi-chat kept only the subscription and is updated.
+          Signed off by John 2026-11-01 (D-R4)
     - Bug Fix: a subscription survives its connection dropping again while
       it is being restored
         - With reconnect on, if the new connection was lost before the
