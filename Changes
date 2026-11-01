@@ -1,6 +1,14 @@
 Revision history for Async-Redis
 
 0.003000
+    - Bug Fix: a subscription survives its connection dropping again while
+      it is being restored
+        - With reconnect on, if the new connection was lost before the
+          channels were subscribed again, the subscription failed for
+          good ("Not connected" or "Request timed out")
+        - It now reconnects again. Each such loss counts as a failed
+          reconnect attempt, with the usual backoff, against
+          reconnect_max_attempts. Signed off by John 2026-11-01 (D-R3)
     - Bug Fix: code attached to a command's reply that dies no longer
       takes the connection down
         - A die in an on_done, on_fail or then callback on one command's

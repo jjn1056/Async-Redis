@@ -992,6 +992,17 @@ async sub _ensure_connected {
 # _connection_lost when reconnect is enabled and a subscription is active.
 # Fires _resume_after_reconnect on the subscription on success, or
 # _fail_fatal on unrecoverable reconnect failure.
+# Is $error the loss of a connection (rather than, say, an error reply)?
+sub _is_connection_loss {
+    my ($error) = @_;
+    return 0 unless blessed($error);
+    return scalar grep { $error->isa($_) } qw(
+        Async::Redis::Error::Connection
+        Async::Redis::Error::Disconnected
+        Async::Redis::Error::Timeout
+    );
+}
+
 sub _reconnect_async {
     my ($self, $sub) = @_;
 
@@ -1005,18 +1016,36 @@ sub _reconnect_async {
     my $pid = $$;
 
     my $f = (async sub {
-        # Reconnect the socket. _reconnect handles retry/backoff and
-        # dies with Disconnected if reconnect_max_attempts is exhausted.
-        await $weak_self->_reconnect;
+        # Connections lost while resubscribing. Each counts as a failed
+        # reconnect attempt, against the same reconnect_max_attempts.
+        my $lost = 0;
 
-        # Delegate the replay, on_reconnect, and driver-restart work to
-        # the subscription's unified resume path. _resume_after_reconnect
-        # handles clearing _paused, setting in_pubsub, replaying all
-        # tracked channels/patterns, firing on_reconnect, and starting
-        # the driver. Keeps the "who restarts what after reconnect"
-        # logic in one place.
-        if ($weak_sub) {
-            await $weak_sub->_resume_after_reconnect;
+        while (1) {
+            # Reconnect the socket. _reconnect handles retry/backoff and
+            # dies with Disconnected if reconnect_max_attempts is exhausted.
+            await $weak_self->_reconnect;
+
+            # Delegate the replay, on_reconnect, and driver-restart work to
+            # the subscription's unified resume path. _resume_after_reconnect
+            # handles clearing _paused, setting in_pubsub, replaying all
+            # tracked channels/patterns, firing on_reconnect, and starting
+            # the driver. Keeps the "who restarts what after reconnect"
+            # logic in one place.
+            return unless $weak_sub;
+            my $ok = eval { await $weak_sub->_resume_after_reconnect; 1 };
+            return if $ok;
+            my $error = $@;
+
+            # The new connection was lost too (the drop that ended it could
+            # not start another reconnect: this one was still running).
+            # Anything else, or a spent budget, ends the subscription.
+            die $error unless $weak_self && !$weak_self->{connected}
+                && _is_connection_loss($error);
+            my $max = $weak_self->{reconnect_max_attempts};
+            die $error if $max && ++$lost >= $max;
+
+            await Future::IO->sleep($weak_self->_calculate_backoff($lost || 1));
+            $weak_self->_die_if_forked($pid);
         }
     })->();
 

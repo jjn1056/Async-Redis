@@ -5,11 +5,12 @@
 use strict;
 use warnings;
 use Test::Lib;
-use Test::Async::Redis qw(run skip_without_redis await_f fake_connection);
+use Test::Async::Redis qw(run skip_without_redis await_f fake_connection with_timeout);
 use Future::AsyncAwait;
 use Test2::V0;
 use Async::Redis;
 use Future;
+use Time::HiRes ();
 
 # --- Unit tests (no Redis needed) ---
 
@@ -159,7 +160,7 @@ SKIP: {
         run { $r->connect };
         $r;
     };
-    skip "Redis not available: $@", 6 unless $test_redis;
+    skip "Redis not available: $@", 8 unless $test_redis;
     $test_redis->disconnect;
 
     my $TEST_TIMEOUT = 5;
@@ -475,6 +476,75 @@ SKIP: {
 
         eval { $killer->disconnect };
         eval { $sub_redis->disconnect };
+    };
+
+    # A drop while the subscription is being restored. A Lua script that
+    # just counts keeps Redis from answering anyone for a while (about
+    # 0.85s for 60M iterations, measured), so the restored SUBSCRIBE gets
+    # no reply and the client's short request_timeout ends the new
+    # connection under it. (CLIENT PAUSE does not hold SUBSCRIBE here,
+    # and DEBUG is disabled.)
+    my $BUSY = q{local x = 0 for i = 1, tonumber(ARGV[1]) do x = x + 1 end return x};
+
+    my $resubscribing = sub {
+        my (%opt) = @_;
+        my $admin = Async::Redis->new(
+            host            => $ENV{REDIS_HOST} // 'localhost',
+            request_timeout => 10,
+        );
+        run { $admin->connect };
+        my $r = Async::Redis->new(
+            host            => $ENV{REDIS_HOST} // 'localhost',
+            reconnect       => 1,
+            reconnect_delay => 0.05,
+            request_timeout => 0.2,
+            %opt,
+        );
+        run { $r->connect };
+        my $id  = run { $r->client('ID') };
+        my $sub = run { $r->subscribe('resume:drop') };
+        return ($admin, $r, $id, $sub);
+    };
+
+    # Drop $id's connection, then keep Redis busy for $iterations, so the
+    # reconnect's resubscribe times out.
+    my $drop_then_stall = sub {
+        my ($admin, $id, $iterations) = @_;
+        my $kill = $admin->client('KILL', 'ID', $id);
+        my $busy = $admin->command('EVAL', $BUSY, 0, $iterations);
+        run { Future->needs_all($kill, $busy) };
+    };
+
+    subtest 'a drop while resubscribing is retried' => sub {
+        my ($admin, $r, $id, $sub) = $resubscribing->();
+        my $resumed = 0;
+        $sub->on_reconnect(sub { $resumed++ });
+
+        $drop_then_stall->($admin, $id, 60_000_000);
+        my $until = Time::HiRes::time() + 3;
+        run { Future::IO->sleep(0.02) } while !$resumed && Time::HiRes::time() < $until;
+        is $resumed, 1, 'the subscription was restored once';
+
+        run { $admin->publish('resume:drop', 'after') };
+        my $msg = eval { run { with_timeout(2, $sub->next) } };
+        is $msg && $msg->{data}, 'after', 'and receives messages' or diag $@;
+        ok !$sub->is_closed, 'it is still open';
+        eval { $r->disconnect };
+        eval { $admin->disconnect };
+    };
+
+    subtest 'a resume that keeps dropping gives up after reconnect_max_attempts' => sub {
+        my ($admin, $r, $id, $sub) = $resubscribing->(reconnect_max_attempts => 2);
+        $drop_then_stall->($admin, $id, 150_000_000);     # about 2s
+
+        my $ok  = eval { run { with_timeout(3, $sub->next) }; 1 };
+        my $err = $@;
+        ok !$ok, 'next fails';
+        ok ref $err && $err->isa('Async::Redis::Error'), 'with an Async::Redis error'
+            or diag "$err";
+        ok $sub->is_closed, 'the subscription is closed';
+        eval { $r->disconnect };
+        eval { $admin->disconnect };
     };
 }
 
