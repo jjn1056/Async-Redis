@@ -4,7 +4,7 @@ use strict;
 use warnings;
 use 5.018;
 
-our $VERSION = '0.002000';
+our $VERSION = '0.003000';
 
 use Future;
 use Future::AsyncAwait;

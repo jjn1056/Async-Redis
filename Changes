@@ -1,6 +1,14 @@
 Revision history for Async-Redis
 
-Unreleased
+0.003000
+    - Bug Fix: every module in the built dist carries the dist version
+      again (GitHub #14)
+        - 0.002000 kept a version only on Async::Redis, so CPAN.pm
+          refused to upgrade an existing 0.001007 install ("would
+          downgrade installed '0.001' to 'undef'")
+        - Dist::Zilla's PkgVersion now stamps the dist version into each
+          module at build; the source keeps one version, on
+          Async::Redis. Signed off by John 2026-11-01 (D-R1)
     - Bug Fix: a forked child running its event loop no longer acts on
       the parent's connection
         - fork copies the event loop's pending work into the child.
