@@ -24,4 +24,5 @@ on 'test' => sub {
 # Development dependencies
 on 'develop' => sub {
     requires 'Dist::Zilla';
+    requires 'Test::Pod::Coverage';
 };

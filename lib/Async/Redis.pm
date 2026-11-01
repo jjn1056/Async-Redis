@@ -2550,6 +2550,14 @@ execution to ensure EVALSHA will succeed.
 
 Thin wrappers around Redis C<SCRIPT> subcommands.
 
+=head2 evalsha_or_eval
+
+    my $result = await $redis->evalsha_or_eval($sha, $lua, $numkeys, @keys_and_args);
+
+Run a script by its SHA1 with C<EVALSHA>; if Redis does not have it
+cached (C<NOSCRIPT>), run C<$lua> with C<EVAL>, which also caches it.
+Any other error is rethrown.
+
 =head2 is_dirty
 
     my $dirty = $redis->is_dirty;
@@ -2611,14 +2619,18 @@ and caches for future calls. This is transparent to your code.
         for my $key (@$keys) { ... }
     }
 
-Create an iterator for SCAN. Also available:
+Create an iterator for SCAN. Iterators return batches; see
+L<Async::Redis::Iterator>.
+
+=head2 hscan_iter / sscan_iter / zscan_iter
 
     my $hash_iter = $redis->hscan_iter('hash', match => 'field:*');
     my $set_iter  = $redis->sscan_iter('set', count => 100);
     my $zset_iter = $redis->zscan_iter('zset');
 
-Iterators return batches. C<ZSCAN> batches are the Redis flat
-member/score list.
+Iterators over one hash, set or sorted set (C<HSCAN>, C<SSCAN>,
+C<ZSCAN>), taking the key and then the same options as C<scan_iter>.
+C<ZSCAN> batches are the Redis flat member/score list.
 
 =head1 CONNECTION POOLING
 

@@ -181,8 +181,41 @@ Returns undef for empty/undef input. Dies on invalid URI.
 
 Returns hash suitable for passing to Async::Redis->new().
 
+=head2 new(%fields)
+
+Builds a URI object from fields already parsed (the accessors' names).
+Most code uses C<parse>.
+
 =head2 Accessors
 
-scheme, host, port, path, database, username, password, tls, is_unix
+=over 4
+
+=item scheme
+
+C<redis>, C<rediss> or C<redis+unix>.
+
+=item host
+
+=item port
+
+=item path
+
+The socket path, for C<redis+unix>.
+
+=item database
+
+=item username
+
+=item password
+
+=item tls
+
+True for C<rediss>.
+
+=item is_unix
+
+True for C<redis+unix>.
+
+=back
 
 =cut

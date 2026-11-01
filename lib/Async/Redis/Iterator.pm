@@ -117,6 +117,17 @@ Iterator provides async cursor-based iteration over Redis SCAN commands:
 
 =head1 METHODS
 
+=head2 new
+
+    my $iter = Async::Redis::Iterator->new(
+        redis => $redis, command => 'HSCAN', key => 'hash', match => 'f:*',
+    );
+
+Usually made by C<scan_iter> and its relatives in L<Async::Redis>.
+C<command> is C<SCAN> (default), C<HSCAN>, C<SSCAN> or C<ZSCAN>; C<key>
+is the key for the last three; C<match>, C<count> and C<type> are the
+SCAN options.
+
 =head2 next
 
     my $batch = await $iter->next;

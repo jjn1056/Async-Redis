@@ -1,6 +1,15 @@
 Revision history for Async-Redis
 
 0.003000
+    - Docs: every public method is documented, checked by a release test
+      (t/00-pod/coverage.t, Test::Pod::Coverage)
+        - New POD: evalsha_or_eval, hscan_iter/sscan_iter/zscan_iter,
+          Async::Redis::Error's methods, Async::Redis::URI's accessors,
+          the Iterator and Transaction constructors, and
+          Subscription->get_replay_commands
+        - Async::Redis::AutoPipeline, ::KeyExtractor and ::Telemetry are
+          documented as internal (used through Async::Redis's options),
+          as Async::Redis::Connection already was
     - Behaviour change: a client that has a subscription is freed when it
       is dropped
         - The client and its Subscription referred to each other, so

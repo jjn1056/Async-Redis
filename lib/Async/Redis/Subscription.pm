@@ -779,6 +779,14 @@ Return the currently tracked regular channels, patterns, or sharded channels.
 
 Return the total number of tracked regular, pattern, and sharded subscriptions.
 
+=head2 get_replay_commands
+
+    my @commands = $sub->get_replay_commands;   # (['SUBSCRIBE', @channels], ...)
+
+The commands that subscribe to everything this subscription tracks: one
+array ref each for C<SUBSCRIBE>, C<PSUBSCRIBE> and C<SSUBSCRIBE>, for
+those that have entries. This is what is sent again after a reconnect.
+
 =head2 is_closed
 
 Return true after the subscription has been closed.
